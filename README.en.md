@@ -18,11 +18,25 @@ The original site works fine on its own. Moving it into the panel changes two th
 
 Requires DeepSeek Harness.
 
+### Let your agent install it
+
+Paste this into a DeepSeek Harness session. The agent installs the plugin, enables it, and checks the result:
+
+```
+Install and enable the HackerTube plugin: plugin_manager install_bundle target=dsh-hackertube.
+If npm fails, use target=github:chow651/dsh-hackertube instead.
+Then confirm dsh-hackertube is enabled in the plugin list and remind me to refresh the page.
+```
+
+### Manual install
+
+The package is published on npm as version 0.1.1:
+
 ```
 plugin_manager install_bundle target=dsh-hackertube
 ```
 
-The package is published on npm as version 0.1.1. It can also be installed straight from the Git repository, though how the host parses the install argument depends on its version.
+It can also be installed straight from the Git repository, though how the host parses the install argument depends on its version:
 
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube

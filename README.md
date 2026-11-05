@@ -18,11 +18,25 @@
 
 需要已安装 DeepSeek Harness 本体。
 
+### 一句话让 agent 装
+
+把下面这段发给 DSH 里的 agent，安装、启用、核对都由它完成：
+
+```
+安装并启用 HackerTube 插件：plugin_manager install_bundle target=dsh-hackertube。
+npm 上取不到就改用 target=github:chow651/dsh-hackertube。
+装完确认插件列表里 dsh-hackertube 已启用，并提醒我刷新页面。
+```
+
+### 手动安装
+
+包已发布到 npm，版本 0.1.1：
+
 ```
 plugin_manager install_bundle target=dsh-hackertube
 ```
 
-包已发布到 npm，版本 0.1.1。也可以直接从 Git 仓库安装，宿主如何解析安装参数取决于版本。
+也可以直接从 Git 仓库安装，宿主如何解析安装参数取决于版本：
 
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube
