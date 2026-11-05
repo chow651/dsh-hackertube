@@ -1452,6 +1452,7 @@ const commentTrState = { map: null, timer: null }
 
 /* Chrome 内置翻译的批量端点：一次可交多条，质量明显好于 translate_a 系列 */
 const MT_ENDPOINT = 'https://translate-pa.googleapis.com/v1/translateHtml'
+/* 这是 Chrome 浏览器自带翻译随包发布的公开网页 key，不是账号凭证，也不计费 */
 const MT_KEY = 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520'
 const MT_BATCH = 10
 /* 缓存键带引擎标记，换引擎后旧条目自然失效，不必手动清文件 */
