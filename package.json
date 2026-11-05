@@ -1,12 +1,14 @@
 {
   "name": "dsh-hackertube",
   "version": "0.1.0",
-  "description": "HackerTube 面板：Hacker News 二十年里被反复推荐的 6454 个视频",
+  "description": "DeepSeek Harness 插件：在面板里看 Hacker News 二十年推荐的 6454 个技术视频",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
     "hackertube",
     "hacker-news",
     "youtube"
@@ -34,7 +36,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "data/*.json",
-    "icon.svg"
+    "icon.svg",
+    "README.en.md"
   ],
   "scripts": {
     "test": "node test/host-smoke.mjs && node test/client-render.mjs client.js"
