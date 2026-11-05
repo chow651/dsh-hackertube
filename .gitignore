@@ -1,0 +1,15 @@
+node_modules/
+.pnpm-store/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+coverage/
+dist/
+
+# 内部资料：留在本地，不进发布仓库
+AGENTS.md
+HANDOFF.md
+ROADMAP.md
+prototype/

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HackerTube">
+  <rect width="64" height="64" rx="14" fill="#ff6600"/>
+  <path d="M26 18.5c0-1.6 1.75-2.6 3.13-1.78l22.3 13.2c1.37.81 1.37 2.79 0 3.6l-22.3 13.2C27.75 47.5 26 46.5 26 44.9z" fill="#ffffff"/>
+  <rect x="14" y="20" width="6" height="24" rx="2" fill="#ffffff" opacity="0.85"/>
+</svg>

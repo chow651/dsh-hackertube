@@ -1,0 +1,2677 @@
+/**
+ * HackerTube Host 半。
+ *
+ * 浏览器端不能直接取上游数据：hackertube.org 的 /api/* 不带 CORS 头，
+ * 而数据主体是 8.2MB 的 videos.jsonl。这里负责拉取、瘦身、落盘缓存，
+ * 再通过 /hackertube/api/* 交给面板。
+ *
+ * webServer 是可选服务：headless 场景没有它，写进 inject 会让插件永远 park，
+ * 所以只在运行时用 ctx.get 探测，并给两次延迟重试。
+ */
+
+import { spawn } from 'node:child_process'
+import { createReadStream } from 'node:fs'
+import { createServer } from 'node:http'
+import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/* 仓库里预生成的译文，首次安装时直接铺到缓存目录 */
+const HERE = dirname(fileURLToPath(import.meta.url))
+const SEED_DIR = join(HERE, 'data')
+
+const SOURCE = 'https://hackertube.org'
+const PREFIX = '/hackertube/api'
+const TTL_MS = 24 * 60 * 60 * 1000
+const FETCH_TIMEOUT_MS = 45_000
+/* 机翻接口是第三方免鉴权端点，超时要短，失败就留原文 */
+const MT_TIMEOUT_MS = 12_000
+const DETAIL_CACHE_MAX = 60
+/* 单次媒体下载预算；yt-dlp 在本机实测 10 分钟片长约 17 秒 */
+const MEDIA_TIMEOUT_MS = 180_000
+const MEDIA_MAX_HEIGHT = 480
+/* 本地媒体缓存总上限，超了按最近最少使用淘汰 */
+const MEDIA_CAP_BYTES = 512 * 1024 * 1024
+
+/* /api/list 用 offset + n 分页；n 的上限是 100，更大的值被静默截到 100 */
+const PAGE_SIZE = 100
+const PAGE_CONCURRENCY = 8
+const PAGE_RETRIES = 3
+const FALLBACK_TOTAL = 6454
+/* 整轮抓取的总预算，网络异常时不至于无限拖住预热 */
+const TOTAL_BUDGET_MS = 120_000
+/* 缓存结构变更时递增，旧缓存直接作废 */
+const CACHE_VERSION = 2
+
+const state = {
+  ctx: null,
+  origin: null,
+  authUrl: null,
+  mediaOrigin: null,
+  list: null,
+  listAt: 0,
+  listJson: null,
+  browse: null,
+  playlists: null,
+  playlistsAt: 0,
+  playlistDetail: new Map(),
+  comments: new Map(),
+  related: new Map(),
+  browseAt: 0,
+  browseJson: null,
+  inflight: new Map(),
+  detail: new Map(),
+}
+
+/* ---------------- 缓存位置 ---------------- */
+
+function cacheRoot() {
+  const base = process.env.DSH_PROFILE_DIR || join(homedir(), '.dsh')
+  return join(base, '.dsh-hackertube')
+}
+
+async function readCache(name) {
+  try {
+    return JSON.parse(await readFile(join(cacheRoot(), name), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+async function writeCache(name, value) {
+  try {
+    await mkdir(cacheRoot(), { recursive: true })
+    await writeFile(join(cacheRoot(), name), JSON.stringify(value), 'utf8')
+  } catch {
+    /* 缓存写失败不影响本次返回 */
+  }
+}
+
+/* ---------------- 上游取数 ---------------- */
+
+async function fetchJson(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+  if (!res.ok) throw new Error(`上游 ${res.status}: ${url}`)
+  return res.json()
+}
+
+/** 同一个 key 的并发请求合并成一次。 */
+function once(key, task) {
+  const running = state.inflight.get(key)
+  if (running) return running
+  const p = task().finally(() => state.inflight.delete(key))
+  state.inflight.set(key, p)
+  return p
+}
+
+/* ---------------- 数据整形 ---------------- */
+
+/**
+ * 列表页只需要这些字段。summary / why_hn / quote / hn 占单条的六成以上，
+ * 只在详情页取，所以不进入列表缓存。
+ */
+function toSlim(o) {
+  const published = o.published ?? null
+  return {
+    v: o.vid,
+    t: o.title ?? '',
+    c: o.channel ?? '',
+    d: o.duration_s ?? 0,
+    th: o.thumbnail ?? '',
+    p: published,
+    w: o.views ?? 0,
+    ct: o.content_type ?? '',
+    lv: o.level ?? '',
+    y: published ? Number(String(published).slice(0, 4)) || null : null,
+    cats: Array.isArray(o.categories) ? o.categories.map((c) => c.id) : [],
+    tags: Array.isArray(o.tags) ? o.tags : [],
+    s: typeof o.score === 'number' ? o.score : 0,
+    r: o.hn && typeof o.hn.recommenders === 'number' ? o.hn.recommenders : 0,
+  }
+}
+
+function setList(items, at) {
+  state.list = items
+  state.listAt = at
+  state.listJson = null
+}
+
+/* ---------------- 三个数据方法 ---------------- */
+
+/** 单页抓取，带重试；offset 定位，n 是每页条数（上限 100）。 */
+async function fetchPage(page) {
+  let lastError
+  const offset = page * PAGE_SIZE
+  for (let attempt = 0; attempt < PAGE_RETRIES; attempt += 1) {
+    try {
+      return await fetchJson(`${SOURCE}/api/list?offset=${offset}&n=${PAGE_SIZE}`)
+    } catch (err) {
+      lastError = err
+      if (attempt + 1 < PAGE_RETRIES) {
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
+      }
+    }
+  }
+  throw lastError
+}
+
+/**
+ * 全量列表。videos.jsonl 虽然一次给 6454 条，但没有 thumbnail / published /
+ * duration_s / views，卡片会缺封面和时长；只有 /api/list 带齐这些字段，
+ * 代价是按 offset + n 翻完 65 页。gzip 后每页约 28KB。
+ */
+async function fetchAllSlim() {
+  let total = FALLBACK_TOTAL
+  try {
+    const stats = await fetchJson(`${SOURCE}/api/stats`)
+    if (stats && typeof stats.videos === 'number' && stats.videos > 0) total = stats.videos
+  } catch {
+    /* 拿不到统计就用已知总数 */
+  }
+
+  const pages = Math.ceil(total / PAGE_SIZE)
+  const deadline = Date.now() + TOTAL_BUDGET_MS
+  const out = []
+  const failed = []
+  let cursor = 0
+
+  const absorb = (page, value) => {
+    if (!Array.isArray(value)) {
+      failed.push(page)
+      return
+    }
+    for (const o of value) out.push(toSlim(o))
+  }
+
+  while (cursor < pages) {
+    if (Date.now() > deadline) throw new Error(`抓取超时：${out.length} / ${total}`)
+    const batch = []
+    for (let i = 0; i < PAGE_CONCURRENCY && cursor + i < pages; i += 1) {
+      batch.push(cursor + i)
+    }
+    const settled = await Promise.allSettled(batch.map((p) => fetchPage(p)))
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled') absorb(batch[i], r.value)
+      else failed.push(batch[i])
+    })
+    cursor += PAGE_CONCURRENCY
+  }
+
+  /* 并发批里偶发失败的页单独补一次，别因为一页丢一百条 */
+  if (failed.length) {
+    for (const page of failed.slice()) {
+      try {
+        absorb(page, await fetchPage(page))
+        const at = failed.indexOf(page)
+        if (at >= 0) failed.splice(at, 1)
+      } catch {
+        /* 仍失败则记在 failed 里 */
+      }
+    }
+  }
+
+  const coverage = total ? out.length / total : 0
+  if (coverage < 0.95) {
+    const err = new Error(
+      `列表不完整：拿到 ${out.length} / ${total}，${failed.length} 页始终失败`,
+    )
+    err.partialCount = out.length
+    throw err
+  }
+  return out
+}
+
+async function loadList() {
+  const fresh = state.list && Date.now() - state.listAt < TTL_MS
+  if (fresh) return state.list
+
+  if (!state.list) {
+    const cached = await readCache('list.json')
+    if (
+      cached &&
+      cached.v === CACHE_VERSION &&
+      Array.isArray(cached.items) &&
+      cached.items.length
+    ) {
+      setList(cached.items, Number(cached.at) || 0)
+      if (Date.now() - state.listAt < TTL_MS) return state.list
+    }
+  }
+
+  return once('list', async () => {
+    try {
+      const items = await fetchAllSlim()
+      setList(items, Date.now())
+      void writeCache('list.json', { v: CACHE_VERSION, at: state.listAt, items })
+      return state.list
+    } catch (err) {
+      /* 预热失败是静默的，留个落盘痕迹，事后能查到底卡在哪一步 */
+      void writeCache('diag.json', {
+        at: Date.now(),
+        stage: 'list',
+        error: String(err?.message ?? err),
+      })
+      if (state.list) return state.list
+      throw err
+    }
+  })
+}
+
+/**
+ * 27 个播放列表的中文标题与简介。上游只给英文，这里内置一份人工译文，
+ * 比让模型临时翻更稳，也不会因为一次调用失败而在界面上露出英文。
+ */
+const PLAYLIST_ZH = {
+  "hn-canon": [
+    "HN 必看清单",
+    "Hacker News 最常被推荐给彼此的十个视频，一个帖子接一个帖子，年复一年。数学、金钱、编程、芯片、生物，还有怎么活。"
+  ],
+  "talks-every-programmer-should-watch": [
+    "每个程序员都该看的演讲",
+    "HN 反复推荐给开发者看的编程演讲，不论你写什么语言。关于简洁、设计、手艺，以及如何思考软件。"
+  ],
+  "computers-from-the-transistor-up": [
+    "从晶体管讲起的计算机",
+    "一层一层讲清计算机怎么工作：晶体管与逻辑门、芯片怎么造、CPU 与内存、操作系统，最后是编译器与语言。"
+  ],
+  "learn-deep-learning-from-zero": [
+    "从零学深度学习",
+    "从「什么是神经元」到亲手用代码搭一个 GPT 的学习路径，每一步都用 HN 最推荐的那个讲解。"
+  ],
+  "programming-history-in-12-talks": [
+    "十二场演讲里的编程史",
+    "用 HN 推荐的演讲与影像讲编程的故事：从战时的密码破译机器，到 Unix、PARC、家用电脑热潮、自由软件与万维网。"
+  ],
+  "lectures-worth-a-weekend": [
+    "值得一个周末的讲座",
+    "HN 一直劝人去看的课堂录像：Feynman、SICP、Strang、Sapolsky、Sandel 等好老师，每人一场开篇讲座。"
+  ],
+  "documentaries-hn-loves": [
+    "HN 爱看的纪录片",
+    "适合慢悠悠一个晚上的长篇纪录片：AlphaGo、Connections、Aaron Swartz、Adam Curtis 等等，横跨技术、科学、历史与人。"
+  ],
+  "how-things-are-made": [
+    "东西是怎么造出来的",
+    "工厂参观与制造讲解，专治「这玩意儿到底怎么做出来的」：从易拉罐到 EUV 光刻机，再到火箭工厂。"
+  ],
+  "security-war-stories": [
+    "安全圈的血泪史",
+    "真实的入侵、骗局与数据泄露，由干过的人或追查过的人亲口讲。从 1986 年追捕克格勃间谍，到几乎波及每台 Linux 服务器的 xz 后门。"
+  ],
+  "systems-and-databases": [
+    "系统与数据库",
+    "HN 推荐来理解真实系统怎么运转的硬核技术演讲：数据库、共识、分布式代码测试、性能，以及怎么让生产环境不倒。"
+  ],
+  "hidden-gems": [
+    "被埋没的好东西",
+    "HN 很喜欢、YouTube 几乎没注意到的东西，多数远不到五万播放。物理、音乐、航天器、遗传学、能源，还有软件史。"
+  ],
+  "comedy-break-for-programmers": [
+    "程序员的喜剧时间",
+    "HN 帖子里用来逗乐的短剧、恶搞与荒诞演讲：从需求根本不可能实现的会议，到用 PowerPoint 搭出来的图灵机。"
+  ],
+  "indistinguishable-from-magic": [
+    "与魔法无异",
+    "从厨房桌上的一只晶体管，到 ASML 机器里的锡滴激光，再讲到为这套东西争抢的人与国家。"
+  ],
+  "mechanical-sympathy": [
+    "机械同理心",
+    "为什么你的快电脑跑着慢代码，以及写快代码的人对缓存、数据布局和测量知道些什么。"
+  ],
+  "things-you-never-look-at": [
+    "你从没细看过东西",
+    "门、插头、易拉罐、烤面包机和转向灯，由显然很爱这些东西的人来讲。关于日常物品的短片设计随笔。"
+  ],
+  "debugging-at-a-distance": [
+    "远程调试",
+    "从阿波罗导航计算机的 1202 警报，到隔着 150 亿英里给旅行者一号打补丁：史上最难的远程调试，由干过的人或重建过那套硬件的人讲述。"
+  ],
+  "brass-brains": [
+    "黄铜大脑：用齿轮计算",
+    "晶体管之前，人们用齿轮、凸轮和水做微积分。从一枚差速齿轮，一路讲到为战列舰瞄准、预测潮汐、跑经济模型的机器。"
+  ],
+  "objects-on-trial": [
+    "面向对象受审记",
+    "HN 吵了十五年的 OOP 之争，这次排成一场庭审：辩方、控方、创始人的证词，还有两小时的结案陈词。"
+  ],
+  "before-it-worked": [
+    "在它成真之前",
+    "用领域起飞之前录下的演讲讲 AI 史：从 1973 年那场促成了第一次 AI 寒冬的辩论，到 2017 年把这场热潮称作炼金术的演讲。"
+  ],
+  "how-to-count-a-vote": [
+    "怎么数一张选票",
+    "投票是一种算法，HN 就按算法在吵。从为什么简单多数养出两党制，到 Arrow 定理与评分投票，再到杰利蝾螈，以及为什么纸质选票仍然胜过计算机。"
+  ],
+  "speedrunners-are-reverse-engineers": [
+    "速通玩家都是逆向工程师",
+    "从马里奥赛车里的一条捷径，到只用一只手柄在《超级马里奥世界》里跑《Flappy Bird》：玩家是怎么把自己的游戏拆开的。"
+  ],
+  "cheating-the-hardware": [
+    "骗过硬件",
+    "游戏开发者怎么绕开可怜的内存、稀少的颜色和慢慢转的磁盘，从《爆破彗星》讲到《古惑狼》，大致按时间顺序。"
+  ],
+  "everything-is-circles": [
+    "万物皆圆",
+    "一个想法——傅里叶变换——从用本轮画出荷马·辛普森，一路跟到 JPEG、数字音频、无线电、镜头和测不准原理。"
+  ],
+  "biology-for-programmers": [
+    "给程序员看的生物学",
+    "细胞是纳米级机加工车间，生物电网络存着身体蓝图，遗传病被当成漏洞利用，还有一门用来设计分子的 Lisp 编译器。用 HN 的眼光看生物学：这是世界上最奇怪的代码库。"
+  ],
+  "who-watches-the-silicon": [
+    "硅片由谁看守",
+    "你的威胁模型大概止步于操作系统。这些演讲往下再挖一层：没有文档的 CPU 指令、隐藏的协处理器、恶意 USB 固件，以及主板上的植入物。"
+  ],
+  "how-things-fall-over": [
+    "东西是怎么塌的",
+    "被删掉的数据库、一次核事故、因为一个笔误被重启的数据中心，以及安全科学里那些解释「这一切都很正常」的概念。"
+  ],
+  "small-profitable-nobodys-unicorn": [
+    "小而赚钱，不当独角兽",
+    "HN 发给每个想做生意而不是造火箭的人：DHH 2008 年那篇异端，Jason Cohen 的白手起家手册，Maciej 谈勉强成功，还有一家从 1994 年活到今天的游戏工作室。"
+  ]
+}
+
+function withChinese(p) {
+  if (!p || !p.slug) return p
+  const z = PLAYLIST_ZH[p.slug]
+  if (!z) return p
+  return Object.assign({}, p, { titleZh: z[0], pitchZh: z[1] })
+}
+
+/**
+ * 站点策划的播放列表。上游一次给全部 27 个（标题、简介、封面、时长），
+ * 详情按 slug 单独取，缓存 30 分钟。
+ */
+async function loadPlaylists(force = false) {
+  const fresh = state.playlists && Date.now() - state.playlistsAt < TTL_MS
+  if (fresh && !force) return state.playlists
+  return once('playlists', async () => {
+    const list = await fetchJson(`${SOURCE}/api/playlists`)
+    state.playlists = Array.isArray(list) ? list : []
+    state.playlistsAt = Date.now()
+    return state.playlists
+  })
+}
+
+async function loadPlaylist(slug) {
+  const hit = state.playlistDetail.get(slug)
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.value
+  const value = await fetchJson(`${SOURCE}/api/playlist?slug=${encodeURIComponent(slug)}`)
+  state.playlistDetail.set(slug, { at: Date.now(), value })
+  return value
+}
+
+async function loadBrowse() {
+  const fresh = state.browse && Date.now() - state.browseAt < TTL_MS
+  if (fresh) return state.browse
+
+  if (!state.browse) {
+    const cached = await readCache('browse.json')
+    if (cached && cached.taxonomy) {
+      state.browse = cached.taxonomy
+      state.browseAt = Number(cached.at) || 0
+      if (Date.now() - state.browseAt < TTL_MS) return state.browse
+    }
+  }
+
+  return once('browse', async () => {
+    try {
+      const data = await fetchJson(`${SOURCE}/download/taxonomy.json`)
+      state.browse = data
+      state.browseAt = Date.now()
+      state.browseJson = null
+      void writeCache('browse.json', { at: state.browseAt, taxonomy: data })
+      return data
+    } catch (err) {
+      if (state.browse) return state.browse
+      throw err
+    }
+  })
+}
+
+/**
+ * 详情页只展示 12 条：每条带作者、年月、立场、一句为什么。
+ * 正文和引用可能很长，截到 400 字，避免一次响应过大。
+ */
+function pickComments(vid) {
+  const list = state.comments.get(vid) || []
+  return list.slice(0, 12).map((c) => ({
+    id: c.id,
+    author: c.author || '',
+    ym: c.ym || '',
+    stance: c.stance || '',
+    why: c.why || '',
+    text: String(c.text || '').replace(/\s+/g, ' ').slice(0, 400),
+    quote: c.quote ? String(c.quote).replace(/\s+/g, ' ').slice(0, 240) : '',
+  }))
+}
+
+/**
+ * 相关视频：上游按 HN 共同推荐度排序。详情页右栏用，最多 12 条。
+ */
+async function loadRelated(vid) {
+  const hit = state.related.get(vid)
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.value
+  const list = await fetchJson(`${SOURCE}/api/related?vid=${encodeURIComponent(vid)}&n=12`)
+  const value = (Array.isArray(list) ? list : []).slice(0, 12).map(toSlim)
+  state.related.set(vid, { at: Date.now(), value })
+  return value
+}
+
+async function loadVideo(vid) {
+  const hit = state.detail.get(vid)
+  if (hit) return hit
+  const data = await fetchJson(`${SOURCE}/api/video?vid=${encodeURIComponent(vid)}`)
+  const payload = data && data.video ? data.video : data
+  const comments = data && Array.isArray(data.comments) ? data.comments : []
+  state.comments.set(vid, comments)
+  if (state.detail.size >= DETAIL_CACHE_MAX) {
+    const oldest = state.detail.keys().next().value
+    if (oldest !== undefined) state.detail.delete(oldest)
+  }
+  state.detail.set(vid, payload)
+  return payload
+}
+
+/* ---------------- 本地媒体 ---------------- */
+
+function mediaDir() {
+  return join(cacheRoot(), 'media')
+}
+
+/** 调 yt-dlp 落盘：480p 合并 mp4，音视频轨由 yt-dlp 自行调 ffmpeg 合并。 */
+function downloadMedia(vid, dest) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-f',
+      `bv*[height<=${MEDIA_MAX_HEIGHT}]+ba/b[height<=${MEDIA_MAX_HEIGHT}]`,
+      '--merge-output-format',
+      'mp4',
+      '--no-warnings',
+      '--no-playlist',
+      '-o',
+      dest,
+      `https://www.youtube.com/watch?v=${vid}`,
+    ]
+    const child = spawn('yt-dlp', args, { windowsHide: true })
+    let stderr = ''
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        /* 已退出 */
+      }
+      reject(new Error('媒体下载超时'))
+    }, MEDIA_TIMEOUT_MS)
+    child.stderr.on('data', (d) => {
+      stderr = (stderr + d.toString()).slice(-400)
+    })
+    child.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`yt-dlp 退出码 ${code}：${stderr}`))
+    })
+  })
+}
+
+/**
+ * 中转页：宿主页面不发 Referer，YouTube 因此报 153。
+ * 这里返回一个自己声明 Referrer-Policy 的文档，让内层 embed 请求带上来源。
+ */
+function serveEmbed(req, res, vid, lang) {
+  /* 播放器界面语言跟随面板：英文界面下 YouTube 不该弹中文的『前往平台观看』 */
+  const hl = lang === 'zh' ? 'zh-CN' : 'en'
+  const host = String(req.headers?.host || '')
+  const relayOrigin = /^[\w.:-]+$/.test(host) ? 'http://' + host : 'http://127.0.0.1:18090'
+  /* 用 YouTube IFrame API 托管播放器，才能读到播放位置；每秒把时间戳递回父页面，
+     面板据此把「当前在讲什么」作为上下文交给模型 */
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#yt{width:100%;height:100%}' +
+    '#yt iframe{width:100%;height:100%;border:0;display:block}</style>' +
+    '</head><body><div id="yt"></div><script>' +
+    'var player=null,lastT=-1,timer=null;' +
+    'function tell(m){try{parent.postMessage(m,"*")}catch(e){}}' +
+    'function tick(){if(player&&typeof player.getCurrentTime==="function"){try{' +
+    'var t=player.getCurrentTime(),d=player.getDuration();' +
+    'if(Math.abs(t-lastT)>=1){lastT=t;tell({__ht:"time",t:t,d:d})}' +
+    '}catch(e){}}timer=setTimeout(tick,800)}' +
+    'function ready(){player=new YT.Player("yt",{videoId:' +
+    JSON.stringify(vid) +
+    ',playerVars:{rel:0,playsinline:1,hl:' + JSON.stringify(hl) + ',origin:' +
+    JSON.stringify(relayOrigin) +
+    '},events:{' +
+    'onReady:function(){tell({__ht:"relay-loaded",secure:!!window.isSecureContext});tick()},' +
+    'onStateChange:function(e){tell({__ht:"state",s:e.data})},' +
+    'onError:function(e){tell({__ht:"yt-error",code:e.data})}}});}' +
+    'window.onYouTubeIframeAPIReady=ready;' +
+    'var s=document.createElement("script");s.src="https://www.youtube.com/iframe_api";' +
+    's.onerror=function(){tell({__ht:"api-error"})};document.head.appendChild(s);' +
+    '</script></body></html>'
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    /* 不能设 X-Frame-Options：父页面是 dsh-app://，与本服务器不同源，
+       SAMEORIGIN 会让浏览器直接拒绝渲染这个 iframe */
+    'Cache-Control': 'no-store',
+    ...(state.origin ? { 'X-Hackertube-Origin': state.origin } : {}),
+  })
+  res.end(html)
+}
+
+/**
+ * 流式播放：yt-dlp 输出 MPEG-TS，ffmpeg 转封装成 fragmented MP4 直接透传。
+ * 不落磁盘、不依赖 YouTube 的嵌入策略；代价是流式不可 seek。
+ */
+function serveStream(req, res, vid) {
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Cache-Control': 'no-store',
+    'Accept-Ranges': 'none',
+  })
+
+  const ytdlp = spawn(
+    'yt-dlp',
+    [
+      '-f',
+      `bv*[height<=${MEDIA_MAX_HEIGHT}]+ba/b[height<=${MEDIA_MAX_HEIGHT}]`,
+      '--merge-output-format',
+      'mp4',
+      '-o',
+      '-',
+      '--no-warnings',
+      '--no-playlist',
+      `https://www.youtube.com/watch?v=${vid}`,
+    ],
+    { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+  )
+
+  const ff = spawn(
+    'ffmpeg',
+    [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      'pipe:0',
+      '-c',
+      'copy',
+      '-movflags',
+      'frag_keyframe+empty_moov+default_base_moof',
+      '-f',
+      'mp4',
+      'pipe:1',
+    ],
+    { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true },
+  )
+
+  let closed = false
+  const cleanup = () => {
+    if (closed) return
+    closed = true
+    for (const child of [ytdlp, ff]) {
+      try {
+        child.kill()
+      } catch {
+        /* 已退出 */
+      }
+    }
+  }
+
+  ytdlp.stdout.pipe(ff.stdin)
+  ff.stdout.pipe(res)
+
+  req.on('close', cleanup)
+  res.on('close', cleanup)
+  ytdlp.on('error', cleanup)
+  ff.on('error', cleanup)
+  ff.on('close', () => {
+    try {
+      res.end()
+    } catch {
+      /* 已断开 */
+    }
+    cleanup()
+  })
+}
+
+/** 支持 Range 的静态投递，<video> 拖动进度条必须靠它。 */
+function streamMedia(req, res, file, size) {
+  const range = req.headers.range
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+    let start = m && m[1] ? Number(m[1]) : 0
+    let end = m && m[2] ? Number(m[2]) : size - 1
+    if (!Number.isFinite(start) || start < 0) start = 0
+    if (!Number.isFinite(end) || end >= size) end = size - 1
+    if (start > end) {
+      res.writeHead(416, { 'Content-Range': `bytes */${size}` })
+      res.end()
+      return
+    }
+    res.writeHead(206, {
+      'Content-Type': 'video/mp4',
+      'Content-Length': end - start + 1,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
+    })
+    createReadStream(file, { start, end }).pipe(res)
+    return
+  }
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Content-Length': size,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  })
+  createReadStream(file).pipe(res)
+}
+
+/** 超过总配额就按最近访问时间从旧到新删除，避免无限占盘。 */
+async function trimMedia(keepName) {
+  const dir = mediaDir()
+  let names
+  try {
+    names = await readdir(dir)
+  } catch {
+    return
+  }
+  const files = []
+  let total = 0
+  for (const name of names) {
+    if (!name.endsWith('.mp4')) continue
+    const full = join(dir, name)
+    try {
+      const st = await stat(full)
+      files.push({ full, size: st.size, at: st.atimeMs || st.mtimeMs, name })
+      total += st.size
+    } catch {
+      /* 并发删除，忽略 */
+    }
+  }
+  if (total <= MEDIA_CAP_BYTES) return
+  files.sort((a, b) => a.at - b.at)
+  for (const f of files) {
+    if (total <= MEDIA_CAP_BYTES) break
+    if (f.name === keepName) continue
+    try {
+      await unlink(f.full)
+      total -= f.size
+    } catch {
+      /* 删不掉不影响播放 */
+    }
+  }
+}
+
+/** 首次请求触发下载并缓存，之后直接读盘；同一视频的并发请求合并成一次。 */
+async function serveMedia(req, res, vid) {
+  const dir = mediaDir()
+  const file = join(dir, `${vid}.mp4`)
+
+  try {
+    const st = await stat(file)
+    if (st.size > 1024) return streamMedia(req, res, file, st.size)
+  } catch {
+    /* 尚未缓存 */
+  }
+
+  try {
+    await once(`media:${vid}`, async () => {
+      await mkdir(dir, { recursive: true })
+      const part = `${file}.part`
+      try {
+        await downloadMedia(vid, part)
+        await rename(part, file)
+        void trimMedia(`${vid}.mp4`)
+      } catch (err) {
+        try {
+          await unlink(part)
+        } catch {
+          /* 清理失败忽略 */
+        }
+        throw err
+      }
+    })
+    const st = await stat(file)
+    return streamMedia(req, res, file, st.size)
+  } catch (err) {
+    return json(res, 502, { error: String(err?.message ?? err) })
+  }
+}
+
+/* ---------------- 路由 ---------------- */
+
+function trusted(req) {
+  const host = String(req.headers?.host ?? '')
+  const origin = String(req.headers?.origin ?? '')
+  if (origin && host) {
+    try {
+      return new URL(origin).host === host
+    } catch {
+      return false
+    }
+  }
+  if (!origin) return /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host)
+  return false
+}
+
+/* ---------------- LLM ---------------- */
+
+/** 插件自己的模型通道：复用当前 profile 已配置的 provider，不需要额外 key。 */
+const llmState = { candidates: null, error: null, working: null }
+
+/** 列出所有可用的文本模型路由，按 provider 顺序排好，供失败时逐个回退。 */
+async function listCandidates(ctx) {
+  if (llmState.candidates) return llmState.candidates
+  const out = []
+  try {
+    const llm = ctx?.get?.('llm')
+    if (!llm) {
+      llmState.error = 'no llm service'
+      llmState.candidates = []
+      return llmState.candidates
+    }
+    const providers = (await llm.listProviders?.()) || []
+    for (const p of providers) {
+      let models = []
+      try {
+        models = (await llm.listModels(p.id)) || []
+      } catch {
+        continue
+      }
+      for (const m of models) {
+        if (m.inputModalities && !m.inputModalities.includes('text')) continue
+        out.push({ provider: p.id, model: m.id })
+      }
+    }
+  } catch (err) {
+    llmState.error = String(err?.message ?? err).slice(0, 150)
+  }
+  llmState.candidates = out
+  return out
+}
+
+async function streamOnce(ctx, route, prompt, opts) {
+  /* 单个路由挂死会拖住整批，加硬超时把它变成可重试的失败 */
+  return Promise.race([
+    streamOnceInner(ctx, route, prompt, opts),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('llm timeout')), 90_000),
+    ),
+  ])
+}
+
+async function streamOnceInner(ctx, route, prompt, opts) {
+  const llm = ctx.get('llm')
+  const stream = llm.stream({
+    provider: route.provider,
+    model: route.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    ...(opts.maxTokens ? { maxOutputTokens: opts.maxTokens } : {}),
+  })
+  let out = ''
+  const seen = new Set()
+  /* 流里只有 block-start 带 blockType，后续增量靠当前块类型判断归属 */
+  let currentBlock = null
+  for await (const chunk of stream) {
+    if (!chunk) continue
+    if (typeof chunk === 'string') {
+      if (currentBlock !== 'reasoning') {
+        out += chunk
+        if (opts.onDelta) opts.onDelta(chunk)
+      }
+      continue
+    }
+    if (typeof chunk !== 'object') continue
+    if (chunk.type) seen.add(String(chunk.type))
+    if (chunk.type === 'finish') {
+      if (chunk.reason && chunk.reason.kind === 'error') {
+        throw new Error(chunk.reason.failure?.message || 'llm error')
+      }
+      break
+    }
+    if (chunk.type === 'block-start') {
+      currentBlock = chunk.blockType || null
+      continue
+    }
+    if (chunk.type === 'block-stop' || chunk.type === 'block-end' || chunk.type === 'block-finish') {
+      currentBlock = null
+      continue
+    }
+    if (currentBlock === 'reasoning') continue
+    if (typeof chunk.text === 'string') {
+      out += chunk.text
+      if (opts.onDelta) opts.onDelta(chunk.text)
+    } else if (typeof chunk.delta === 'string') {
+      out += chunk.delta
+      if (opts.onDelta) opts.onDelta(chunk.delta)
+    } else if (chunk.delta && typeof chunk.delta.text === 'string') {
+      out += chunk.delta.text
+      if (opts.onDelta) opts.onDelta(chunk.delta.text)
+    }
+  }
+  if (!out.trim()) {
+    throw new Error('empty response, chunk types: ' + Array.from(seen).join('|'))
+  }
+  return out.trim()
+}
+
+/** 一次性问模型，返回完整文本；某个 provider 余额不足或不可用时自动换下一个。 */
+async function askLlm(ctx, prompt, opts = {}) {
+  if (llmState.working) {
+    try {
+      return await streamOnce(ctx, llmState.working, prompt, opts)
+    } catch (err) {
+      if (!/balance|quota|unavailable|not found|no adapter/i.test(String(err?.message))) throw err
+      llmState.working = null
+    }
+  }
+  const candidates = await listCandidates(ctx)
+  if (!candidates.length) throw new Error(llmState.error || 'no model available')
+  let lastErr = null
+  for (const route of candidates) {
+    try {
+      const text = await streamOnce(ctx, route, prompt, opts)
+      llmState.working = route
+      return text
+    } catch (err) {
+      lastErr = err
+      const msg = String(err?.message ?? err)
+      if (/balance|quota|unavailable|not found|no adapter|unauthorized/i.test(msg)) continue
+      throw err
+    }
+  }
+  throw lastErr || new Error('all providers failed')
+}
+
+/* ---------------- 翻译 ---------------- */
+
+const I18N_VERSION = 1
+
+function i18nDir() {
+  return join(cacheRoot(), 'i18n')
+}
+
+function i18nFile(lang) {
+  return join(i18nDir(), `${lang}.json`)
+}
+
+const i18nState = { zh: null, dirty: false, timer: null }
+
+async function loadI18n(lang) {
+  if (i18nState[lang]) return i18nState[lang]
+  try {
+    const raw = await readFile(i18nFile(lang), 'utf8')
+    const parsed = JSON.parse(raw)
+    i18nState[lang] = parsed.entries || {}
+  } catch {
+    /* 缓存里没有时用仓库自带的译文打底，省掉几小时的模型翻译 */
+    const seeded = await readSeed(lang)
+    i18nState[lang] = seeded
+    if (Object.keys(seeded).length) {
+      void mkdir(i18nDir(), { recursive: true })
+        .then(() => writeFile(i18nFile(lang), JSON.stringify({ v: I18N_VERSION, entries: seeded })))
+        .catch(() => {})
+    }
+  }
+  return i18nState[lang]
+}
+
+async function readSeed(name) {
+  try {
+    const parsed = JSON.parse(await readFile(join(SEED_DIR, name + '.json'), 'utf8'))
+    return parsed.entries || {}
+  } catch {
+    return {}
+  }
+}
+
+function scheduleI18nSave(lang) {
+  if (i18nState.timer) return
+  i18nState.timer = setTimeout(() => {
+    i18nState.timer = null
+    const entries = i18nState[lang] || {}
+    void mkdir(i18nDir(), { recursive: true })
+      .then(() =>
+        writeFile(i18nFile(lang), JSON.stringify({ v: I18N_VERSION, entries })),
+      )
+      .catch(() => {})
+  }, 2000)
+  if (typeof i18nState.timer.unref === 'function') i18nState.timer.unref()
+}
+
+const TERMS = [
+  ['transformer', 'Transformer'],
+  ['kernel', '内核'],
+  ['gradient', '梯度'],
+  ['backpropagation', '反向传播'],
+  ['compiler', '编译器'],
+  ['garbage collection', '垃圾回收'],
+  ['lock-free', '无锁'],
+  ['type inference', '类型推断'],
+]
+
+/**
+ * 把一批英文推荐理由翻成中文。
+ * 只翻没有缓存的条目；返回 vid → 译文 的映射。
+ */
+async function translateEntries(ctx, items, lang = 'zh') {
+  const cache = await loadI18n(lang)
+  const todo = items.filter((it) => it.r && !cache[it.v])
+  if (!todo.length) return cache
+
+  const glossary = TERMS.map(([en, zh]) => `${en}=${zh}`).join('; ')
+  for (let i = 0; i < todo.length; i += 12) {
+    const batch = todo.slice(i, i + 12)
+    const numbered = batch
+      .map((it, idx) => `${idx + 1}. ${String(it.r).replace(/\s+/g, ' ').slice(0, 600)}`)
+      .join('\n')
+    const prompt =
+      '把这些 Hacker News 上推荐技术视频的理由翻译成简体中文。' +
+      '保持技术准确性，语气自然，不要添加解释。\n' +
+      `术语对照：${glossary}\n` +
+      '严格输出 JSON 数组，只包含译文，顺序与输入一致，例如 ["译文一","译文二"]。\n\n' +
+      numbered
+    let text
+    try {
+      text = await askLlm(ctx, prompt)
+    } catch {
+      break
+    }
+    const m = text.match(/\[[\s\S]*\]/)
+    if (!m) continue
+    let arr
+    try {
+      arr = JSON.parse(m[0])
+    } catch {
+      continue
+    }
+    if (!Array.isArray(arr)) continue
+    batch.forEach((it, idx) => {
+      if (typeof arr[idx] === 'string' && arr[idx].trim()) cache[it.v] = arr[idx].trim()
+    })
+    scheduleI18nSave(lang)
+  }
+  return cache
+}
+
+/* 查询扩展用的通用机翻：中文查询先翻成英文，才能命中英文标签 */
+const mtQueryState = { map: new Map() }
+const MT_QUERY_MAX = 400
+
+async function mtQuery(text, to) {
+  const key = to + ':' + text
+  if (mtQueryState.map.has(key)) return mtQueryState.map.get(key)
+  const [from, target] = to === 'en' ? ['zh-CN', 'en'] : ['en', 'zh-CN']
+  let out = ''
+  try {
+    out = (await mtBatch([text], from, target))[0] || ''
+  } catch {
+    try {
+      out = await mtSingle(text, from, target)
+    } catch {
+      out = ''
+    }
+  }
+  if (mtQueryState.map.size > MT_QUERY_MAX) mtQueryState.map.clear()
+  mtQueryState.map.set(key, out)
+  return out
+}
+
+
+/* ---------------- HN 评论机翻 ---------------- */
+
+const commentTrState = { map: null, timer: null }
+
+/* Chrome 内置翻译的批量端点：一次可交多条，质量明显好于 translate_a 系列 */
+const MT_ENDPOINT = 'https://translate-pa.googleapis.com/v1/translateHtml'
+const MT_KEY = 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520'
+const MT_BATCH = 10
+/* 缓存键带引擎标记，换引擎后旧条目自然失效，不必手动清文件 */
+const MT_TAG = 'g'
+
+function commentTrFile() {
+  return join(i18nDir(), 'zh-comments.json')
+}
+
+async function loadCommentTr() {
+  if (commentTrState.map) return commentTrState.map
+  try {
+    const parsed = JSON.parse(await readFile(commentTrFile(), 'utf8'))
+    commentTrState.map = parsed.entries || {}
+  } catch {
+    commentTrState.map = {}
+  }
+  return commentTrState.map
+}
+
+function scheduleCommentTrSave() {
+  if (commentTrState.timer) return
+  commentTrState.timer = setTimeout(() => {
+    commentTrState.timer = null
+    const entries = commentTrState.map || {}
+    void mkdir(i18nDir(), { recursive: true })
+      .then(() => writeFile(commentTrFile(), JSON.stringify({ v: I18N_VERSION, entries })))
+      .catch(() => {})
+  }, 2000)
+  if (typeof commentTrState.timer.unref === 'function') commentTrState.timer.unref()
+}
+
+function mtFetch(url, init) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), MT_TIMEOUT_MS) : null
+  const opts = Object.assign({}, init, ctrl ? { signal: ctrl.signal } : {})
+  return fetch(url, opts).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+/** 主通道：批量提交，返回与输入等长的数组 */
+async function mtBatch(texts, from = 'en', to = 'zh-CN') {
+  const res = await mtFetch(MT_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json+protobuf',
+      'X-Goog-API-Key': MT_KEY,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+    },
+    body: JSON.stringify([[texts, from, to], 'wt_lib']),
+  })
+  if (!res.ok) throw new Error('mt http ' + res.status)
+  const data = await res.json()
+  const arr = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : null
+  if (!arr) throw new Error('mt bad payload')
+  return texts.map((_, i) => (typeof arr[i] === 'string' ? arr[i].trim() : ''))
+}
+
+/** 备用通道：translate_a 单条接口，主通道被拒时逐条补 */
+async function mtSingle(text, from = 'en', to = 'zh-CN') {
+  const url =
+    'https://translate.googleapis.com/translate_a/single?client=at&sl=' +
+    from +
+    '&tl=' +
+    to +
+    '&dt=t&q=' +
+    encodeURIComponent(text)
+  const res = await mtFetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+      Accept: '*/*',
+    },
+  })
+  if (!res.ok) throw new Error('mt http ' + res.status)
+  const data = await res.json()
+  if (!Array.isArray(data) || !Array.isArray(data[0])) return ''
+  return data[0]
+    .map((seg) => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''))
+    .join('')
+    .trim()
+}
+
+async function mtTranslateAll(texts) {
+  try {
+    return await mtBatch(texts)
+  } catch {
+    /* 主通道失败时逐条走备用，单条失败留空由调用方保留原文 */
+    const out = []
+    for (const t of texts) {
+      try {
+        out.push(await mtSingle(t))
+      } catch {
+        out.push('')
+      }
+    }
+    return out
+  }
+}
+
+/**
+ * 逐条机翻 HN 评论，按评论 id 缓存，同一条只翻一次。
+ * 十条一批提交，失败的条目不写入缓存，下次点击会重试。
+ */
+async function translateComments(comments) {
+  const cache = await loadCommentTr()
+  const keyOf = (c) => MT_TAG + ':' + c.id
+  const todo = comments.filter((c) => c.text && c.text.trim().length >= 4 && !cache[keyOf(c)])
+  if (!todo.length) return cache
+  for (let i = 0; i < todo.length; i += MT_BATCH) {
+    const batch = todo.slice(i, i + MT_BATCH)
+    const texts = batch.map((c) => String(c.text).slice(0, 900))
+    const out = await mtTranslateAll(texts)
+    batch.forEach((c, idx) => {
+      if (out[idx]) cache[keyOf(c)] = out[idx]
+    })
+  }
+  scheduleCommentTrSave()
+  return cache
+}
+
+/** 从可能夹带推理过程的文本里，抠出第一个完整 JSON 数组。 */
+function extractJsonArray(text) {
+  const start = text.indexOf('[')
+  if (start < 0) return null
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') inStr = true
+    else if (ch === '[') depth += 1
+    else if (ch === ']') {
+      depth -= 1
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1))
+        } catch {
+          return null
+        }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 翻译单条视频的详情文本。
+ * 列表里没有推荐理由，只有详情带 quote / summary / why_hn，所以翻译按详情触发。
+ */
+async function translateDetail(ctx, detail, lang = 'zh') {
+  const cache = await loadI18n(lang)
+  const jobs = []
+  const push = (field, text) => {
+    if (typeof text !== 'string' || text.trim().length < 8) return
+    const key = `${detail.vid}:${field}`
+    if (cache[key]) return
+    jobs.push({ key, text: text.replace(/\s+/g, ' ').slice(0, 700) })
+  }
+  push('summary', detail.summary)
+  push('why_hn', detail.why_hn)
+  if (detail.quote) push('quote', detail.quote.text)
+
+  if (!jobs.length) return cache
+
+  const glossary = TERMS.map(([en, zh]) => `${en}=${zh}`).join('; ')
+  const numbered = jobs.map((j, i) => `${i + 1}. ${j.text}`).join('\n')
+  const prompt =
+    '把下面这些 Hacker News 上推荐技术视频的英文说明翻成简体中文。' +
+    '保持技术准确、语气自然，不要添加任何解释或前言。\n' +
+    `术语对照：${glossary}\n` +
+    '严格输出 JSON 数组，只含译文，顺序与输入一致，例如 ["译文一","译文二"]。\n\n' +
+    numbered
+
+  try {
+    const text = await askLlm(ctx, prompt)
+    void writeCache('translate-last.json', { ok: true, at: Date.now(), raw: String(text).slice(0, 400) })
+    const arr = extractJsonArray(text)
+    if (Array.isArray(arr)) {
+      jobs.forEach((j, i) => {
+        if (typeof arr[i] === 'string' && arr[i].trim()) cache[j.key] = arr[i].trim()
+      })
+      scheduleI18nSave(lang)
+    }
+  } catch (err) {
+    void writeCache('translate-last.json', {
+      ok: false,
+      at: Date.now(),
+      message: String(err?.message ?? err).slice(0, 300),
+    })
+  }
+  return cache
+}
+
+/** 模型偶尔把批内编号带进译文，剥掉行首的 "N. " / "N、" / "N)" */
+function stripLeadingIndex(text) {
+  return String(text)
+    .replace(/^\s*\d+\s*[.、)．]\s*/, '')
+    .trim()
+}
+
+/* ---------------- 译文出口校验 ---------------- */
+
+/**
+ * 只认真正的指令泄漏。早先的正则把「要求」「prompt」当特征词，
+ * 误伤了「有人要求我对此保密」「[un]prompted 2026」这类正常译文。
+ */
+const TITLE_LEAK = /(只含译文|只输出|输出译文|请翻译以下|以下是译文|翻译成中文[:：]|不要解释|格式要求|译文如下)/
+const TITLE_MAX = 120
+
+/**
+ * 中文标题不用竖线分层。原站标题是 "A | B | C" 的结构，
+ * 译文照搬竖线会读成机器翻的，这里改写成冒号 / 括号 / 逗号。
+ */
+function normalizeTitle(input) {
+  let s = String(input ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/｜/g, '|')
+  const parts = s
+    .split('|')
+    .map((x) => x.trim())
+    .filter(Boolean)
+  if (parts.length < 2) return s
+  let out = parts[0]
+  for (let i = 1; i < parts.length; i += 1) {
+    const p = parts[i]
+    const endsWithQuestion = /[？！?!]$/.test(out)
+    /* 这一段自己已经带冒号（"第1章：线性代数的本质"），再用冒号接就是双冒号 */
+    const partHasColon = /[：:]/.test(p)
+    if (i === 1 && endsWithQuestion) out += `（${p}）`
+    else if (partHasColon) out += `，${p}`
+    else if (!/[：:]/.test(out)) out += `：${p}`
+    else out += `，${p}`
+  }
+  return out
+    .replace(/：\s+/g, '：')
+    .replace(/\s+，/g, '，')
+    /* 历史数据里已经写成「A：第1章：B」的，把中间那段降级成逗号 */
+    .replace(/：([^：，。；！？（）]{1,10})：/g, '，$1：')
+}
+
+/**
+ * 结构可疑度：中文标题里出现堆叠分层、过长、并列逗号过多，都说明模型
+ * 是照着英文语序搬的。0 分不动，>=2 分优先重排。
+ */
+function titleStructureScore(text) {
+  const t = String(text || '')
+  let n = 0
+  if ((t.match(/：/g) || []).length >= 2) n += 1
+  if (t.length > 30) n += 1
+  if (/，[^，]{0,8}：/.test(t)) n += 1
+  if ((t.match(/（/g) || []).length >= 2) n += 1
+  if (t.length > 18 && !t.includes('：') && (t.match(/，/g) || []).length >= 2) n += 1
+  return n
+}
+
+/** 译文能不能进缓存：ok / empty / leak / separator / too-long */
+function titleVerdict(text) {
+  const s = String(text ?? '').trim()
+  if (!s) return 'empty'
+  if (TITLE_LEAK.test(s)) return 'leak'
+  if (/[｜|]/.test(s)) return 'separator'
+  if (s.length > TITLE_MAX) return 'too-long'
+  return 'ok'
+}
+
+/**
+ * 批量翻译视频标题。
+ * 标题短、量大，单独一个缓存文件，避免和详情译文混在一起。
+ */
+let titleRun = null
+
+/**
+ * 单飞：标题翻译同一时刻只跑一轮。前端打开面板会带一次 translate=1，
+ * 和后台补翻撞上就会互相抢并发，把两边都拖成超时。
+ */
+function translateTitles(ctx, items, lang = 'zh') {
+  if (titleRun) return titleRun
+  titleRun = runTitleTranslation(ctx, items, lang).finally(() => {
+    titleRun = null
+  })
+  return titleRun
+}
+
+async function runTitleTranslation(ctx, items, lang = 'zh') {
+  const store = lang + '-titles'
+  const cache = await loadI18n(store)
+  const todo = items.filter((it) => it.t && !cache[it.v])
+  if (!todo.length) return cache
+
+  /* 实测：16 条一批时输出变长、超时增多，自适应把并发压到 4-8，净吞吐反而低于 12 */
+  const BATCH = 12
+  const CONCURRENCY = 6
+  const batches = []
+  for (let i = 0; i < todo.length; i += BATCH) batches.push(todo.slice(i, i + BATCH))
+
+  const buildPrompt = (batch) => {
+    const lines = batch
+      .map((it, idx) => {
+        const hint = []
+        if (Array.isArray(it.tags) && it.tags.length) hint.push('标签：' + it.tags.slice(0, 5).join(', '))
+        if (it.c) hint.push('频道：' + it.c)
+        if (it.y) hint.push('年份：' + it.y)
+        const meta = hint.length ? `（${hint.join('；')}）` : ''
+        return `${idx + 1}. ${String(it.t).slice(0, 220)}${meta}`
+      })
+      .join('\n')
+    return (
+      '你是一位极其挑剔的中文作家，痛恨从英文直译而来的不自然表达。\n' +
+      '下面是一批英文技术视频标题。请用中文重写它们——不是逐词翻译，是重写：\n' +
+      '先想清楚这个视频讲什么，再用一个中国人会写出来的标题表达。\n\n' +
+      '【必须遵守】\n' +
+      '1. 拒绝英文语序。英文的连词、冠词、介词在中文里常常不该出现。\n' +
+      '   一句话读不通就是错的，宁可换说法也不要逐词对应。\n' +
+      '2. 拆解英文复合名词，用中文的名词修饰语法重建。\n' +
+      '   例：mom creators 不是「母亲创作者」，是「宝妈博主」\n' +
+      '3. 专有名词、产品名、人名、项目名、缩写保留原文：Transformer、Rust、Karpathy、TCP、micrograd\n' +
+      '4. 副标题用冒号「：」或括号承接，绝对不要用竖线「|」或「｜」分层；原标题的编号要保留\n' +
+      '5. 原标题是问句就译成问句；有比喻就保留比喻，不要压平成说明文\n' +
+      '6. 中英文之间加空格：API 密钥 而不是 API密钥\n' +
+      '7. 中文标点用全角：。，：；！？（）——……；引用一律用「」，不用弯引号\n' +
+      '8. 括号里的标签和频道只用于理解，不要译进标题\n\n' +
+      '【中文标题的层级：先分层，再落笔】\n' +
+      '英文标题把信息平铺成一串（主题 - 副标题 - 讲者 - 活动），几段是平级的；\n' +
+      '中文标题必须有主从：主标题只说「这是什么」，其余降级或删掉。\n' +
+      '1. 主标题一句话，20 字内，不塞年份、活动名、讲者。\n' +
+      '2. 从属信息最多留一层：系列与集数写「第 N 章 / 第 N 讲」，讲者写「人名：」前置或「（人名）」后置。\n' +
+      '3. 三段以上砍到两段，砍的顺序：活动名 → 年份 → 讲者。\n' +
+      '4. 分层靠语序和冒号，不靠竖线，也不要把四段用逗号串起来。\n' +
+      '5. 四种结构按内容选一种，不混用：\n' +
+      '   A 系列在前：线性代数的本质 第 1 章：向量\n' +
+      '   B 讲者在前：Derek Sivers：怎样发起一场运动\n' +
+      '   C 机构在前：GOTO 2019：Erlang 与 Elixir 的灵魂\n' +
+      '   D 主题在前：分布式系统 1.1：导论\n' +
+      '【这些是错的，照着避开】\n' +
+      '- "But what is the Fourier Transform?" → 错：「但傅里叶变换是什么？」（中文不用"但"起句）\n' +
+      '  对：「傅里叶变换究竟是什么？」\n' +
+      '- "Simple Made Easy" → 错：「让简单变容易」（原意是简单不等于容易，译反了）\n' +
+      '  对：「简单并不容易」\n' +
+      '- "Around The Corner - How Differential Steering Works" → 错：「拐角处——差速转向如何工作」\n' +
+      '  对：「过弯时发生了什么——差速转向原理」\n' +
+      '- "How to Speak" → 错：「如何演讲」（干瘪，丢掉这是 MIT 经典讲座的分量）\n' +
+      '  对：「怎样做一场好演讲」\n' +
+      '- "makes sense" 类直译 → 错：「这说得通」，对：「这有道理」\n' +
+      '- "at the end of the day" 类直译 → 错：「在一天结束时」，对：「归根结底」\n\n' +
+      '严格输出 JSON 数组，只含译文，顺序与输入一致，不要任何解释。\n\n' +
+      lines
+    )
+  }
+
+  /* 自适应并发：一次 10 条一批，同时在飞的请求数在 MIN..MAX 之间爬。
+     成功连击就加速，失败或超时立刻降速，避免把 provider 打到 429。 */
+  const MIN_INFLIGHT = 4
+  const MAX_INFLIGHT = 24
+  let inflight = 10
+  let streak = 0
+  let consecutiveFails = 0
+  let shortCount = 0
+  const refilled = new Set()
+  const errors = []
+  let cursor = 0
+  let done = 0
+  let failed = 0
+  let active = 0
+  const startedAt = Date.now()
+
+  const report = () => {
+    const elapsed = Math.max(1, (Date.now() - startedAt) / 1000)
+    const rate = done / elapsed
+    void writeCache('titles-progress.json', {
+      at: Date.now(),
+      total: batches.length,
+      done,
+      failed,
+      inflight,
+      ratePerSec: Number(rate.toFixed(2)),
+      refilled: shortCount,
+      etaSec: rate > 0 ? Math.round((batches.length - done - failed) / rate) : null,
+    })
+  }
+
+  const runBatch = async (batch) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const text = await askLlm(ctx, buildPrompt(batch))
+        const arr = extractJsonArray(text)
+        if (!Array.isArray(arr)) throw new Error('bad json')
+        const rejected = []
+        batch.forEach((it, i2) => {
+          if (typeof arr[i2] !== 'string' || !arr[i2].trim()) return
+          const clean = normalizeTitle(stripLeadingIndex(arr[i2]))
+          const verdict = titleVerdict(clean)
+          /* 指令泄漏和空串不进缓存，下次还会重翻；其余规范化后收下 */
+          if (verdict === 'leak' || verdict === 'empty') {
+            rejected.push({ v: it.v, verdict, text: clean.slice(0, 90) })
+            return
+          }
+          cache[it.v] = clean
+        })
+        /* 批次变大以后模型偶尔少给几条：把没拿到的重新排队，只回填一次 */
+        if (arr.length < batch.length) {
+          const missing = batch.slice(arr.length).filter((it) => !refilled.has(it.v))
+          if (missing.length) {
+            for (const it of missing) refilled.add(it.v)
+            for (let i = 0; i < missing.length; i += BATCH) batches.push(missing.slice(i, i + BATCH))
+            shortCount += missing.length
+          }
+        }
+        if (rejected.length) {
+          void writeCache('titles-reject.json', { at: Date.now(), count: rejected.length, samples: rejected.slice(0, 20) })
+        }
+        scheduleI18nSave(store)
+        streak += 1
+        consecutiveFails = 0
+        if (streak >= 6 && inflight < MAX_INFLIGHT) {
+          inflight += 1
+          streak = 0
+        }
+        return true
+      } catch (err) {
+        streak = 0
+        consecutiveFails += 1
+        if (errors.length < 12) errors.push(String(err?.message ?? err).slice(0, 160))
+        /* 单批失败很常见（超时、JSON 截断），连续两次才降速，且一次只降一档 */
+        if (consecutiveFails >= 2) {
+          inflight = Math.max(MIN_INFLIGHT, inflight - 2)
+          consecutiveFails = 0
+        }
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)))
+      }
+    }
+    return false
+  }
+
+  const lane = async () => {
+    while (cursor < batches.length) {
+      if (active >= inflight) {
+        await new Promise((r) => setTimeout(r, 40))
+        continue
+      }
+      const idx = cursor
+      cursor += 1
+      active += 1
+      const ok = await runBatch(batches[idx])
+      active -= 1
+      if (ok) done += 1
+      else failed += 1
+      if ((done + failed) % 10 === 0) report()
+    }
+  }
+
+  await Promise.all(Array.from({ length: MAX_INFLIGHT }, lane))
+  report()
+  if (errors.length) {
+    void writeCache('titles-llm-errors.json', { at: Date.now(), inflight, errors })
+  }
+  return cache
+}
+
+/** 翻译领域名和分类名，一共 166 条，一次跑完 */
+async function translateTaxonomy(ctx, jobs, lang = 'zh') {
+  const store = lang + '-taxonomy'
+  const cache = await loadI18n(store)
+  const todo = jobs.filter((j) => !cache[j.key])
+  if (!todo.length) return cache
+
+  const BATCH = 30
+  for (let i = 0; i < todo.length; i += BATCH) {
+    const batch = todo.slice(i, i + BATCH)
+    const numbered = batch.map((j, idx) => `${idx + 1}. ${j.text}`).join('\n')
+    const prompt =
+      '把这些技术视频平台的领域名和分类名翻成简体中文。\n' +
+      '要求：\n' +
+      '- 简洁准确，符合中文技术社区习惯\n' +
+      '- 保留专有名词与缩写：AI、GPU、Rust、TCP、VR\n' +
+      '- 并列结构保留并列，例如 "Business, Startups & Economics" → "商业、创业与经济"\n' +
+      '- 分类名用名词短语，不加句号\n\n' +
+      '严格输出 JSON 数组，只含译文，顺序与输入一致。\n\n' +
+      numbered
+    try {
+      const text = await askLlm(ctx, prompt)
+      const arr = extractJsonArray(text)
+      if (Array.isArray(arr)) {
+        batch.forEach((j, idx) => {
+          if (typeof arr[idx] === 'string' && arr[idx].trim()) cache[j.key] = arr[idx].trim()
+        })
+        scheduleI18nSave(store)
+      }
+    } catch {
+      break
+    }
+  }
+  return cache
+}
+
+/* ---------------- 依赖探测 ---------------- */
+
+/** 跑一条命令拿输出；命令不存在、超时、非零退出都收敛成同一个形状。 */
+function runCmd(cmd, args, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    let out = ''
+    let err = ''
+    let settled = false
+    const finish = (r) => {
+      if (settled) return
+      settled = true
+      resolve(r)
+    }
+    let child
+    try {
+      child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      return finish({ ok: false, out: '', err: String(e?.message ?? e) })
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        /* 已退出 */
+      }
+      finish({ ok: false, out, err: 'timeout' })
+    }, timeoutMs)
+    child.stdout.on('data', (d) => {
+      out = (out + d).slice(0, 8000)
+    })
+    child.stderr.on('data', (d) => {
+      err = (err + d).slice(0, 8000)
+    })
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      finish({ ok: false, out, err: String(e?.message ?? e) })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      finish({ ok: code === 0, out, err })
+    })
+  })
+}
+
+const depsState = { at: 0, value: null }
+
+/** 探测字幕管线依赖。缺失时给安装提示，不替用户装。 */
+async function probeDeps(force) {
+  if (!force && depsState.value && Date.now() - depsState.at < 60_000) return depsState.value
+  const [ytdlp, ffmpeg, py] = await Promise.all([
+    runCmd('yt-dlp', ['--version'], 10_000),
+    runCmd('ffmpeg', ['-version'], 10_000),
+    runCmd('python', ['-c', 'import faster_whisper;print(faster_whisper.__version__)'], 15_000),
+  ])
+  const value = {
+    ytdlp: ytdlp.ok
+      ? { ok: true, version: ytdlp.out.trim().split('\n')[0] }
+      : { ok: false, hint: 'pip install -U yt-dlp' },
+    ffmpeg: ffmpeg.ok
+      ? {
+          ok: true,
+          version: (/ffmpeg version (\S+)/.exec(ffmpeg.out) || [])[1] || 'ok',
+        }
+      : { ok: false, hint: '安装 ffmpeg 并加入 PATH' },
+    whisper: py.ok
+      ? { ok: true, version: py.out.trim() }
+      : { ok: false, hint: 'pip install faster-whisper' },
+  }
+  depsState.at = Date.now()
+  depsState.value = value
+  return value
+}
+
+/* ---------------- 字幕 ---------------- */
+
+function subsDir() {
+  return join(cacheRoot(), 'subs')
+}
+
+function vttSeconds(s) {
+  const m = /(\d+):(\d+):(\d+)\.(\d+)/.exec(s)
+  if (!m) return 0
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000
+}
+
+function parseVtt(text) {
+  const cues = []
+  let cur = null
+  for (const line of String(text).replace(/\r/g, '').split('\n')) {
+    if (/^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->/.test(line)) {
+      const [a, b] = line.split('-->')
+      cur = {
+        start: vttSeconds(a.trim()),
+        end: vttSeconds((b || '').trim().split(/\s+/)[0] || ''),
+        text: '',
+      }
+      cues.push(cur)
+    } else if (cur && line.trim() && !/^(WEBVTT|NOTE|Kind:|Language:|STYLE)/.test(line)) {
+      const clean = line.replace(/<[^>]+>/g, '').trim()
+      if (clean) cur.text = cur.text ? cur.text + ' ' + clean : clean
+    }
+  }
+  return cues.filter((c) => c.text)
+}
+
+/* 中文优先，回退到英文 */
+const SUBS_ZH = ['zh-Hans', 'zh-CN', 'zh', 'zh-Hant', 'zh-TW']
+const SUBS_EN = ['en', 'en-US', 'en-GB']
+
+/**
+ * 取一条视频的字幕。
+ * 只做三件事：查缓存、调 yt-dlp、把失败翻译成可执行的提示。
+ * 依赖缺失或上游风控时如实上报，不尝试自行修复环境。
+ */
+async function loadSubs(vid, wantZh) {
+  const dir = subsDir()
+  const cacheFile = join(dir, `${vid}.${wantZh ? 'zh' : 'en'}.json`)
+  try {
+    const raw = await readFile(cacheFile, 'utf8')
+    return { status: 200, body: JSON.parse(raw) }
+  } catch {
+    /* 未缓存 */
+  }
+
+  const deps = await probeDeps()
+  if (!deps.ytdlp.ok) {
+    return {
+      status: 424,
+      body: { reason: 'missing-dependency', need: 'yt-dlp', hint: deps.ytdlp.hint },
+    }
+  }
+
+  await mkdir(dir, { recursive: true })
+  const tmp = join(dir, `.tmp-${vid}-${Date.now()}`)
+  await mkdir(tmp, { recursive: true })
+
+  /* 约定路径：用户把导出的 cookie 放到插件缓存目录下，管线自动使用 */
+  const cookieFile = join(cacheRoot(), 'cookies.txt')
+  const hasCookies = await stat(cookieFile)
+    .then((s) => s.size > 0)
+    .catch(() => false)
+
+  const langs = (wantZh ? SUBS_ZH.concat(SUBS_EN) : SUBS_EN).join(',')
+  const args = [
+    '--skip-download',
+    '--write-subs',
+    '--write-auto-subs',
+    '--sub-langs',
+    langs,
+    '--sub-format',
+    'vtt',
+    '--no-warnings',
+    '-o',
+    join(tmp, '%(id)s.%(ext)s'),
+  ]
+  if (hasCookies) args.push('--cookies', cookieFile)
+  args.push(`https://www.youtube.com/watch?v=${vid}`)
+
+  const res = await runCmd('yt-dlp', args, 120_000)
+
+  let files = []
+  try {
+    files = (await readdir(tmp)).filter((f) => f.endsWith('.vtt'))
+  } catch {
+    /* 目录都没建出来 */
+  }
+
+  if (!files.length) {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {})
+    if (/sign in to confirm|not a bot|cookies/i.test(res.err)) {
+      return {
+        status: 409,
+        body: {
+          reason: 'needs-cookies',
+          hint:
+            'YouTube 要求登录校验。用浏览器扩展导出 Netscape 格式 cookies.txt，' +
+            `放到 ${cookieFile}，然后重试。`,
+          cookiePath: cookieFile,
+        },
+      }
+    }
+    return {
+      status: 409,
+      body: { reason: 'no-captions', hint: '这条视频没有可用字幕，需要本地转写' },
+    }
+  }
+
+  /* 文件名形如 <vid>.<lang>.vtt，按优先级挑一条 */
+  const order = wantZh ? SUBS_ZH.concat(SUBS_EN) : SUBS_EN
+  let picked = null
+  let pickedLang = null
+  for (const lang of order) {
+    const hit = files.find((f) => f.startsWith(`${vid}.${lang}.`))
+    if (hit) {
+      picked = hit
+      pickedLang = lang
+      break
+    }
+  }
+  if (!picked) {
+    picked = files[0]
+    pickedLang = picked.slice(vid.length + 1, picked.length - 4)
+  }
+
+  let cues = []
+  try {
+    cues = parseVtt(await readFile(join(tmp, picked), 'utf8'))
+  } catch {
+    cues = []
+  }
+  await rm(tmp, { recursive: true, force: true }).catch(() => {})
+
+  if (!cues.length) {
+    return { status: 409, body: { reason: 'no-captions', hint: '字幕文件为空' } }
+  }
+
+  const payload = {
+    v: 1,
+    vid,
+    lang: pickedLang,
+    auto: /^(zh|en)/.test(pickedLang) ? undefined : undefined,
+    cues,
+    at: Date.now(),
+  }
+  void writeFile(cacheFile, JSON.stringify(payload)).catch(() => {})
+  return { status: 200, body: payload }
+}
+
+function send(res, code, body, type = 'application/json; charset=utf-8') {
+  const headers = {
+    'Content-Type': type,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  }
+  /* 桌面端页面在 dsh-app:// 下拿不到 HTTP 地址，借每次响应把它带过去，
+     前端才能把播放器中转页放回安全上下文 */
+  if (state.origin) headers['X-Hackertube-Origin'] = state.origin
+  res.writeHead(code, headers)
+  res.end(typeof body === 'string' ? body : JSON.stringify(body))
+}
+
+function json(res, code, body) {
+  send(res, code, body)
+}
+
+async function handler(req, res) {
+  const url = new URL(req.url ?? '/', 'http://local')
+  const route = url.pathname.slice(PREFIX.length)
+
+  if (!trusted(req)) return json(res, 403, { error: 'forbidden' })
+
+  /* 浏览器半的执行回执：client.js 在各阶段 POST 上来，落盘供事后核查 */
+  if (route === '/chat' && req.method === 'POST') {
+    let size = 0
+    const chunks = []
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 262144) {
+        req.destroy()
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', async () => {
+      let body = {}
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        return json(res, 400, { error: 'bad json' })
+      }
+      const vid = String(body.vid || '')
+      const question = String(body.question || '').slice(0, 2000)
+      if (!/^[A-Za-z0-9_-]{6,20}$/.test(vid) || !question) {
+        return json(res, 400, { error: 'vid and question required' })
+      }
+      if (!state.ctx) return json(res, 503, { error: 'llm unavailable' })
+      try {
+        const detail = await loadVideo(vid).catch(() => null)
+        const title = (detail && (detail.title || detail.t)) || vid
+        /* 有字幕就带上播放位置附近的片段，没有就只靠元数据回答 */
+        let subtitleContext = ''
+        try {
+          const subs = await loadSubs(vid, false)
+          if (subs.status === 200 && subs.body.cues && subs.body.cues.length) {
+            const at = Number(body.at)
+            const cues = subs.body.cues
+            let slice = cues
+            if (Number.isFinite(at) && at > 0) {
+              const from = Math.max(0, at - 180)
+              const to = at + 180
+              slice = cues.filter((c) => c.end >= from && c.start <= to)
+              if (!slice.length) slice = cues.slice(0, 60)
+            } else {
+              slice = cues.slice(0, 120)
+            }
+            subtitleContext =
+              '\n\n以下是该视频的字幕片段（带时间戳）：\n' +
+              slice
+                .slice(0, 200)
+                .map((c) => `[${Math.floor(c.start / 60)}:${String(Math.floor(c.start % 60)).padStart(2, '0')}] ${c.text}`)
+                .join('\n')
+          }
+        } catch {
+          /* 字幕不可用时退化为只读元数据 */
+        }
+        const answerLang = body.lang === 'en' ? 'en' : 'zh'
+        const prompt =
+          `你在帮用户理解一个 Hacker News 推荐过的技术视频。\n` +
+          `视频标题：${title}\n` +
+          (detail && detail.channel ? `频道：${detail.channel}\n` : '') +
+          (detail && detail.summary ? `简介：${detail.summary}\n` : '') +
+          (detail && detail.why_hn ? `HN 推荐理由：${detail.why_hn}\n` : '') +
+          subtitleContext +
+          `\n\n用户的问题：${question}\n\n` +
+          (answerLang === 'en'
+            ? '要求：用英文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。'
+            : '要求：用简体中文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。')
+        if (body.stream === true) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          })
+          if (typeof res.flushHeaders === 'function') res.flushHeaders()
+          let closed = false
+          const finish = (payload) => {
+            if (closed) return
+            closed = true
+            try {
+              res.write('data: ' + JSON.stringify(payload) + '\n\n')
+              res.write('data: [DONE]\n\n')
+              res.end()
+            } catch {
+              /* 客户端提前断开 */
+            }
+          }
+          res.on('close', () => {
+            closed = true
+          })
+          try {
+            const answer = await askLlm(state.ctx, prompt, {
+              onDelta: (piece) => {
+                if (closed) return
+                try {
+                  res.write('data: ' + JSON.stringify({ delta: piece }) + '\n\n')
+                } catch {
+                  closed = true
+                }
+              },
+            })
+            finish({ done: true, answer, hasSubtitles: !!subtitleContext })
+          } catch (err) {
+            finish({ error: String(err?.message ?? err).slice(0, 200) })
+          }
+          return
+        }
+        const answer = await askLlm(state.ctx, prompt)
+        return json(res, 200, { answer, hasSubtitles: !!subtitleContext })
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message ?? err).slice(0, 200) })
+      }
+    })
+    return
+  }
+
+  if (route === '/beacon' && req.method === 'POST') {
+    let size = 0
+    const chunks = []
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 65536) {
+        req.destroy()
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        /* 记请求头时避开 payload 自己的 origin 字段，免得覆盖客户端上报的值 */
+        payload.reqReferer = req.headers.referer ?? req.headers.referrer ?? null
+        payload.reqOrigin = req.headers.origin ?? null
+        payload.reqSite = req.headers['sec-fetch-site'] ?? null
+        const prev = state.beaconLog || []
+        prev.push(payload)
+        state.beaconLog = prev.slice(-20)
+        void writeCache('beacon.json', state.beaconLog)
+      } catch {
+        /* 回执坏了不影响主流程 */
+      }
+      json(res, 200, { ok: true })
+    })
+    return
+  }
+
+    if (route === '/prefs') {
+      if (req.method === 'POST') {
+        let size = 0
+        const chunks = []
+        req.on('data', (c) => {
+          size += c.length
+          if (size > 262144) {
+            req.destroy()
+            return
+          }
+          chunks.push(c)
+        })
+        req.on('end', async () => {
+          let body = null
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+          } catch {
+            return json(res, 400, { error: 'bad json' })
+          }
+          const clean = {}
+          for (const key of ['likes', 'later', 'seen']) {
+            const list = body && Array.isArray(body[key]) ? body[key] : []
+            clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
+          }
+          clean.at = Date.now()
+          await writeCache('prefs.json', clean)
+          return json(res, 200, { ok: true, counts: { likes: clean.likes.length, later: clean.later.length, seen: clean.seen.length } })
+        })
+        return
+      }
+      const saved = await readCache('prefs.json')
+      return json(res, 200, {
+        likes: Array.isArray(saved && saved.likes) ? saved.likes : [],
+        later: Array.isArray(saved && saved.later) ? saved.later : [],
+        seen: Array.isArray(saved && saved.seen) ? saved.seen : [],
+      })
+    }
+  /* 搜索框的中文查询先机翻成英文，再去命中英文标签与频道 */
+  if (route === '/mt' && req.method === 'POST') {
+    let size = 0
+    const chunks = []
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 8192) {
+        req.destroy()
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', async () => {
+      let body = {}
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        return json(res, 400, { error: 'bad json' })
+      }
+      const text = String(body.text || '').trim().slice(0, 200)
+      const to = body.to === 'zh' ? 'zh' : 'en'
+      if (!text) return json(res, 400, { error: 'text required' })
+      const out = await mtQuery(text, to)
+      return json(res, 200, { text: out })
+    })
+    return
+  }
+
+  if (route === '/comments/translate' && req.method === 'POST') {
+    let size = 0
+    const chunks = []
+    req.on('data', (c) => {
+      size += c.length
+      if (size > 262144) {
+        req.destroy()
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', async () => {
+      let body = {}
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        return json(res, 400, { error: 'bad json' })
+      }
+      const vid = String(body.vid || '')
+      if (!/^[A-Za-z0-9_-]{6,20}$/.test(vid)) return json(res, 400, { error: 'bad vid' })
+      const wanted = Array.isArray(body.ids) ? body.ids.map(String) : null
+      const list = pickComments(vid).filter((c) => !wanted || wanted.indexOf(String(c.id)) >= 0)
+      if (!list.length) return json(res, 200, { entries: {} })
+      try {
+        const cache = await translateComments(list)
+        const entries = {}
+        for (const c of list) {
+          const zh = cache[MT_TAG + ':' + c.id]
+          if (zh) entries[c.id] = zh
+        }
+        return json(res, 200, { entries })
+      } catch (err) {
+        return json(res, 500, { error: String(err?.message ?? err).slice(0, 200) })
+      }
+    })
+    return
+  }
+
+  if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
+
+  try {
+    if (route === '/list') {
+      const items = await loadList()
+      if (!state.listJson) state.listJson = JSON.stringify(items)
+      return send(res, 200, state.listJson)
+    }
+    if (route === '/playlists') {
+      const list = await loadPlaylists(url.searchParams.get('force') === '1')
+      return json(res, 200, list.map(withChinese))
+    }
+    if (route === '/playlist') {
+      const slug = url.searchParams.get('slug')
+      if (!slug || !/^[a-z0-9-]{2,64}$/.test(slug)) return json(res, 400, { error: 'bad-slug' })
+      return json(res, 200, withChinese(await loadPlaylist(slug)))
+    }
+    if (route === '/browse') {
+      if (!state.browseJson) state.browseJson = JSON.stringify(await loadBrowse())
+      return send(res, 200, state.browseJson)
+    }
+    if (route === '/related') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) return json(res, 400, { error: 'bad vid' })
+      return json(res, 200, await loadRelated(vid))
+    }
+    if (route === '/video') {
+      const vid = url.searchParams.get('vid')
+      if (!vid) return json(res, 400, { error: 'vid required' })
+      const detail = await loadVideo(vid)
+      if (url.searchParams.get('lang') === 'zh' && state.ctx) {
+        const cache = await translateDetail(state.ctx, detail, 'zh')
+        return json(res, 200, {
+          ...detail,
+          comments: pickComments(vid),
+          i18n: {
+            summary: cache[`${vid}:summary`] || null,
+            why_hn: cache[`${vid}:why_hn`] || null,
+            quote: cache[`${vid}:quote`] || null,
+          },
+        })
+      }
+      return json(res, 200, Object.assign({}, detail, { comments: pickComments(vid) }))
+    }
+    if (route === '/media') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad vid' })
+      }
+      return serveMedia(req, res, vid)
+    }
+    if (route === '/stream') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad vid' })
+      }
+      return serveStream(req, res, vid)
+    }
+    if (route === '/embed') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad vid' })
+      }
+      return serveEmbed(req, res, vid, url.searchParams.get('lang') === 'zh' ? 'zh' : 'en')
+    }
+    if (route === '/config') {
+      return json(res, 200, {
+        origin: state.origin,
+        authUrl: state.authUrl,
+        mediaOrigin: state.mediaOrigin,
+      })
+    }
+    if (route === '/taxonomy') {
+      const lang = url.searchParams.get('lang') || 'en'
+      const tax = await loadBrowse()
+      if (lang !== 'zh') return json(res, 200, tax)
+      const cache = await loadI18n('zh-taxonomy')
+      if (url.searchParams.get('translate') === '1' && state.ctx) {
+        const jobs = []
+        for (const a of tax.areas || []) {
+          if (a.name && !cache['a:' + a.id]) jobs.push({ key: 'a:' + a.id, text: a.name })
+          for (const c of a.categories || []) {
+            if (c.name && !cache['c:' + c.id]) jobs.push({ key: 'c:' + c.id, text: c.name })
+          }
+        }
+        if (jobs.length) void translateTaxonomy(state.ctx, jobs).catch(() => {})
+      }
+      const out = {
+        version: tax.version,
+        areas: (tax.areas || []).map((a) => ({
+          ...a,
+          nameZh: cache['a:' + a.id] || null,
+          categories: (a.categories || []).map((c) => ({
+            ...c,
+            nameZh: cache['c:' + c.id] || null,
+          })),
+        })),
+      }
+      return json(res, 200, out)
+    }
+    if (route === '/titles') {
+      const lang = url.searchParams.get('lang') || 'zh'
+      const store = lang + '-titles'
+      const cache = await loadI18n(store)
+      if (url.searchParams.get('translate') === '1') {
+        const items = await loadList()
+        const missing = items.filter((it) => it.t && !cache[it.v])
+        void writeCache('titles-trigger.json', {
+          at: Date.now(),
+          hasCtx: !!state.ctx,
+          items: items.length,
+          missing: missing.length,
+        })
+        if (missing.length && state.ctx) {
+          const limit = Number(url.searchParams.get('n') || 400)
+          void translateTitles(state.ctx, missing.slice(0, limit), lang).catch(() => {})
+        }
+      }
+      return json(res, 200, { lang, total: Object.keys(cache).length, entries: cache })
+    }
+    /**
+     * 标题译文体检。没有 apply 只统计，apply=1 时把能修的修掉、
+     * 把指令泄漏的条目删掉让下一轮重翻。可反复调用，幂等。
+     */
+    if (route === '/titles/lint') {
+      const lang = url.searchParams.get('lang') || 'zh'
+      const store = lang + '-titles'
+      const cache = await loadI18n(store)
+      const apply = url.searchParams.get('apply') === '1'
+      const out = {
+        lang,
+        total: 0,
+        changed: 0,
+        removed: 0,
+        leaks: 0,
+        separators: 0,
+        rawSeparators: 0,
+        empty: 0,
+        applied: apply,
+        samples: [],
+      }
+      for (const [vid, raw] of Object.entries(cache)) {
+        out.total += 1
+        const clean = normalizeTitle(raw)
+        const verdict = titleVerdict(clean)
+        if (verdict === 'leak') {
+          out.leaks += 1
+          if (out.samples.length < 8) {
+            out.samples.push({ vid, verdict, text: String(raw).slice(0, 90) })
+          }
+        }
+        if (verdict === 'separator') out.separators += 1
+        if (/[｜|]/.test(String(raw))) out.rawSeparators += 1
+        if (verdict === 'empty') out.empty += 1
+        const changed = clean !== raw
+        if (changed) out.changed += 1
+        if (!apply) continue
+        if (verdict === 'leak' || verdict === 'empty') {
+          delete cache[vid]
+          out.removed += 1
+        } else if (changed) {
+          cache[vid] = clean
+        }
+      }
+      if (apply && (out.changed || out.removed)) scheduleI18nSave(store)
+      return json(res, 200, out)
+    }
+    /** 指定 id 强制重译：先删缓存再排队，用来验证新的提示词。 */
+    if (route === '/titles/retranslate') {
+      const store = 'zh-titles'
+      let ids = String(url.searchParams.get('ids') || '')
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean)
+      if (!ids.length && url.searchParams.get('filter') === 'title-missing') {
+        const limit = Number(url.searchParams.get('n') || 200)
+        const list = await loadList()
+        const cacheNow = await loadI18n(store)
+        ids = list
+          .filter((it) => it.t && !cacheNow[it.v])
+          .slice(0, limit)
+          .map((it) => it.v)
+      }
+      if (!ids.length && url.searchParams.get('filter') === 'title-structure') {
+        const limit = Number(url.searchParams.get('n') || 200)
+        const minScore = Number(url.searchParams.get('min') || 1)
+        const list = await loadList()
+        const cacheNow = await loadI18n(store)
+        ids = list
+          .filter((it) => {
+            const z = cacheNow[it.v]
+            return z && titleStructureScore(z) >= minScore
+          })
+          .slice(0, limit)
+          .map((it) => it.v)
+      }
+      if (!ids.length) return json(res, 400, { error: 'ids required' })
+      const cache = await loadI18n(store)
+      let removed = 0
+      for (const id of ids) {
+        if (cache[id] !== undefined) {
+          delete cache[id]
+          removed += 1
+        }
+      }
+      scheduleI18nSave(store)
+      const list = await loadList()
+      const items = list.filter((it) => ids.includes(it.v))
+      if (state.ctx && items.length) void translateTitles(state.ctx, items, 'zh').catch(() => {})
+      return json(res, 200, { requested: ids.length, removed, queued: items.length })
+    }
+    if (route === '/titles/progress') {
+      const p = await readCache('titles-progress.json')
+      return json(res, 200, p || { done: 0, total: 0 })
+    }
+    if (route === '/tools') {
+      const out = { registered: null, names: [] }
+      try {
+        const tools = state.ctx?.get?.('tools')
+        if (tools) {
+          out.hasService = true
+          const api = []
+          let p = tools
+          while (p && p !== Object.prototype) {
+            api.push(...Object.getOwnPropertyNames(p))
+            p = Object.getPrototypeOf(p)
+          }
+          out.api = Array.from(new Set(api)).slice(0, 30)
+          for (const key of ['get', 'schemas', 'view', 'wireSchemas']) {
+            if (typeof tools[key] !== 'function') continue
+            try {
+              const v = await tools[key]()
+              if (Array.isArray(v) && v.length) {
+                out.names = v
+                  .map((x) => (typeof x === 'string' ? x : x && (x.name || x.id || x.tool)))
+                  .filter(Boolean)
+                out.via = key
+                if (out.names.length) break
+              } else if (v && typeof v === 'object') {
+                out.names = Object.keys(v).slice(0, 80)
+                out.via = key
+                if (out.names.length) break
+              }
+            } catch {
+              /* 换下一个 */
+            }
+          }
+        }
+      } catch (err) {
+        out.error = String(err?.message ?? err).slice(0, 150)
+      }
+      return json(res, 200, out)
+    }
+    if (route === '/thumb') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad vid' })
+      }
+      try {
+        const upstream = await fetch(`https://i.ytimg.com/vi/${vid}/hqdefault.jpg`, {
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!upstream.ok) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' })
+          return res.end('upstream ' + upstream.status)
+        }
+        const buf = Buffer.from(await upstream.arrayBuffer())
+        /* 从本域返回，画布才不会被跨域图片污染 */
+        res.writeHead(200, {
+          'Content-Type': 'image/jpeg',
+          'Cache-Control': 'public, max-age=86400',
+          'Content-Length': buf.length,
+        })
+        return res.end(buf)
+      } catch (err) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' })
+        return res.end(String(err?.message ?? err).slice(0, 120))
+      }
+    }
+    if (route === '/i18n') {
+      const lang = url.searchParams.get('lang') || 'zh'
+      const entries = await loadI18n(lang)
+      /* 有 pending=1 时顺手把未翻译的条目排进后台，返回当前已有的 */
+      if (url.searchParams.get('translate') === '1' && state.ctx) {
+        const items = await loadList()
+        const missing = items.filter((it) => it.r && !entries[it.v])
+        if (missing.length) {
+          const limit = Number(url.searchParams.get('n') || 240)
+          void translateEntries(state.ctx, missing.slice(0, limit), lang).catch(() => {})
+        }
+      }
+      return json(res, 200, { lang, total: Object.keys(entries).length, entries })
+    }
+    if (route === '/deps') {
+      const force = url.searchParams.get('force') === '1'
+      return json(res, 200, await probeDeps(force))
+    }
+    if (route === '/subs') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { reason: 'bad-vid' })
+      }
+      const lang = url.searchParams.get('lang') || 'zh'
+      const result = await loadSubs(vid, lang !== 'en')
+      return json(res, result.status, result.body)
+    }
+    return json(res, 404, { error: 'not found' })
+  } catch (err) {
+    return json(res, 502, { error: String(err?.message ?? err) })
+  }
+}
+
+export function apply(ctx) {
+  state.ctx = ctx
+  /* 落一个启动标记：能不能写出这个文件，本身就说明 apply 有没有被调用 */
+  void writeCache('boot.json', {
+    at: Date.now(),
+    pid: process.pid,
+    profileDir: process.env.DSH_PROFILE_DIR || null,
+  })
+
+  let attempt = 0
+  let done = false
+
+  const tryRegister = () => {
+    if (done) return
+    let webServer = null
+    try {
+      webServer = ctx?.get?.('webServer')
+    } catch {
+      webServer = null
+    }
+    if (!webServer || typeof webServer.register !== 'function') {
+      if (attempt < 2) {
+        attempt += 1
+        const t = setTimeout(tryRegister, 1500 * attempt)
+        if (t && typeof t.unref === 'function') t.unref()
+      }
+      return
+    }
+    done = true
+    /* 桌面端页面跑在 dsh-app:// 自定义协议下，不发 Referer，YouTube 因此报 153；
+       记下 HTTP origin，让前端用绝对地址把中转页放进安全上下文 */
+    try {
+      const origin = typeof webServer.getOrigin === 'function' ? webServer.getOrigin() : null
+      if (origin) state.origin = String(origin)
+      const names = []
+      let proto = webServer
+      while (proto && proto !== Object.prototype) {
+        for (const n of Object.getOwnPropertyNames(proto)) names.push(n)
+        proto = Object.getPrototypeOf(proto)
+      }
+      void writeCache('webserver.json', {
+        origin: state.origin,
+        methods: Array.from(new Set(names)).slice(0, 40),
+      })
+    } catch (err) {
+      void writeCache('webserver.json', { error: String(err?.message ?? err) })
+    }
+
+    /* 浏览器打开本应用的入口：dsh-app:// 不发 Referer，导致内嵌播放器全部失效；
+       拿到带 launch token 的 HTTP 地址后，整个页面就能落到安全上下文里 */
+    void (async () => {
+      try {
+        const conn = ctx?.get?.('connection')
+        let info = { hasConn: !!conn }
+        if (conn) {
+          let proto = conn
+          const keys = []
+          while (proto && proto !== Object.prototype) {
+            keys.push(...Object.getOwnPropertyNames(proto))
+            proto = Object.getPrototypeOf(proto)
+          }
+          info.methods = Array.from(new Set(keys)).slice(0, 40)
+          if (typeof conn.authenticatedUrl === 'function' && state.origin) {
+            try {
+              info.url = conn.authenticatedUrl(state.origin + '/')
+              state.authUrl = info.url
+            } catch (e) {
+              info.urlError = String(e?.message ?? e)
+            }
+          }
+        }
+        await writeCache('auth-url.json', info)
+
+        /* connection 可能比 apply 晚就绪，重试补齐 authUrl */
+        if (!state.authUrl) {
+          for (let i = 0; i < 15 && !state.authUrl; i += 1) {
+            await new Promise((r) => setTimeout(r, 1000))
+            try {
+              const c2 = ctx?.get?.('connection')
+              if (c2 && typeof c2.authenticatedUrl === 'function' && state.origin) {
+                state.authUrl = c2.authenticatedUrl(state.origin + '/')
+                await writeCache('auth-url.json', { hasConn: true, url: state.authUrl })
+                break
+              }
+            } catch {
+              /* 继续重试 */
+            }
+          }
+        }
+      } catch (err) {
+        await writeCache('auth-url.json', { error: String(err?.message ?? err) })
+      }
+    })()
+
+    /* 探针：试一次真实 LLM 调用，确认插件能用当前 profile 的模型 */
+    void (async () => {
+      const out = { steps: [] }
+      try {
+        const llm = ctx.get?.('llm')
+        if (!llm) {
+          await writeCache('llm-call.json', { steps: ['no llm service'] })
+          return
+        }
+        const provider = 'magpie'
+        const model = 'opencode-go/deepseek-v4.1-flash'
+        const stream = llm.stream({
+          provider,
+          model,
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'Reply with exactly: OK' }] },
+          ],
+        })
+        let text = ''
+        let raw = null
+        for await (const chunk of stream) {
+          if (raw === null) raw = JSON.stringify(chunk).slice(0, 400)
+          if (typeof chunk === 'string') text += chunk
+          else if (chunk && typeof chunk.text === 'string') text += chunk.text
+          else if (chunk && typeof chunk.delta === 'string') text += chunk.delta
+          else if (chunk && chunk.delta && typeof chunk.delta.text === 'string') text += chunk.delta.text
+          if (text.length > 300) break
+        }
+        out.steps.push('chunk shape: ' + raw)
+        out.steps.push('text: ' + JSON.stringify(text.slice(0, 150)))
+      } catch (err) {
+        out.steps.push('ERR: ' + String(err?.message ?? err).slice(0, 250))
+      }
+      await writeCache('llm-call.json', out)
+    })()
+    ctx.effect?.(
+      () => webServer.register({ kind: 'prefix', path: PREFIX, handler }),
+      'dsh-hackertube: routes',
+    )
+  }
+
+  tryRegister()
+
+  /* 让主对话能查这个视频库：Agent 在回答技术问题时可以主动检索 */
+  try {
+    ctx.inject(['tools'], (scope) => {
+      scope.tools.register({
+        name: 'hackertube_search',
+        description:
+          '在 Hacker News 二十年推荐的 6454 个技术视频里检索。' +
+          '当用户在讨论某个技术概念、想找深入讲解，或问有没有相关演讲、课程、论文讲解时使用。' +
+          '返回标题、频道、时长、播放量、HN 推荐理由和链接。',
+        parameters: {
+          query: {
+            type: 'string',
+            required: true,
+            description: '检索词，可以是技术概念、语言、框架名或自然语言描述',
+          },
+          limit: {
+            type: 'number',
+            description: '返回条数，默认 5，最多 15',
+          },
+        },
+        output: {
+          schema: { type: 'string' },
+          render: (_args, value) => [{ type: 'text', text: String(value) }],
+        },
+        async execute(args) {
+          const items = await loadList()
+          const terms = String(args.query || '')
+            .toLowerCase()
+            .split(/\s+/)
+            .filter(Boolean)
+          if (!terms.length) return '请提供检索词。'
+          const scored = items
+            .map((it) => {
+              const hay = [it.t, it.c, (it.tags || []).join(' '), (it.cats || []).join(' ')]
+                .join(' ')
+                .toLowerCase()
+              let score = 0
+              for (const t of terms) if (hay.includes(t)) score += 1
+              return { it, score }
+            })
+            .filter((x) => x.score > 0)
+            .sort((a, b) => b.score - a.score || (b.it.w || 0) - (a.it.w || 0))
+            .slice(0, Math.min(Number(args.limit) || 5, 15))
+          if (!scored.length) return '没有找到匹配的视频。'
+          return scored
+            .map((x, i) => {
+              const it = x.it
+              const mins = Math.round((it.d || 0) / 60)
+              return (
+                `${i + 1}. ${it.t} — ${it.c} · ${mins} 分钟 · ${it.w || 0} 次观看\n` +
+                `   https://www.youtube.com/watch?v=${it.v}`
+              )
+            })
+            .join('\n')
+        },
+      })
+      void writeCache('tool-registered.json', { ok: true, at: Date.now() })
+    })
+  } catch (err) {
+    void writeCache('tool-registered.json', {
+      ok: false,
+      error: String(err?.message ?? err).slice(0, 200),
+    })
+  }
+
+  /* 探针：列出 ctx 上可用的服务，决定推荐流能否直接读会话数据 */
+  try {
+    const own = Object.getOwnPropertyNames(ctx).filter((n) => n.startsWith('$'))
+    const protoNames = []
+    let p = Object.getPrototypeOf(ctx)
+    while (p && p !== Object.prototype) {
+      protoNames.push(...Object.getOwnPropertyNames(p))
+      p = Object.getPrototypeOf(p)
+    }
+    const candidates = [
+      'sessions',
+      'agent',
+      'agents',
+      'llm',
+      'model',
+      'models',
+      'completion',
+      'inference',
+      'provider',
+      'providers',
+      'ai',
+      'chat',
+      'prompt',
+    ]
+    const resolved = {}
+    for (const name of candidates) {
+      try {
+        const svc = ctx.get?.(name)
+        resolved[name] = svc ? 'yes' : 'no'
+      } catch (err) {
+        resolved[name] = 'throw: ' + String(err?.message ?? err).slice(0, 60)
+      }
+    }
+    void writeCache('ctx-services.json', {
+      dollarProps: own.slice(0, 60),
+      proto: Array.from(new Set(protoNames)).slice(0, 60),
+      resolved,
+      apiOf: Object.fromEntries(
+        ['sessions', 'llm', 'agents'].map((name) => {
+          try {
+            const svc = ctx.get?.(name)
+            if (!svc) return [name, null]
+            const keys = []
+            let q = svc
+            while (q && q !== Object.prototype) {
+              keys.push(...Object.getOwnPropertyNames(q))
+              q = Object.getPrototypeOf(q)
+            }
+            return [name, Array.from(new Set(keys)).slice(0, 40)]
+          } catch (err) {
+            return [name, 'throw: ' + String(err?.message ?? err).slice(0, 60)]
+          }
+        }),
+      ),
+    })
+  } catch (err) {
+    void writeCache('ctx-services.json', { error: String(err?.message ?? err) })
+  }
+
+  /**
+   * 独立的中转服务器：DSH 的 webServer 在认证层后面，dsh-app:// 页面发起的
+   * 跨源 iframe 请求带不上 cookie，会被 401 挡掉。这里另起一个只服务中转页、
+   * 免认证、仅监听回环地址的小服务器，让播放器真正落在 HTTP 安全上下文。
+   */
+  try {
+    /* 重载时旧实例的监听不会自动消失，先显式关掉，避免端口漂移后
+       前端还指向旧版中转页（旧版带 X-Frame-Options，会被浏览器拒绝渲染） */
+    const stale = globalThis.__htMediaServer
+    if (stale && typeof stale.close === 'function') {
+      try {
+        stale.close()
+      } catch {
+        /* 已关闭 */
+      }
+    }
+
+    const mediaServer = createServer((req, res) => {
+      const u = new URL(req.url ?? '/', 'http://local')
+      if (u.pathname === '/embed') {
+        const vid = u.searchParams.get('vid')
+        if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end('bad vid')
+          return
+        }
+        const lang = u.searchParams.get('lang') === 'zh' ? 'zh' : 'en'
+        return serveEmbed(req, res, vid, lang)
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('not found')
+    })
+    mediaServer.on('error', () => {
+      /* 端口占用等异常不影响主面板 */
+    })
+    globalThis.__htMediaServer = mediaServer
+
+    /* 优先用固定端口：前端可能缓存了地址，端口稳定才不会被旧值误导 */
+    const tryListen = (ports) => {
+      const port = ports[0]
+      mediaServer.listen(port, '127.0.0.1', () => {
+        state.mediaOrigin = `http://127.0.0.1:${port}`
+        void writeCache('media-origin.json', { origin: state.mediaOrigin, port })
+      })
+      mediaServer.once('error', () => {
+        if (ports.length > 1) tryListen(ports.slice(1))
+      })
+    }
+    tryListen([18090, 18091, 18092, 18093, 0])
+
+    ctx.effect(
+      () => () => {
+        try {
+          mediaServer.close()
+        } catch {
+          /* 已关闭 */
+        }
+        if (globalThis.__htMediaServer === mediaServer) globalThis.__htMediaServer = null
+      },
+      'dsh-hackertube: media server',
+    )
+  } catch (err) {
+    void writeCache('media-origin.json', { error: String(err?.message ?? err) })
+  }
+
+  /* 预热：把首次十几秒的抓取挪到 Host 启动阶段，面板打开时多半已就绪 */
+  void loadList().catch(() => {})
+  void loadBrowse().catch(() => {})
+}
