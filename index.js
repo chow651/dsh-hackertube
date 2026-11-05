@@ -16,6 +16,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'n
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { inflateRawSync } from 'node:zlib'
 
 /* 仓库里预生成的译文，首次安装时直接铺到缓存目录 */
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -27,6 +28,8 @@ const TTL_MS = 24 * 60 * 60 * 1000
 const FETCH_TIMEOUT_MS = 45_000
 /* 机翻接口是第三方免鉴权端点，超时要短，失败就留原文 */
 const MT_TIMEOUT_MS = 12_000
+/* 导出包 17.8 MB，给足下载预算 */
+const EXPORT_DOWNLOAD_MS = 120_000
 const DETAIL_CACHE_MAX = 60
 /* 单次媒体下载预算；yt-dlp 在本机实测 10 分钟片长约 17 秒 */
 const MEDIA_TIMEOUT_MS = 180_000
@@ -118,7 +121,7 @@ function toSlim(o) {
     t: o.title ?? '',
     c: o.channel ?? '',
     d: o.duration_s ?? 0,
-    th: o.thumbnail ?? '',
+    th: o.thumbnail ?? (o.vid ? 'https://i.ytimg.com/vi/' + o.vid + '/hq2.jpg' : ''),
     p: published,
     w: o.views ?? 0,
     ct: o.content_type ?? '',
@@ -135,6 +138,318 @@ function setList(items, at) {
   state.list = items
   state.listAt = at
   state.listJson = null
+}
+
+/* ---------------- 官方数据导出 ---------------- */
+
+/**
+ * hackertube.org 把整套数据以 zip 形式挂在 /download 上，作者的原话是
+ * “Export of the site's data available to give to your agent to easily create
+ * your own version”。这里直接吃这份导出：一次 17.8 MB 的下载，换来列表、详情、
+ * HN 评论和相关推荐全部本地可得，不必再翻 65 页 /api/list。
+ */
+
+const EXPORT_ZIP_URL = `${SOURCE}/download/hackertube-data.zip`
+const EXPORT_FILES = [
+  'videos.jsonl',
+  'mentions.jsonl',
+  'related.jsonl',
+  'embeddings.npy',
+  'embedding_ids.json',
+]
+const EXPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const EXPORT_VERSION = 1
+const EXPORT_MAX_BYTES = 64 * 1024 * 1024
+
+function exportDir() {
+  return join(cacheRoot(), 'export')
+}
+
+/** 最小 zip 解析：只认 store 与 deflate，够解这一个包。 */
+function unzipEntries(buf, wanted) {
+  let eocd = -1
+  const floor = Math.max(0, buf.length - 66 * 1024)
+  for (let i = buf.length - 22; i >= floor; i -= 1) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocd = i
+      break
+    }
+  }
+  if (eocd < 0) throw new Error('zip: 找不到中央目录')
+  const count = buf.readUInt16LE(eocd + 10)
+  let off = buf.readUInt32LE(eocd + 16)
+  const out = {}
+  for (let i = 0; i < count; i += 1) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('zip: 中央目录损坏')
+    const method = buf.readUInt16LE(off + 10)
+    const compSize = buf.readUInt32LE(off + 20)
+    const nameLen = buf.readUInt16LE(off + 28)
+    const extraLen = buf.readUInt16LE(off + 30)
+    const commentLen = buf.readUInt16LE(off + 32)
+    const localOff = buf.readUInt32LE(off + 42)
+    const name = buf.toString('utf8', off + 46, off + 46 + nameLen)
+    off += 46 + nameLen + extraLen + commentLen
+    const base = name.split('/').pop()
+    if (wanted.indexOf(base) < 0) continue
+    if (buf.readUInt32LE(localOff) !== 0x04034b50) throw new Error('zip: 本地头损坏')
+    const lNameLen = buf.readUInt16LE(localOff + 26)
+    const lExtraLen = buf.readUInt16LE(localOff + 28)
+    const start = localOff + 30 + lNameLen + lExtraLen
+    const raw = buf.subarray(start, start + compSize)
+    out[base] = method === 0 ? raw : inflateRawSync(raw)
+  }
+  return out
+}
+
+async function fetchExportZip() {
+  const res = await fetch(EXPORT_ZIP_URL, { signal: AbortSignal.timeout(EXPORT_DOWNLOAD_MS) })
+  if (!res.ok) throw new Error('export zip ' + res.status)
+  const buf = Buffer.from(await res.arrayBuffer())
+  if (buf.length > EXPORT_MAX_BYTES) throw new Error('export zip 异常大：' + buf.length)
+  if (buf.length < 1024) throw new Error('export zip 异常小：' + buf.length)
+  return buf
+}
+
+/**
+ * 整包一次下载、一次解包，之后各取所需。
+ * 分次请求会各触发一次 17.8 MB 下载，所以这里只允许一个在飞的任务。
+ */
+let exportReadyP = null
+
+async function ensureExportReady() {
+  if (exportReadyP) return exportReadyP
+  exportReadyP = (async () => {
+    const dir = exportDir()
+    const manifest = await readCache('export/manifest.json')
+    if (manifest && Number(manifest.v) === EXPORT_VERSION) {
+      const fresh = Date.now() - Number(manifest.at || 0) < EXPORT_TTL_MS
+      if (fresh) {
+        const sizes = await Promise.all(
+          EXPORT_FILES.map(async (n) => {
+            try {
+              return (await stat(join(dir, n))).size > 0
+            } catch {
+              return false
+            }
+          }),
+        )
+        if (sizes.every(Boolean)) return
+      }
+    }
+    await mkdir(dir, { recursive: true })
+    const zip = await fetchExportZip()
+    const entries = unzipEntries(zip, EXPORT_FILES)
+    for (const n of EXPORT_FILES) {
+      if (!entries[n]) throw new Error('导出缺少文件：' + n)
+      await writeFile(join(dir, n), entries[n])
+    }
+    await writeCache('export/manifest.json', { v: EXPORT_VERSION, at: Date.now(), bytes: zip.length })
+  })().finally(() => {
+    exportReadyP = null
+  })
+  return exportReadyP
+}
+
+/** 读若干导出文件，必要时先补齐整包 */
+async function readExport(names) {
+  await ensureExportReady()
+  const out = {}
+  for (const n of names) out[n] = await readFile(join(exportDir(), n))
+  return out
+}
+
+/**
+ * 把导出解析成内存结构。videos 用与列表一致的瘦身形状，detail 保留原始记录
+ * 供详情页使用（summary / why_hn / quote / tags / categories 都在里面）。
+ */
+async function loadDataset() {
+  if (state.dataset) return state.dataset
+  if (state.datasetP) return state.datasetP
+  state.datasetP = (async () => {
+    const files = await readExport(['videos.jsonl', 'related.jsonl'])
+    const videos = []
+    const detail = new Map()
+    for (const line of files['videos.jsonl'].toString('utf8').split('\n')) {
+      if (!line || line.charCodeAt(0) !== 123) continue
+      let o
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (!o || !o.vid) continue
+      detail.set(o.vid, o)
+      videos.push(toSlim(o))
+    }
+    if (!videos.length) throw new Error('导出里没有视频')
+
+    const related = new Map()
+    for (const line of files['related.jsonl'].toString('utf8').split('\n')) {
+      if (!line || line.charCodeAt(0) !== 123) continue
+      let o
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (!o || !o.vid || !Array.isArray(o.related)) continue
+      related.set(
+        o.vid,
+        o.related.map((r) => r.vid).filter(Boolean),
+      )
+    }
+
+    state.dataset = { videos, detail, related, at: Date.now() }
+    void writeCache('export/stats.json', { at: Date.now(), videos: videos.length, related: related.size })
+    return state.dataset
+  })()
+  try {
+    return await state.datasetP
+  } finally {
+    state.datasetP = null
+  }
+}
+
+/** HN 评论按 vid 归组，按推荐力度排序后截取前 12 条 */
+const STANCE_RANK = { strong_rec: 0, rec: 1, reference: 2, joke: 3, critical: 4 }
+
+async function loadMentions() {
+  if (state.mentions) return state.mentions
+  if (state.mentionsP) return state.mentionsP
+  state.mentionsP = (async () => {
+    const files = await readExport(['mentions.jsonl'])
+    const map = new Map()
+    for (const line of files['mentions.jsonl'].toString('utf8').split('\n')) {
+      if (!line || line.charCodeAt(0) !== 123) continue
+      let m
+      try {
+        m = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (!m || !m.vid) continue
+      const bucket = map.get(m.vid)
+      if (bucket) bucket.push(m)
+      else map.set(m.vid, [m])
+    }
+    state.mentions = map
+    return map
+  })()
+  try {
+    return await state.mentionsP
+  } finally {
+    state.mentionsP = null
+  }
+}
+
+function commentsFromMentions(list) {
+  return (list || [])
+    .slice()
+    .sort((a, b) => {
+      const ra = STANCE_RANK[a.stance] ?? 9
+      const rb = STANCE_RANK[b.stance] ?? 9
+      if (ra !== rb) return ra - rb
+      return String(b.month || '').localeCompare(String(a.month || ''))
+    })
+    .slice(0, 12)
+    .map((m) => ({
+      id: m.hn_comment_id,
+      author: m.author || '',
+      ym: m.month || '',
+      stance: m.stance || '',
+      why: m.why || '',
+      text: String(m.text || '').replace(/\s+/g, ' ').slice(0, 400),
+      quote: m.quote ? String(m.quote).replace(/\s+/g, ' ').slice(0, 240) : '',
+    }))
+}
+
+/* 语义近邻：导出里的 384 维 float16 向量，用于 related.jsonl 没覆盖的视频 */
+const npyState = { ids: null, index: null, vec: null, rows: 0, dim: 0 }
+
+/* float16 → float32 查表，比逐元素 2**exp 快两个数量级 */
+const F16 = (() => {
+  const t = new Float32Array(65536)
+  for (let h = 0; h < 65536; h += 1) {
+    const sign = h & 0x8000 ? -1 : 1
+    const exp = (h >> 10) & 0x1f
+    const frac = h & 0x3ff
+    let v
+    if (exp === 0) v = frac * 2 ** -24
+    else if (exp === 31) v = 0
+    else v = (1 + frac / 1024) * 2 ** (exp - 15)
+    t[h] = sign * v
+  }
+  return t
+})()
+
+async function loadVectors() {
+  if (npyState.vec) return npyState
+  const files = await readExport(['embeddings.npy', 'embedding_ids.json'])
+  const npy = files['embeddings.npy']
+  if (npy.toString('latin1', 1, 7) !== 'NUMPY') throw new Error('embeddings.npy 头不对')
+  const major = npy[6]
+  const headerLen = major === 1 ? npy.readUInt16LE(8) : npy.readUInt32LE(8)
+  const headerStart = major === 1 ? 10 : 12
+  const header = npy.toString('latin1', headerStart, headerStart + headerLen)
+  const m = header.match(/shape'\s*:\s*\((\d+)\s*,\s*(\d+)\)/)
+  if (!m) throw new Error('embeddings.npy 缺少 shape')
+  const rows = Number(m[1])
+  const dim = Number(m[2])
+  const dataStart = headerStart + headerLen
+  const vec = new Float32Array(rows * dim)
+  /* Uint16 视图比逐字节 readUInt16LE 快一个数量级；x86 上小端直接可用 */
+  const aligned = (npy.byteOffset + dataStart) % 2 === 0
+  if (aligned) {
+    const u16 = new Uint16Array(npy.buffer, npy.byteOffset + dataStart, rows * dim)
+    for (let i = 0; i < rows * dim; i += 1) vec[i] = F16[u16[i]]
+  } else {
+    for (let i = 0; i < rows * dim; i += 1) {
+      vec[i] = F16[npy.readUInt16LE(dataStart + i * 2)]
+    }
+  }
+  const ids = JSON.parse(files['embedding_ids.json'].toString('utf8'))
+  /* 向量是 L2 归一化的，模长预先算好，检索时只做点积 */
+  const norms = new Float32Array(rows)
+  for (let i = 0; i < rows; i += 1) {
+    let n = 0
+    const base = i * dim
+    for (let d = 0; d < dim; d += 1) n += vec[base + d] * vec[base + d]
+    norms[i] = Math.sqrt(n) || 1
+  }
+  npyState.ids = ids
+  npyState.norms = norms
+  npyState.index = new Map(ids.map((vid, i) => [vid, i]))
+  npyState.vec = vec
+  npyState.rows = rows
+  npyState.dim = dim
+  return npyState
+}
+
+async function relatedFromVectors(vid, n) {
+  const s = await loadVectors()
+  const at = s.index.get(vid)
+  if (at === undefined) return []
+  const { vec, dim, rows, norms } = s
+  const off = at * dim
+  const an = norms[at] || 1
+  const scores = new Float32Array(rows)
+  for (let i = 0; i < rows; i += 1) {
+    if (i === at) {
+      scores[i] = -1
+      continue
+    }
+    const base = i * dim
+    let dot = 0
+    for (let d = 0; d < dim; d += 1) dot += vec[off + d] * vec[base + d]
+    scores[i] = dot / (an * (norms[i] || 1))
+  }
+  const order = Array.from({ length: rows }, (_, i) => i).sort((a, b) => scores[b] - scores[a])
+  const out = []
+  for (const i of order.slice(0, n)) {
+    const id = s.ids[i]
+    if (id && id !== vid) out.push(id)
+  }
+  return out
 }
 
 /* ---------------- 三个数据方法 ---------------- */
@@ -222,6 +537,29 @@ async function fetchAllSlim() {
   return out
 }
 
+/** 把 YouTube 元信息（时长/播放量/发布时间/封面）并进导出数据，导出本身没有这几个字段 */
+function mergeMeta(items, metaItems) {
+  if (!Array.isArray(metaItems) || !metaItems.length) return items
+  const byVid = new Map()
+  for (const m of metaItems) if (m && m.v) byVid.set(m.v, m)
+  let changed = false
+  const out = items.map((it) => {
+    const m = byVid.get(it.v)
+    if (!m) return it
+    if (!(m.d || m.w || m.p || m.th)) return it
+    changed = true
+    return {
+      ...it,
+      d: m.d || it.d,
+      th: it.th || m.th,
+      p: m.p || it.p,
+      w: m.w || it.w,
+      y: it.y || m.y,
+    }
+  })
+  return changed ? out : items
+}
+
 async function loadList() {
   const fresh = state.list && Date.now() - state.listAt < TTL_MS
   if (fresh) return state.list
@@ -235,26 +573,57 @@ async function loadList() {
       cached.items.length
     ) {
       setList(cached.items, Number(cached.at) || 0)
-      if (Date.now() - state.listAt < TTL_MS) return state.list
+      if (Date.now() - state.listAt < TTL_MS) {
+        /* 命中缓存时也把导出与评论解析放到后台，打开第一个视频就不用等 */
+        void loadDataset()
+          .then(() => loadMentions())
+          .catch(() => {})
+        return state.list
+      }
     }
   }
 
   return once('list', async () => {
+    /* 冷启动并行做两件事：吃官方导出、补 YouTube 元信息。
+       导出给内容，/api/list 只给时长、播放量、发布时间和封面。 */
+    const metaTask = fetchAllSlim()
+      .then((items) => {
+        setList(items, Date.now())
+        void writeCache('list.json', { v: CACHE_VERSION, at: Date.now(), items })
+        return items
+      })
+      .catch((err) => {
+        void writeCache('diag.json', {
+          at: Date.now(),
+          stage: 'list',
+          error: String(err?.message ?? err),
+        })
+        return null
+      })
+
+    let ds = null
     try {
-      const items = await fetchAllSlim()
-      setList(items, Date.now())
-      void writeCache('list.json', { v: CACHE_VERSION, at: state.listAt, items })
-      return state.list
+      ds = await loadDataset()
     } catch (err) {
-      /* 预热失败是静默的，留个落盘痕迹，事后能查到底卡在哪一步 */
       void writeCache('diag.json', {
         at: Date.now(),
-        stage: 'list',
+        stage: 'export',
         error: String(err?.message ?? err),
       })
-      if (state.list) return state.list
-      throw err
     }
+
+    const meta = await metaTask
+
+    if (ds) {
+      const merged = meta ? mergeMeta(ds.videos, meta) : ds.videos
+      setList(merged, Date.now())
+      /* 评论要等第一次打开视频才用到，先在后台上把 mentions 解析好 */
+      void loadMentions().catch(() => {})
+      return state.list
+    }
+    if (meta) return state.list
+    if (state.list) return state.list
+    throw new Error('列表不可用：导出与上游都失败')
   })
 }
 
@@ -454,6 +823,27 @@ function pickComments(vid) {
 async function loadRelated(vid) {
   const hit = state.related.get(vid)
   if (hit && Date.now() - hit.at < TTL_MS) return hit.value
+  /* 先查导出里的共推荐图，没有再退到向量近邻，最后才问上游 */
+  try {
+    const ds = await loadDataset()
+    let ids = ds.related.get(vid) || []
+    if (!ids.length) ids = await relatedFromVectors(vid, 14).catch(() => [])
+    if (ids.length) {
+      const source = state.list && state.list.length ? state.list : ds.videos
+      const byId = new Map(source.map((it) => [it.v, it]))
+      const value = []
+      for (const id of ids) {
+        const it = byId.get(id)
+        if (it && value.length < 12) value.push(it)
+      }
+      if (value.length) {
+        state.related.set(vid, { at: Date.now(), value })
+        return value
+      }
+    }
+  } catch {
+    /* 导出不可用时退回上游 */
+  }
   const list = await fetchJson(`${SOURCE}/api/related?vid=${encodeURIComponent(vid)}&n=12`)
   const value = (Array.isArray(list) ? list : []).slice(0, 12).map(toSlim)
   state.related.set(vid, { at: Date.now(), value })
@@ -463,16 +853,37 @@ async function loadRelated(vid) {
 async function loadVideo(vid) {
   const hit = state.detail.get(vid)
   if (hit) return hit
+  /* 导出里带着 summary / why_hn / quote / tags / categories，详情页不用再联网 */
+  try {
+    const ds = await loadDataset()
+    const rec = ds.detail.get(vid)
+    if (rec) {
+      /* 导出里的引文用 hn_comment_id，前端要的是 id，这里统一 */
+      if (rec.quote && typeof rec.quote === 'object' && rec.quote.hn_comment_id && !rec.quote.id) {
+        rec.quote = { ...rec.quote, id: rec.quote.hn_comment_id }
+      }
+      const mentions = await loadMentions().catch(() => null)
+      state.comments.set(vid, commentsFromMentions(mentions ? mentions.get(vid) : null))
+      rememberDetail(vid, rec)
+      return rec
+    }
+  } catch {
+    /* 导出不可用时退回上游接口 */
+  }
   const data = await fetchJson(`${SOURCE}/api/video?vid=${encodeURIComponent(vid)}`)
   const payload = data && data.video ? data.video : data
   const comments = data && Array.isArray(data.comments) ? data.comments : []
   state.comments.set(vid, comments)
+  rememberDetail(vid, payload)
+  return payload
+}
+
+function rememberDetail(vid, payload) {
   if (state.detail.size >= DETAIL_CACHE_MAX) {
     const oldest = state.detail.keys().next().value
     if (oldest !== undefined) state.detail.delete(oldest)
   }
   state.detail.set(vid, payload)
-  return payload
 }
 
 /* ---------------- 本地媒体 ---------------- */
@@ -933,15 +1344,24 @@ async function readSeed(name) {
   }
 }
 
+/** 只回写本轮改动过的译文表；共用同一个定时器，避免互相顶掉 */
 function scheduleI18nSave(lang) {
+  if (!(i18nState.dirty instanceof Set)) i18nState.dirty = new Set()
+  if (lang) i18nState.dirty.add(lang)
   if (i18nState.timer) return
   i18nState.timer = setTimeout(() => {
     i18nState.timer = null
-    const entries = i18nState[lang] || {}
+    const names = i18nState.dirty instanceof Set ? [...i18nState.dirty] : []
+    if (i18nState.dirty instanceof Set) i18nState.dirty.clear()
+    if (!names.length) return
     void mkdir(i18nDir(), { recursive: true })
-      .then(() =>
-        writeFile(i18nFile(lang), JSON.stringify({ v: I18N_VERSION, entries })),
-      )
+      .then(async () => {
+        for (const name of names) {
+          const entries = i18nState[name]
+          if (!entries || typeof entries !== 'object') continue
+          await writeFile(i18nFile(name), JSON.stringify({ v: I18N_VERSION, entries }))
+        }
+      })
       .catch(() => {})
   }, 2000)
   if (typeof i18nState.timer.unref === 'function') i18nState.timer.unref()
@@ -1232,9 +1652,34 @@ async function translateDetail(ctx, detail, lang = 'zh') {
   return cache
 }
 
+/**
+ * 模型不可用时的详情机翻：摘要、推荐理由、引用一次批量翻完。
+ * 单独存 zh-mt.json，和模型译文分开，日后配了模型还能覆盖升级。
+ */
+async function translateDetailMT(detail) {
+  const cache = await loadI18n('zh-mt')
+  const jobs = []
+  const push = (field, text) => {
+    if (typeof text !== 'string' || text.trim().length < 6) return
+    const key = `${detail.vid}:${field}`
+    if (cache[key]) return
+    jobs.push({ key, text: text.replace(/\s+/g, ' ').slice(0, 900) })
+  }
+  push('summary', detail.summary)
+  push('why_hn', detail.why_hn)
+  if (detail.quote) push('quote', detail.quote.text)
+  if (!jobs.length) return cache
+
+  const out = await mtTranslateAll(jobs.map((j) => j.text))
+  jobs.forEach((j, i) => {
+    if (out[i]) cache[j.key] = out[i]
+  })
+  scheduleI18nSave('zh-mt')
+  return cache
+}
+
 /** 模型偶尔把批内编号带进译文，剥掉行首的 "N. " / "N、" / "N)" */
-function stripLeadingIndex(text) {
-  return String(text)
+function stripLeadingIndex(text) {  return String(text)
     .replace(/^\s*\d+\s*[.、)．]\s*/, '')
     .trim()
 }
@@ -2063,15 +2508,34 @@ async function handler(req, res) {
       const vid = url.searchParams.get('vid')
       if (!vid) return json(res, 400, { error: 'vid required' })
       const detail = await loadVideo(vid)
-      if (url.searchParams.get('lang') === 'zh' && state.ctx) {
-        const cache = await translateDetail(state.ctx, detail, 'zh')
+      if (url.searchParams.get('lang') === 'zh') {
+        /* 模型在就用模型翻；没有模型或没翻出来，退到机翻，同样落盘缓存 */
+        let llmCache = {}
+        if (state.ctx) {
+          try {
+            llmCache = await translateDetail(state.ctx, detail, 'zh')
+          } catch {
+            llmCache = {}
+          }
+        }
+        const pick = (field) => llmCache[`${vid}:${field}`] || null
+        const needMt = !pick('summary') || !pick('why_hn') || !!(detail.quote && !pick('quote'))
+        let mtCache = {}
+        if (needMt) {
+          try {
+            mtCache = await translateDetailMT(detail)
+          } catch {
+            mtCache = {}
+          }
+        }
+        const merge = (field) => llmCache[`${vid}:${field}`] || mtCache[`${vid}:${field}`] || null
         return json(res, 200, {
           ...detail,
           comments: pickComments(vid),
           i18n: {
-            summary: cache[`${vid}:summary`] || null,
-            why_hn: cache[`${vid}:why_hn`] || null,
-            quote: cache[`${vid}:quote`] || null,
+            summary: merge('summary'),
+            why_hn: merge('why_hn'),
+            quote: merge('quote'),
           },
         })
       }

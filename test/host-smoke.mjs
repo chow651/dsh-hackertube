@@ -172,5 +172,21 @@ function check(name, ok, extra = '') {
   check('seeded file persisted', existsSync(join(tmp, '.dsh-hackertube', 'i18n', 'zh-titles.json')))
 }
 
+/* 10. 相关推荐走导出里的共推荐图，不依赖上游 */
+{
+  const res = await call('/hackertube/api/related?vid=fNk_zzaMoSs')
+  check('related 200', res.statusCode === 200, 'got ' + res.statusCode)
+  const list = JSON.parse(res.body)
+  check('related 12 items', Array.isArray(list) && list.length === 12, String(list && list.length))
+  check('related items carry title', Array.isArray(list) && list.every((x) => x && x.t))
+  check('related items carry thumb', Array.isArray(list) && list.every((x) => x && x.th))
+}
+
+/* 11. 导出文件与清单落盘 */
+{
+  check('export manifest written', existsSync(join(tmp, '.dsh-hackertube', 'export', 'manifest.json')))
+  check('export videos on disk', existsSync(join(tmp, '.dsh-hackertube', 'export', 'videos.jsonl')))
+}
+
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | cache dir: ' + tmp)
 process.exit(failures ? 1 : 0)
