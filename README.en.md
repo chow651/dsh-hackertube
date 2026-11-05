@@ -22,7 +22,7 @@ Requires DeepSeek Harness.
 plugin_manager install_bundle target=dsh-hackertube
 ```
 
-If the package is not on npm yet, install from the Git repository. How the host parses the install argument depends on its version, so fall back to the command above if this one fails.
+The package is published on npm as version 0.1.1. It can also be installed straight from the Git repository, though how the host parses the install argument depends on its version.
 
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube

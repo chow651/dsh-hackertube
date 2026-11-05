@@ -22,7 +22,7 @@
 plugin_manager install_bundle target=dsh-hackertube
 ```
 
-未发布到 npm 时，可从 Git 仓库安装。宿主如何解析安装参数取决于版本，失败时改用上一条命令。
+包已发布到 npm，版本 0.1.1。也可以直接从 Git 仓库安装，宿主如何解析安装参数取决于版本。
 
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube
