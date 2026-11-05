@@ -1,6 +1,6 @@
 {
   "name": "dsh-hackertube",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DeepSeek Harness 插件：在面板里看 Hacker News 二十年推荐的 6454 个技术视频",
   "type": "module",
   "license": "MIT",
