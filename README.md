@@ -143,27 +143,6 @@ YouTube 嵌入受上游策略限制，年龄限制或地区限制的视频需前
 
 播放中转页监听 `127.0.0.1:18090`，端口被占用时依次尝试 18091 与 18092。
 
-## 开发
-
-```
-node test/host-smoke.mjs      # Host 半，42 项
-node test/client-render.mjs   # Client 渲染，41 项
-```
-
-```
-npm install   # 仅安装测试所需的 react 与 react-test-renderer
-npm test
-```
-
-修改代码后重载插件，无需重启 DSH：
-
-```
-plugin_manager set_bundle enabled=false target=dsh-hackertube
-plugin_manager set_bundle enabled=true  target=dsh-hackertube
-```
-
-Host 半改动重载后立即生效，Client 半改动需要刷新页面。
-
 ## 致谢
 
 感谢 Andrej Karpathy 开发 HackerTube 并将数据导出公开，本插件建立在这份工作之上。

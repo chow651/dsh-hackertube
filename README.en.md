@@ -143,27 +143,6 @@ YouTube embeds follow upstream policy. Age-restricted and region-restricted vide
 
 The playback relay listens on `127.0.0.1:18090`, falling back to 18091 and 18092 when the port is taken.
 
-## Development
-
-```
-node test/host-smoke.mjs      # Host side, 42 checks
-node test/client-render.mjs   # Client rendering, 41 checks
-```
-
-```
-npm install   # Installs react and react-test-renderer for the tests only
-npm test
-```
-
-Reload the plugin after changing code. Do not restart DSH.
-
-```
-plugin_manager set_bundle enabled=false target=dsh-hackertube
-plugin_manager set_bundle enabled=true  target=dsh-hackertube
-```
-
-Changes on the host side take effect on reload. Changes on the client side need a page refresh.
-
 ## Credits
 
 Thanks to Andrej Karpathy for building HackerTube and for publishing its data export. This plugin builds on that work.
