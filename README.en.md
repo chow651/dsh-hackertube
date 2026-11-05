@@ -28,7 +28,7 @@ If npm fails, use target=github:chow651/dsh-hackertube instead.
 Then confirm dsh-hackertube is enabled in the plugin list and remind me to refresh the page.
 ```
 
-### Manual install
+### Install with the plugin manager
 
 The package is published on npm as version 0.1.1:
 
@@ -41,6 +41,18 @@ It can also be installed straight from the Git repository, though how the host p
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube
 ```
+
+### Install with npm or pnpm
+
+```
+npm install dsh-hackertube
+```
+
+```
+pnpm add dsh-hackertube
+```
+
+DSH loads plugins from its profile directory, so installing into an ordinary project has no effect. Install inside that profile directory, add the package name to its `dsh.profile.bundles` array, then restart DSH. The `plugin_manager` command above does all three steps for you. Take the manual route only for scripting or bulk deployment.
 
 After installing, enable `dsh-hackertube` in the plugin list and refresh the page. No configuration, no API key, and no data to fetch beforehand.
 

@@ -28,7 +28,7 @@ npm 上取不到就改用 target=github:chow651/dsh-hackertube。
 装完确认插件列表里 dsh-hackertube 已启用，并提醒我刷新页面。
 ```
 
-### 手动安装
+### 用插件管理器安装
 
 包已发布到 npm，版本 0.1.1：
 
@@ -41,6 +41,18 @@ plugin_manager install_bundle target=dsh-hackertube
 ```
 plugin_manager install_bundle target=github:chow651/dsh-hackertube
 ```
+
+### 用 npm 或 pnpm 安装
+
+```
+npm install dsh-hackertube
+```
+
+```
+pnpm add dsh-hackertube
+```
+
+DSH 从 profile 目录加载插件，在普通项目里安装不会生效。需要在该 profile 目录下安装，把包名加入它的 `dsh.profile.bundles` 数组，然后重启 DSH。上面那条 `plugin_manager` 命令会自动完成这三步，只有在写脚本或做批量部署时才需要手动走一遍。
 
 安装后在插件列表中启用 `dsh-hackertube` 并刷新页面。无需额外配置，无需 API key，也不需要在安装前预取任何数据。
 
