@@ -15,6 +15,11 @@ if (process.env.HT_FIRST_PAINT_FIXTURE === '1') {
   process.exit(await runFirstPaintFixture())
 }
 
+/* 子进程模式：固定 fixture 验证语言偏好与详情异步翻译，不打真实上游/模型 */
+if (process.env.HT_LANGUAGE_FIXTURE === '1') {
+  process.exit(await runLanguageFixture())
+}
+
 const tmp = mkdtempSync(join(tmpdir(), 'ht-smoke-'))
 process.env.DSH_PROFILE_DIR = tmp
 
@@ -608,6 +613,229 @@ async function runFirstPaintFixture() {
   return failures ? 1 : 0
 }
 
+/* ---------- 固定 fixture：语言偏好与详情异步翻译 ---------- */
+
+async function runLanguageFixture() {
+  const tmp = mkdtempSync(join(tmpdir(), 'ht-language-'))
+  process.env.DSH_PROFILE_DIR = tmp
+  const root = join(tmp, '.dsh-hackertube')
+  const exportRoot = join(root, 'export')
+  mkdirSync(exportRoot, { recursive: true })
+
+  const videos = [
+    {
+      vid: 'lgv001',
+      title: 'Model translated video',
+      channel: 'FixtureConf',
+      duration_s: 600,
+      thumbnail: 'https://i.ytimg.com/vi/lgv001/hqdefault.jpg',
+      published: '2020-01-01T00:00:00Z',
+      views: 1200,
+      content_type: 'talk',
+      level: 'intro',
+      categories: [{ id: 'prog' }],
+      tags: ['model'],
+      score: 12,
+      hn: { recommenders: 5, mentions: 7 },
+      summary: 'Model summary text.',
+      why_hn: 'Model reason text.',
+      quote: { text: 'Model quote text.', hn_comment_id: 101 },
+    },
+    {
+      vid: 'lgv002',
+      title: 'Machine translated video',
+      channel: 'FixtureConf',
+      duration_s: 900,
+      thumbnail: 'https://i.ytimg.com/vi/lgv002/hqdefault.jpg',
+      published: '2020-01-02T00:00:00Z',
+      views: 2400,
+      content_type: 'talk',
+      level: 'advanced',
+      categories: [{ id: 'prog' }],
+      tags: ['machine'],
+      score: 8,
+      hn: { recommenders: 3, mentions: 4 },
+      summary: 'Machine summary text.',
+      why_hn: 'Machine reason text.',
+      quote: { text: 'Machine quote text.', hn_comment_id: 102 },
+    },
+  ]
+  writeFileSync(join(exportRoot, 'videos.jsonl'), videos.map((o) => JSON.stringify(o)).join('\n'))
+  writeFileSync(join(exportRoot, 'mentions.jsonl'), '\n')
+  writeFileSync(join(exportRoot, 'related.jsonl'), '\n')
+  writeFileSync(join(exportRoot, 'embeddings.npy'), 'x')
+  writeFileSync(join(exportRoot, 'embedding_ids.json'), '[]')
+  writeFileSync(join(exportRoot, 'manifest.json'), JSON.stringify({ v: 1, at: Date.now(), bytes: 1234 }))
+
+  global.fetch = async (url, init) => {
+    const raw = String(url)
+    if (raw.includes('translate-pa.googleapis.com')) {
+      const payload = JSON.parse(String((init && init.body) || '[]'))
+      const texts = payload && payload[0] && Array.isArray(payload[0][0]) ? payload[0][0] : []
+      return { ok: true, status: 200, json: async () => [texts.map((t) => '机翻：' + String(t))] }
+    }
+    if (raw.includes('translate.googleapis.com')) {
+      return { ok: true, status: 200, json: async () => [['机翻单条']] }
+    }
+    throw new Error('fixture upstream blocked: ' + raw)
+  }
+
+  const fakeLlm = {
+    listProviders: async () => [{ id: 'fixture' }],
+    listModels: async () => [{ id: 'fixture-model' }],
+    stream({ messages }) {
+      const prompt = String(
+        (messages && messages[0] && messages[0].content && messages[0].content[0] && messages[0].content[0].text) || '',
+      )
+      return (async function* () {
+        if (prompt.includes('Reply with exactly: OK')) {
+          yield { type: 'block-start', blockType: 'text' }
+          yield { type: 'text', text: 'OK' }
+          yield { type: 'finish' }
+          return
+        }
+        if (prompt.includes('Machine summary text.')) throw new Error('balance exhausted')
+        await new Promise((r) => setTimeout(r, 1200))
+        yield { type: 'block-start', blockType: 'text' }
+        yield { type: 'text', text: JSON.stringify(['模型摘要文本', '模型推荐理由文本', '模型引用文本']) }
+        yield { type: 'finish' }
+      })()
+    },
+  }
+
+  let handler = null
+  const registered = []
+  const { apply } = await import('../index.js')
+  const ctx = {
+    get(name) {
+      if (name === 'webServer') {
+        return {
+          register: (route) => {
+            registered.push(route)
+            handler = route.handler
+            return () => {}
+          },
+        }
+      }
+      if (name === 'llm') return fakeLlm
+      return undefined
+    },
+    effect(fn) {
+      return fn()
+    },
+    inject(names, cb) {
+      if (names.indexOf('tools') >= 0) cb({ tools: { register: () => {} } })
+    },
+  }
+  apply(ctx)
+
+  let failures = 0
+  const lcheck = (name, ok, extra = '') => {
+    console.log((ok ? 'ok   ' : 'FAIL ') + name + (extra ? ' — ' + extra : ''))
+    if (!ok) failures += 1
+  }
+  const fakeRes = () => {
+    let release = null
+    const done = new Promise((resolve) => {
+      release = resolve
+    })
+    const res = {
+      statusCode: 0,
+      headers: {},
+      body: '',
+      done,
+      writeHead(code, headers) {
+        this.statusCode = code
+        this.headers = headers
+      },
+      end(chunk) {
+        this.body = chunk === undefined ? '' : String(chunk)
+        release()
+      },
+    }
+    return res
+  }
+  const call = async (path, opts = {}) => {
+    const res = fakeRes()
+    const body = opts.body
+    const req = {
+      method: opts.method || 'GET',
+      url: path,
+      headers: { host: '127.0.0.1:54321' },
+      on(type, fn) {
+        if (type === 'data' && body != null) fn(Buffer.from(body))
+        if (type === 'end') fn()
+      },
+      destroy() {},
+    }
+    await handler(req, res)
+    await res.done
+    return res
+  }
+  const read = (res) => JSON.parse(res.body)
+
+  if (!handler) {
+    console.error('FAIL: route handler was not registered in language fixture mode')
+    return 1
+  }
+
+  /* 语言偏好落盘；局部更新不能把已有的 like 列表清空 */
+  {
+    const initial = read(await call('/hackertube/api/prefs'))
+    lcheck('lang prefs default null', initial.lang === null, JSON.stringify(initial))
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ likes: ['abcdef'] }) })
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'zh' }) })
+    const saved = read(await call('/hackertube/api/prefs'))
+    lcheck('lang prefs stores zh', saved.lang === 'zh', JSON.stringify(saved))
+    lcheck('lang prefs keeps likes on partial update', Array.isArray(saved.likes) && saved.likes[0] === 'abcdef', JSON.stringify(saved.likes))
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'fr' }) })
+    const invalid = read(await call('/hackertube/api/prefs'))
+    lcheck('lang prefs ignores invalid language', invalid.lang === 'zh', String(invalid.lang))
+
+    /* 语言偏好和喜欢列表是两次独立提交，同时到达时不能互相覆盖 */
+    await Promise.all([
+      call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'en' }) }),
+      call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ likes: ['abcdef', 'ghijkl'] }) }),
+    ])
+    const merged = read(await call('/hackertube/api/prefs'))
+    lcheck(
+      'lang prefs merge concurrent writes',
+      merged.lang === 'en' && Array.isArray(merged.likes) && merged.likes.length === 2,
+      JSON.stringify(merged),
+    )
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'zh' }) })
+  }
+
+  /* 详情先返回原文：即使模型要等 1.2 秒，这一请求也不能等它 */
+  await call('/hackertube/api/video?vid=lgv001')
+  const t0 = Date.now()
+  const detailRes = await call('/hackertube/api/video?vid=lgv001&lang=zh')
+  const detailMs = Date.now() - t0
+  const detail = read(detailRes)
+  lcheck('lang detail 200', detailRes.statusCode === 200, 'got ' + detailRes.statusCode)
+  lcheck('lang detail is immediate', detailMs < 500, detailMs + 'ms')
+  lcheck('lang detail keeps original summary', detail.summary === 'Model summary text.', String(detail.summary))
+  lcheck('lang detail returns no blocking translation', !detail.i18n || !detail.i18n.summary, JSON.stringify(detail.i18n))
+
+  /* 模型译文：异步接口返回模型来源，之后详情直接读到缓存 */
+  const modelTr = read(await call('/hackertube/api/video/translate?vid=lgv001'))
+  lcheck('lang model translation fills', modelTr.i18n && modelTr.i18n.summary === '模型摘要文本', JSON.stringify(modelTr.i18n))
+  lcheck('lang model provenance', modelTr.i18nSource && modelTr.i18nSource.summary === 'model', JSON.stringify(modelTr.i18nSource))
+  const detailCached = read(await call('/hackertube/api/video?vid=lgv001&lang=zh'))
+  lcheck('lang detail reads cached model translation', detailCached.i18n && detailCached.i18n.summary === '模型摘要文本', JSON.stringify(detailCached.i18n))
+  lcheck('lang detail reads cached provenance', detailCached.i18nSource && detailCached.i18nSource.summary === 'model', JSON.stringify(detailCached.i18nSource))
+
+  /* 模型失败时退回机翻，来源标成 machine */
+  const machineTr = read(await call('/hackertube/api/video/translate?vid=lgv002'))
+  lcheck('lang machine translation fills', !!machineTr.i18n && /^机翻：/.test(String(machineTr.i18n.summary)), JSON.stringify(machineTr.i18n))
+  lcheck('lang machine provenance', machineTr.i18nSource && machineTr.i18nSource.summary === 'machine', JSON.stringify(machineTr.i18nSource))
+  const detailMachine = read(await call('/hackertube/api/video?vid=lgv002&lang=zh'))
+  lcheck('lang detail reads cached machine translation', detailMachine.i18n && /^机翻：/.test(String(detailMachine.i18n.summary)), JSON.stringify(detailMachine.i18n))
+
+  console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | fixture: language')
+  return failures ? 1 : 0
+}
+
 /* 固定 fixture 场景在独立子进程跑，避免真实上游与模块级状态互相污染 */
 for (const scenario of ['export-first', 'stale-offline']) {
   const r = spawnSync(process.execPath, [SELF], {
@@ -618,6 +846,17 @@ for (const scenario of ['export-first', 'stale-offline']) {
   if (r.stdout) process.stdout.write(r.stdout)
   if (r.stderr) process.stderr.write(r.stderr)
   check('first-paint fixture: ' + scenario, r.status === 0, 'exit ' + r.status)
+}
+
+{
+  const r = spawnSync(process.execPath, [SELF], {
+    env: { ...process.env, HT_LANGUAGE_FIXTURE: '1' },
+    encoding: 'utf8',
+    timeout: 30000,
+  })
+  if (r.stdout) process.stdout.write(r.stdout)
+  if (r.stderr) process.stderr.write(r.stderr)
+  check('language fixture', r.status === 0, 'exit ' + r.status)
 }
 
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | cache dir: ' + tmp)
