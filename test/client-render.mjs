@@ -44,6 +44,24 @@ global.IntersectionObserver = class {
   disconnect() {}
 }
 
+/* 语言偏好要跨“刷新”保留：模拟 localStorage；每个测试段可 clear() */
+const langStorage = new Map()
+global.localStorage = {
+  getItem(key) {
+    const k = String(key)
+    return langStorage.has(k) ? langStorage.get(k) : null
+  },
+  setItem(key, value) {
+    langStorage.set(String(key), String(value))
+  },
+  removeItem(key) {
+    langStorage.delete(String(key))
+  },
+  clear() {
+    langStorage.clear()
+  },
+}
+
 /** react-test-renderer 的宿主节点替身：滚动位置与 scrollIntoView 都留痕，供行为断言。
  *  re-render 会反复调用 createNodeMock，滚动容器按 className 固定同一份替身，
  *  否则 ref 指向的节点和测试持有的节点不是同一个对象。 */
@@ -164,6 +182,25 @@ function defaultSearchResponse(params) {
 }
 let searchResponder = defaultSearchResponse
 
+/* T05：语言偏好与详情异步翻译的测试开关 */
+let prefsLang = null
+const prefsPosts = []
+let translateRequests = 0
+let translateGate = null
+let translateReply = {
+  i18n: {
+    summary: '向量动画入门。',
+    why_hn: 'HN 上首推的线性代数直觉课。',
+    quote: '最友好的入门介绍。',
+  },
+  i18nSource: { summary: 'model', why_hn: 'machine', quote: 'model' },
+}
+/* 详情接口自带的缓存译文：有值时详情首屏就该直接显示译文 */
+let detailI18n = null
+let detailI18nSource = null
+const detailBody = () =>
+  detailI18n ? { ...DETAIL, i18n: detailI18n, i18nSource: detailI18nSource || {} } : DETAIL
+
 const statusBody = () => ({
   stage: statusStage,
   source: statusStage === 'ready' ? 'upstream' : 'export',
@@ -177,7 +214,6 @@ const statusBody = () => ({
 
 global.fetch = async (url, options = {}) => {
   fetchCalls += 1
-  fetchLog.push(String(url))
   const u = String(url)
   if (u.includes('/hackertube/api/search')) {
     const qs = new URL(u, 'http://fixture.local').searchParams
@@ -186,6 +222,20 @@ global.fetch = async (url, options = {}) => {
     searchCalls.push(params)
     const result = searchResponder(params)
     return { ok: true, status: 200, json: async () => result }
+  }
+  const method = (options && options.method) || 'GET'
+  fetchLog.push(method + ' ' + u)
+  let requestBody = null
+  try {
+    if (options && options.body) requestBody = JSON.parse(String(options.body))
+  } catch {
+    requestBody = null
+  }
+  if (u.includes('/prefs') && method === 'POST') prefsPosts.push(requestBody)
+  if (u.includes('/video/translate')) {
+    translateRequests += 1
+    if (translateGate) await translateGate
+    return { ok: true, status: 200, json: async () => translateReply }
   }
   if (u.includes('/hackertube/api/chat')) {
     const payload = JSON.parse(String(options.body || '{}'))
@@ -216,11 +266,11 @@ global.fetch = async (url, options = {}) => {
   }
   let body = LIST
   if (u.includes('/browse') || u.includes('/taxonomy')) body = TAX
-  else if (u.includes('/video')) body = DETAIL
+  else if (u.includes('/video')) body = detailBody()
   else if (u.includes('/related')) body = RELATED
   else if (u.includes('/deps')) body = depsBody
   else if (u.includes('/config')) body = { origin: 'http://127.0.0.1:54321', authUrl: null, mediaOrigin: 'http://127.0.0.1:18090' }
-  else if (u.includes('/prefs')) body = { likes: [], later: [], seen: [] }
+  else if (u.includes('/prefs')) body = { likes: [], later: [], seen: [], lang: prefsLang }
   else if (u.includes('/titles')) body = { entries: {} }
   else if (u.includes('/mt')) body = { text: '' }
   return { ok: true, status: 200, json: async () => body }
@@ -242,6 +292,7 @@ const win = {
     },
   },
   location: { pathname: '/', search: '', hash: '' },
+  navigator: { language: 'en-US', languages: ['en-US'] },
   addEventListener(type, fn) {
     if (!winListeners.has(type)) winListeners.set(type, new Set())
     winListeners.get(type).add(fn)
@@ -1086,6 +1137,278 @@ function subtitleDone(status, answer, extra = {}) {
   await sendQuestion(t, '这段在讲什么？')
   const body = treeText(t)
   check('T04 subtitle stage visible', /正在取当前播放位置附近的字幕|Loading subtitles/.test(body), body.slice(-260))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* ---------- T05：默认语言、持久化与详情异步翻译 ---------- */
+
+/** 每个用例重新求值一份 client.js，等价于刷新页面后的全新模块状态。 */
+function makeWin(navLang) {
+  const listeners = new Map()
+  const loc = { pathname: '/', search: '', hash: '' }
+  const entries = ['']
+  const w = {
+    __ModuleLoader__: {
+      load(cfg) {
+        w.captured = cfg
+      },
+    },
+    location: loc,
+    navigator: { language: navLang, languages: [navLang] },
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set())
+      listeners.get(type).add(fn)
+    },
+    removeEventListener(type, fn) {
+      if (listeners.has(type)) listeners.get(type).delete(fn)
+    },
+  }
+  w.__emit = (type, event) => {
+    for (const fn of listeners.get(type) || []) fn(event)
+  }
+  const applyUrl = (url) => {
+    const s = String(url || '')
+    const i = s.indexOf('#')
+    loc.hash = i >= 0 ? s.slice(i) : ''
+  }
+  w.history = {
+    pushState(state, title, url) {
+      entries.push(url)
+      applyUrl(url)
+    },
+    replaceState(state, title, url) {
+      entries[entries.length - 1] = url
+      applyUrl(url)
+    },
+    back() {
+      entries.pop()
+      applyUrl(entries[entries.length - 1] || '')
+      w.__emit('popstate', {})
+    },
+  }
+  return w
+}
+
+function loadClientModule(w) {
+  new Function('window', 'document', 'fetch', code)(w, global.document, global.fetch)
+  return w.captured.factory((name) => (name === 'react' ? React : undefined))
+}
+
+async function mountModule(mod) {
+  const registered = []
+  const ctx = {
+    slots: {
+      inject(name, cb) {
+        cb()
+        return () => {}
+      },
+      register(opts, comp) {
+        registered.push({ opts, comp })
+        return () => {}
+      },
+    },
+    effect(fn) {
+      return fn()
+    },
+  }
+  mod.apply(ctx)
+  const main = registered.find((r) => r.opts.name === 'main')
+  let t = null
+  await act(async () => {
+    t = create(React.createElement(main.comp, {}), { createNodeMock: makeNodeMock })
+  })
+  return t
+}
+
+function resetLangState() {
+  langStorage.clear()
+  prefsLang = null
+  prefsPosts.length = 0
+  translateRequests = 0
+  translateGate = null
+  detailI18n = null
+  detailI18nSource = null
+  translateReply = {
+    i18n: {
+      summary: '向量动画入门。',
+      why_hn: 'HN 上首推的线性代数直觉课。',
+      quote: '最友好的入门介绍。',
+    },
+    i18nSource: { summary: 'model', why_hn: 'machine', quote: 'model' },
+  }
+  fetchLog.length = 0
+}
+
+async function openWatch(t) {
+  const card = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-card')
+  await act(async () => {
+    card.props.onClick()
+    await new Promise((r) => setTimeout(r, 20))
+  })
+}
+
+console.log('\n--- T05 language & translation ---')
+
+/* 浏览器语言决定首次默认 */
+{
+  resetLangState()
+  const t = await mountModule(loadClientModule(makeWin('zh-CN')))
+  const body = treeText(t)
+  check('T05 browser language defaults to chinese', /首页/.test(body) && /分类/.test(body), body.slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 已保存的选择优先于浏览器语言 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  const body = treeText(t)
+  check('T05 stored preference wins over browser', /首页/.test(body) && !/Home \| Categories/.test(body), body.slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 本机选择与宿主偏好冲突时以本机为准，刷新后语言不被顶回去 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  prefsLang = 'en'
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 10))
+  })
+  check('T05 local choice outranks host preference', /首页/.test(treeText(t)), treeText(t).slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 没有本地记录时跟随宿主偏好 */
+{
+  resetLangState()
+  prefsLang = 'zh'
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 10))
+  })
+  check('T05 host preference applies without local storage', /首页/.test(treeText(t)), treeText(t).slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 没有保存过时跟随英文浏览器 */
+{
+  resetLangState()
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  const body = treeText(t)
+  check('T05 english browser defaults to english', /Home/.test(body) && /Categories/.test(body), body.slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 切换语言：写本地存储 + 写宿主偏好；刷新后仍然生效 */
+{
+  resetLangState()
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  const langBtn = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-lang')
+  await act(async () => {
+    langBtn.props.onClick()
+    await Promise.resolve()
+  })
+  check('T05 language toggle stores local preference', langStorage.get('ht.lang') === 'zh', String(langStorage.get('ht.lang')))
+  check('T05 language toggle posts host preference', prefsPosts.some((p) => p && p.lang === 'zh'), JSON.stringify(prefsPosts))
+  check('T05 language toggle switches UI', /首页/.test(treeText(t)), treeText(t).slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+
+  const reopened = await mountModule(loadClientModule(makeWin('en-US')))
+  check('T05 language survives refresh', /首页/.test(treeText(reopened)), treeText(reopened).slice(0, 120))
+  await act(async () => {
+    reopened.unmount()
+  })
+}
+
+/* 详情页：原文先出现，译文异步补齐，并标注模型译/机翻；分享卡片入口消失 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  let release = null
+  translateGate = new Promise((resolve) => {
+    release = resolve
+  })
+  const t = await mountModule(loadClientModule(makeWin('zh-CN')))
+  await openWatch(t)
+  const initial = treeText(t)
+  check('T05 detail shows original immediately', initial.includes('An animated introduction to vectors.'), initial.slice(0, 220))
+  check('T05 translation pending state visible', /正在翻译|Translating/.test(initial), initial.slice(0, 220))
+  const detailCall = fetchLog.findIndex((line) => /\/video\?vid=a1/.test(line))
+  const translateCall = fetchLog.findIndex((line) => /\/video\/translate\?vid=a1/.test(line))
+  check(
+    'T05 translate runs after the detail request',
+    detailCall >= 0 && translateCall > detailCall,
+    'detail=' + detailCall + ' translate=' + translateCall,
+  )
+  check('T05 translation not applied before it arrives', !initial.includes('向量动画入门。'), '')
+  check('T05 share card action removed from watch page', !findButton(t, /(分享卡片|Share card)/), '')
+
+  await act(async () => {
+    release()
+    await new Promise((r) => setTimeout(r, 30))
+  })
+  const after = treeText(t)
+  check('T05 translated summary fills asynchronously', after.includes('向量动画入门。'), after.slice(0, 260))
+  check('T05 model provenance label visible', after.includes('模型译'), after.slice(0, 260))
+  check('T05 machine provenance label visible', after.includes('机翻'), after.slice(0, 260))
+  check('T05 async translation request fired', translateRequests > 0, String(translateRequests))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 宿主已有译文：详情一次到位，不再发翻译请求 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  detailI18n = { summary: '缓存摘要', why_hn: '缓存推荐理由', quote: '缓存引用' }
+  detailI18nSource = { summary: 'model', why_hn: 'machine', quote: 'model' }
+  const t = await mountModule(loadClientModule(makeWin('zh-CN')))
+  await openWatch(t)
+  const body = treeText(t)
+  check(
+    'T05 cached translation shows without waiting',
+    body.includes('缓存摘要') && !body.includes('An animated introduction to vectors.'),
+    body.slice(0, 220),
+  )
+  check('T05 cached translation keeps provenance', body.includes('模型译') && body.includes('机翻'), body.slice(0, 220))
+  check('T05 cached translation skips async request', translateRequests === 0, String(translateRequests))
+  check(
+    'T05 cached detail is requested in chinese',
+    fetchLog.some((line) => /\/video\?vid=a1/.test(line) && /lang=zh/.test(line)),
+    '',
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 英文界面不请求翻译 */
+{
+  resetLangState()
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  await openWatch(t)
+  const body = treeText(t)
+  check('T05 english watch keeps original detail', body.includes('An animated introduction to vectors.'), body.slice(0, 200))
+  check('T05 english watch skips translation request', translateRequests === 0, String(translateRequests))
+  check('T05 english watch has no provenance label', !/模型译|机翻/.test(body), '')
   await act(async () => {
     t.unmount()
   })
