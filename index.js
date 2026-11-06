@@ -947,8 +947,8 @@ function serveEmbed(req, res, vid, lang) {
     '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#yt{width:100%;height:100%}' +
     '#yt iframe{width:100%;height:100%;border:0;display:block}</style>' +
     '</head><body><div id="yt"></div><script>' +
-    'var player=null,lastT=-1,timer=null;' +
-    'function tell(m){try{parent.postMessage(m,"*")}catch(e){}}' +
+    'var player=null,lastT=-1,timer=null;var V=' + JSON.stringify(vid) + ';' +
+    'function tell(m){m.vid=m.vid||V;try{parent.postMessage(m,"*")}catch(e){}}' +
     'function tick(){if(player&&typeof player.getCurrentTime==="function"){try{' +
     'var t=player.getCurrentTime(),d=player.getDuration();' +
     'if(Math.abs(t-lastT)>=1){lastT=t;tell({__ht:"time",t:t,d:d})}' +
@@ -3172,6 +3172,16 @@ export function apply(ctx) {
         }
         const lang = u.searchParams.get('lang') === 'zh' ? 'zh' : 'en'
         return serveEmbed(req, res, vid, lang)
+      }
+      /* 直链兜底也走免认证端口：dsh-app:// 页面带不上 Host 的认证 cookie */
+      if (u.pathname === '/media' || u.pathname === '/stream') {
+        const vid = u.searchParams.get('vid')
+        if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end('bad vid')
+          return
+        }
+        return u.pathname === '/media' ? serveMedia(req, res, vid) : serveStream(req, res, vid)
       }
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
       res.end('not found')
