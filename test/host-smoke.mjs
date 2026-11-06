@@ -112,7 +112,8 @@ async function probeLiveUpstream() {
   }
 }
 
-const liveUpstream = await probeLiveUpstream()
+const liveUpstream =
+  process.env.HT_FORCE_LIVE === '1' ? true : await probeLiveUpstream()
 
 /* 1. 非 loopback 且无 Origin 的请求应被拒 */
 {
