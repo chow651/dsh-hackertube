@@ -81,6 +81,7 @@ const state = {
   browseJson: null,
   inflight: new Map(),
   detail: new Map(),
+  searchIndex: null,
 }
 
 /* ---------------- 缓存位置 ---------------- */
@@ -739,6 +740,302 @@ async function loadList() {
     if (state.list) return state.list
     state.listMeta.stage = 'error'
     throw new Error('列表不可用：导出与上游都失败')
+  }
+}
+
+/* ---------------- 统一检索 ---------------- */
+
+/**
+ * 面板与 hackertube_search 共用这一份检索：词边界、中文查询扩展、字段权重、
+ * 摘要片段、筛选与排序都只在这里实现，客户端不再维护第二套评分。
+ */
+const SEARCH_LIMIT_DEFAULT = 200
+const SEARCH_LIMIT_MAX = 2000
+const SEARCH_SORT_KEYS = ['relevance', 'score', 'year', 'views']
+const SEARCH_FIELD_WEIGHT = {
+  title: 12,
+  title_zh: 12,
+  channel: 4,
+  tags: 8,
+  categories: 5,
+  topic: 8,
+  summary: 3,
+  why_hn: 3,
+}
+/* 字段展示顺序也是匹配字段的输出顺序：标题优先，正文类字段靠后 */
+const SEARCH_FIELD_ORDER = ['title', 'title_zh', 'channel', 'tags', 'categories', 'topic', 'summary', 'why_hn']
+const SEARCH_SNIPPET_ORDER = ['summary', 'why_hn', 'tags', 'categories', 'topic', 'title', 'title_zh', 'channel']
+
+function searchHasHan(text) {
+  return /[\u3400-\u9fff]/.test(String(text || ''))
+}
+
+function searchTokens(text) {
+  return String(text || '')
+    .toLowerCase()
+    .split(/[\s,，、;；|/]+/)
+    .map((t) => t.replace(/^[“”"'‘’()（）\[\]【】]+|[“”"'‘’()（）\[\]【】]+$/g, ''))
+    .filter(Boolean)
+}
+
+function searchTermRegExp(term) {
+  const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp('(^|[^a-z0-9])' + escapeRe(term) + '([^a-z0-9]|$)', 'i')
+}
+
+/** 拉丁词按词边界匹配（raft 不命中 craft / Minecraft），中文按子串匹配 */
+function searchTermMatches(hay, term) {
+  if (!hay) return false
+  if (searchHasHan(term)) return hay.indexOf(term) >= 0
+  return searchTermRegExp(term).test(hay)
+}
+
+function buildSearchIndex(items, detailMap, zhTitles, browse, zhTax) {
+  const catById = new Map()
+  for (const area of (browse && browse.areas) || []) {
+    for (const c of area.categories || []) {
+      catById.set(c.id, { name: c.name, areaId: area.id, areaName: area.name })
+    }
+  }
+  return items.map((item, index) => {
+    const detail = detailMap ? detailMap.get(item.v) : null
+    const zhTitle = (zhTitles && zhTitles[item.v]) || ''
+    const catEn = []
+    const catZh = []
+    const areaIds = []
+    const detailCats = detail && Array.isArray(detail.categories) ? detail.categories : []
+    for (const c of detailCats) {
+      if (!c) continue
+      if (c.name) catEn.push(c.name)
+      if (c.area) areaIds.push(c.area)
+      const z = zhTax && zhTax['c:' + c.id]
+      if (z) catZh.push(z)
+    }
+    for (const id of item.cats || []) {
+      const hit = catById.get(id)
+      if (hit && hit.name && catEn.indexOf(hit.name) < 0) catEn.push(hit.name)
+      if (hit && hit.areaId && areaIds.indexOf(hit.areaId) < 0) areaIds.push(hit.areaId)
+      const z = zhTax && zhTax['c:' + id]
+      if (z && catZh.indexOf(z) < 0) catZh.push(z)
+    }
+    const areaNames = []
+    for (const areaId of areaIds) {
+      const tax = ((browse && browse.areas) || []).find((a) => a.id === areaId)
+      if (tax && tax.name) areaNames.push(tax.name)
+      const z = zhTax && zhTax['a:' + areaId]
+      if (z) areaNames.push(z)
+    }
+    const display = {
+      title: item.t || '',
+      title_zh: zhTitle,
+      channel: item.c || '',
+      tags: Array.isArray(item.tags) ? item.tags.join(' ') : '',
+      categories: catEn.concat(catZh, areaNames).join(' '),
+      topic: (detail && detail.primary_topic) || '',
+      summary: (detail && detail.summary) || '',
+      why_hn: (detail && detail.why_hn) || '',
+    }
+    const hay = {}
+    for (const field of SEARCH_FIELD_ORDER) hay[field] = display[field].toLowerCase()
+    return {
+      index,
+      item,
+      detail,
+      display,
+      hay,
+      areaIds,
+      year: item.y || (detail && detail.published ? Number(String(detail.published).slice(0, 4)) : null),
+      type: item.ct || (detail && detail.content_type) || '',
+      level: item.lv || (detail && detail.level) || '',
+    }
+  })
+}
+
+function searchRecordPasses(rec, filters) {
+  if (filters.area && rec.areaIds.indexOf(filters.area) < 0) return false
+  if (filters.year != null && Number(rec.year) !== Number(filters.year)) return false
+  if (filters.type && String(rec.type) !== filters.type) return false
+  if (filters.level && String(rec.level) !== filters.level) return false
+  return true
+}
+
+function searchSnippet(rec, field, term) {
+  const text = String(rec.display[field] || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!text) return ''
+  let at = -1
+  if (searchHasHan(term)) {
+    at = text.toLowerCase().indexOf(term)
+  } else {
+    const m = searchTermRegExp(term).exec(text)
+    if (m) at = m.index + String(m[1] || '').length
+  }
+  if (at < 0) at = 0
+  const start = Math.max(0, at - 48)
+  const end = Math.min(text.length, at + 96)
+  return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '')
+}
+
+/**
+ * 一条记录对一组检索词的匹配结果。要求每个词至少命中一个字段；
+ * 命中字段按权重累加，整串短语命中标题再加分。
+ */
+function searchMatchRecord(rec, terms, phrase) {
+  const fields = []
+  let score = 0
+  for (const term of terms) {
+    let hit = false
+    for (const field of SEARCH_FIELD_ORDER) {
+      if (!searchTermMatches(rec.hay[field], term)) continue
+      hit = true
+      if (fields.indexOf(field) < 0) fields.push(field)
+      score += SEARCH_FIELD_WEIGHT[field] || 1
+    }
+    if (!hit) return null
+  }
+  if (phrase) {
+    const p = phrase.toLowerCase()
+    if (rec.hay.title.indexOf(p) >= 0 || rec.hay.title_zh.indexOf(p) >= 0) score += 15
+    else if (
+      rec.hay.tags.indexOf(p) >= 0 ||
+      rec.hay.summary.indexOf(p) >= 0 ||
+      rec.hay.why_hn.indexOf(p) >= 0
+    ) {
+      score += 6
+    }
+  }
+  score += Math.min(Number(rec.item.s) || 0, 50) * 0.2
+
+  let snippet = ''
+  let snippetField = ''
+  for (const field of SEARCH_SNIPPET_ORDER) {
+    if (fields.indexOf(field) < 0) continue
+    for (const term of terms) {
+      if (!searchTermMatches(rec.hay[field], term)) continue
+      snippet = searchSnippet(rec, field, term)
+      snippetField = field
+      break
+    }
+    if (snippet) break
+  }
+  return {
+    score,
+    fields: SEARCH_FIELD_ORDER.filter((f) => fields.indexOf(f) >= 0),
+    snippet,
+    snippetField,
+  }
+}
+
+function searchSortRank(a, b, sort, hasQuery) {
+  const sa = Number(a.rec.item.s) || 0
+  const sb = Number(b.rec.item.s) || 0
+  /* 没有查询时「相关度」就等于列表原序：筛选不该打乱浏览顺序 */
+  if (sort === 'relevance' && !hasQuery) return a.rec.index - b.rec.index
+  if (sort === 'score') return sb - sa
+  if (sort === 'year') return (Number(b.rec.year) || 0) - (Number(a.rec.year) || 0) || sb - sa
+  if (sort === 'views') return (Number(b.rec.item.w) || 0) - (Number(a.rec.item.w) || 0) || sb - sa
+  return (b.match ? b.match.score : 0) - (a.match ? a.match.score : 0) || sb - sa
+}
+
+/**
+ * 单一 Host 检索入口：query + filters + sort + limit/offset。
+ * 面板走 /search 路由，Agent 工具直接调用，两边拿到同一条排序。
+ */
+async function searchLibrary(params = {}) {
+  const query = String(params.query ?? '').trim()
+  const limit = Math.max(1, Math.min(Number(params.limit) || SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX))
+  const offset = Math.max(0, Number(params.offset) || 0)
+  const sort = SEARCH_SORT_KEYS.indexOf(String(params.sort || '')) >= 0 ? String(params.sort) : 'relevance'
+  const yearRaw = params.year
+  const filters = {
+    area: String(params.area || ''),
+    year: yearRaw !== '' && yearRaw != null && Number.isFinite(Number(yearRaw)) ? Number(yearRaw) : null,
+    type: String(params.type || ''),
+    level: String(params.level || ''),
+  }
+
+  const items = await loadList()
+  let detailMap = null
+  try {
+    detailMap = (await loadDataset()).detail
+  } catch {
+    /* 导出不可用时退回只按列表字段检索 */
+  }
+  const zhTitles = await loadI18n('zh-titles').catch(() => ({}))
+  let browse = null
+  try {
+    browse = await loadBrowse()
+  } catch {
+    /* 分类树不可用时仍有列表里的分类 id，筛选会退化为不命中 */
+  }
+  const zhTax = await loadI18n('zh-taxonomy').catch(() => ({}))
+  /* 译文表是原地增长的：用条目数当版本号，否者后到的译文不会进索引 */
+  const zhTitlesSize = Object.keys(zhTitles).length
+  const zhTaxSize = Object.keys(zhTax).length
+
+  const cached = state.searchIndex
+  let records
+  if (
+    cached &&
+    cached.items === items &&
+    cached.detailMap === detailMap &&
+    cached.zhTitles === zhTitles &&
+    cached.zhTitlesSize === zhTitlesSize &&
+    cached.browse === browse &&
+    cached.zhTax === zhTax &&
+    cached.zhTaxSize === zhTaxSize
+  ) {
+    records = cached.records
+  } else {
+    records = buildSearchIndex(items, detailMap, zhTitles, browse, zhTax)
+    state.searchIndex = { items, detailMap, zhTitles, zhTitlesSize, browse, zhTax, zhTaxSize, records }
+  }
+
+  const terms = searchTokens(query)
+  let expanded = []
+  if (terms.length && searchHasHan(query)) {
+    const translated = await mtQuery(query, 'en').catch(() => '')
+    expanded = searchTokens(translated)
+  }
+
+  const picked = []
+  for (const rec of records) {
+    if (!searchRecordPasses(rec, filters)) continue
+    let match = null
+    if (terms.length) {
+      const candidates = []
+      if (expanded.length) candidates.push(searchMatchRecord(rec, expanded, expanded.join(' ')))
+      candidates.push(searchMatchRecord(rec, terms, query.toLowerCase()))
+      match = candidates.filter(Boolean).sort((a, b) => b.score - a.score)[0] || null
+      if (!match) continue
+    }
+    picked.push({ rec, match })
+  }
+  picked.sort((a, b) => searchSortRank(a, b, sort, terms.length > 0) || a.rec.index - b.rec.index)
+
+  return {
+    query,
+    total: picked.length,
+    limit,
+    offset,
+    sort,
+    items: picked.slice(offset, offset + limit).map(({ rec, match }) => {
+      const item = Object.assign({}, rec.item)
+      if (match) {
+        item.match = {
+          fields: match.fields,
+          snippet: match.snippet,
+          snippetField: match.snippetField,
+        }
+        /* 工具输出要用中文标题与推荐理由；面板只读 fields/snippet，别把这两串塞进两千条结果 */
+        if (params.verbose) {
+          item.match.titleZh = rec.display.title_zh || ''
+          item.match.why = rec.display.why_hn || rec.display.summary || ''
+        }
+      }
+      return item
+    }),
   }
 }
 
@@ -1812,6 +2109,55 @@ async function translateDetailMT(detail) {
   return cache
 }
 
+/** 详情里需要翻译的字段；没有 quote 正文时不翻 quote。 */
+function detailTranslationFields(detail) {
+  const fields = ['summary', 'why_hn']
+  if (detail && detail.quote && typeof detail.quote.text === 'string' && detail.quote.text.trim()) fields.push('quote')
+  return fields
+}
+
+/** 汇总两个译文缓存，并给每个字段标上 model（模型译）或 machine（机翻）来源。 */
+function buildDetailI18n(vid, detail, llmCache, mtCache) {
+  const i18n = {}
+  const i18nSource = {}
+  for (const field of detailTranslationFields(detail)) {
+    const key = `${vid}:${field}`
+    const model = llmCache && llmCache[key]
+    const machine = mtCache && mtCache[key]
+    i18n[field] = model || machine || null
+    i18nSource[field] = model ? 'model' : machine ? 'machine' : null
+  }
+  return { i18n, i18nSource }
+}
+
+/** 只读缓存：详情首屏用，不触发模型或机翻请求。 */
+async function cachedDetailI18n(vid, detail) {
+  const [llmCache, mtCache] = await Promise.all([loadI18n('zh'), loadI18n('zh-mt')])
+  return buildDetailI18n(vid, detail, llmCache, mtCache)
+}
+
+/** 异步补齐详情译文：模型优先，缺失字段走机翻；返回来源标识。 */
+async function ensureDetailI18n(ctx, vid, detail) {
+  let llmCache = {}
+  if (ctx) {
+    try {
+      llmCache = await translateDetail(ctx, detail, 'zh')
+    } catch {
+      llmCache = {}
+    }
+  }
+  const missing = detailTranslationFields(detail).filter((field) => !llmCache[`${vid}:${field}`])
+  let mtCache = {}
+  if (missing.length) {
+    try {
+      mtCache = await translateDetailMT(detail)
+    } catch {
+      mtCache = {}
+    }
+  }
+  return buildDetailI18n(vid, detail, llmCache, mtCache)
+}
+
 /** 模型偶尔把批内编号带进译文，剥掉行首的 "N. " / "N、" / "N)" */
 function stripLeadingIndex(text) {  return String(text)
     .replace(/^\s*\d+\s*[.、)．]\s*/, '')
@@ -2543,6 +2889,32 @@ function json(res, code, body) {
   send(res, code, body)
 }
 
+/**
+ * prefs 是读-改-写：喜欢列表走 400ms 防抖，语言偏好单独提交，
+ * 两个请求同时到达会互相覆盖。串行化写入，后写的读得到前一次的结果。
+ */
+let prefsWriteChain = Promise.resolve()
+function mergePrefsWrite(body) {
+  const run = prefsWriteChain.then(async () => {
+    const prev = await readCache('prefs.json')
+    const old = prev && typeof prev === 'object' ? prev : {}
+    const clean = {}
+    /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
+    for (const key of ['likes', 'later', 'seen', 'dismissed']) {
+      const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
+      clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
+    }
+    const nextLang = body && (body.lang === 'zh' || body.lang === 'en') ? body.lang : null
+    if (nextLang) clean.lang = nextLang
+    else if (old.lang === 'zh' || old.lang === 'en') clean.lang = old.lang
+    clean.at = Date.now()
+    await writeCache('prefs.json', clean)
+    return clean
+  })
+  prefsWriteChain = run.catch(() => null)
+  return run
+}
+
 async function handler(req, res) {
   const url = new URL(req.url ?? '/', 'http://local')
   const route = url.pathname.slice(PREFIX.length)
@@ -2729,15 +3101,10 @@ async function handler(req, res) {
           } catch {
             return json(res, 400, { error: 'bad json' })
           }
-          const clean = {}
-          for (const key of ['likes', 'later', 'seen', 'dismissed']) {
-            const list = body && Array.isArray(body[key]) ? body[key] : []
-            clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
-          }
-          clean.at = Date.now()
-          await writeCache('prefs.json', clean)
+          const clean = await mergePrefsWrite(body)
           return json(res, 200, {
             ok: true,
+            lang: clean.lang || null,
             counts: {
               likes: clean.likes.length,
               later: clean.later.length,
@@ -2754,6 +3121,7 @@ async function handler(req, res) {
         later: Array.isArray(saved && saved.later) ? saved.later : [],
         seen: Array.isArray(saved && saved.seen) ? saved.seen : [],
         dismissed: Array.isArray(saved && saved.dismissed) ? saved.dismissed : [],
+        lang: saved && (saved.lang === 'zh' || saved.lang === 'en') ? saved.lang : null,
       })
     }
   /* 搜索框的中文查询先机翻成英文，再去命中英文标签与频道 */
@@ -2876,6 +3244,19 @@ async function handler(req, res) {
       })
       return json(res, 200, payload)
     }
+    if (route === '/search') {
+      const result = await searchLibrary({
+        query: url.searchParams.get('q') || '',
+        area: url.searchParams.get('area') || '',
+        year: url.searchParams.get('year') || '',
+        type: url.searchParams.get('type') || '',
+        level: url.searchParams.get('level') || '',
+        sort: url.searchParams.get('sort') || '',
+        limit: url.searchParams.get('limit') || '',
+        offset: url.searchParams.get('offset') || '',
+      })
+      return json(res, 200, result)
+    }
     if (route === '/list') {
       const items = await loadList()
       if (!state.listJson) state.listJson = JSON.stringify(items)
@@ -2910,38 +3291,21 @@ async function handler(req, res) {
       const vid = url.searchParams.get('vid')
       if (!vid) return json(res, 400, { error: 'vid required' })
       const detail = await loadVideo(vid)
+      /* 详情先返回原文；中文只带已有缓存，绝不在这里等模型或机翻 */
+      const payload = Object.assign({}, detail, { comments: pickComments(vid) })
       if (url.searchParams.get('lang') === 'zh') {
-        /* 模型在就用模型翻；没有模型或没翻出来，退到机翻，同样落盘缓存 */
-        let llmCache = {}
-        if (state.ctx) {
-          try {
-            llmCache = await translateDetail(state.ctx, detail, 'zh')
-          } catch {
-            llmCache = {}
-          }
-        }
-        const pick = (field) => llmCache[`${vid}:${field}`] || null
-        const needMt = !pick('summary') || !pick('why_hn') || !!(detail.quote && !pick('quote'))
-        let mtCache = {}
-        if (needMt) {
-          try {
-            mtCache = await translateDetailMT(detail)
-          } catch {
-            mtCache = {}
-          }
-        }
-        const merge = (field) => llmCache[`${vid}:${field}`] || mtCache[`${vid}:${field}`] || null
-        return json(res, 200, {
-          ...detail,
-          comments: pickComments(vid),
-          i18n: {
-            summary: merge('summary'),
-            why_hn: merge('why_hn'),
-            quote: merge('quote'),
-          },
-        })
+        const cached = await cachedDetailI18n(vid, detail)
+        payload.i18n = cached.i18n
+        payload.i18nSource = cached.i18nSource
       }
-      return json(res, 200, Object.assign({}, detail, { comments: pickComments(vid) }))
+      return json(res, 200, payload)
+    }
+    if (route === '/video/translate') {
+      const vid = url.searchParams.get('vid')
+      if (!vid) return json(res, 400, { error: 'vid required' })
+      const detail = await loadVideo(vid)
+      const translation = await ensureDetailI18n(state.ctx, vid, detail)
+      return json(res, 200, { vid, i18n: translation.i18n, i18nSource: translation.i18nSource })
     }
     if (route === '/media') {
       const vid = url.searchParams.get('vid')
@@ -3356,7 +3720,8 @@ export function apply(ctx) {
         description:
           '在 Hacker News 二十年推荐的 6454 个技术视频里检索。' +
           '当用户讨论某个技术概念、想找深入讲解，或问有没有相关的演讲、课程、访谈时使用。' +
-          '支持中英文检索词，返回标题、频道、时长、观看量、HN 推荐人数、推荐理由与链接。',
+          '与面板搜索共用同一套排序：词边界、中英文扩展、标题/频道/标签/分类/摘要/HN 推荐理由加权。' +
+          '返回标题、频道、时长、观看量、HN 推荐人数、匹配字段、摘要片段与链接。',
         parameters: {
           query: {
             type: 'string',
@@ -3371,6 +3736,26 @@ export function apply(ctx) {
             type: 'string',
             description: '返回文案的语言，zh 或 en，默认 zh',
           },
+          area: {
+            type: 'string',
+            description: '按领域筛选，例如 software、ai-data、systems-security',
+          },
+          year: {
+            type: 'number',
+            description: '按发布年份筛选',
+          },
+          type: {
+            type: 'string',
+            description: '按内容类型筛选，例如 talk、course、lecture',
+          },
+          level: {
+            type: 'string',
+            description: '按难度筛选，例如 intro、intermediate、advanced、general',
+          },
+          sort: {
+            type: 'string',
+            description: '排序：relevance（默认）、score、year、views',
+          },
         },
         output: {
           schema: { type: 'string' },
@@ -3379,67 +3764,37 @@ export function apply(ctx) {
         async execute(args) {
           const lang = args.lang === 'en' ? 'en' : 'zh'
           const tz = (zh, en) => (lang === 'zh' ? zh : en)
-          const terms = String(args.query || '')
-            .toLowerCase()
-            .split(/\s+/)
-            .filter(Boolean)
-          if (!terms.length) return tz('请提供检索词。', 'Provide a search query.')
+          const query = String(args.query || '').trim()
+          if (!query) return tz('请提供检索词。', 'Provide a search query.')
 
-          const items = await loadList()
-          const zhTitles = await loadI18n('zh-titles').catch(() => ({}))
-          let detailMap = null
-          try {
-            detailMap = (await loadDataset()).detail
-          } catch {
-            /* 导出不可用时退回只按列表字段检索 */
-          }
-
-          /* 拉丁词按词边界匹配，否则 raft 会命中 craft、Minecraft；中文按子串 */
-          const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-          const matchers = terms.map((term) => {
-            if (/[\u4e00-\u9fff]/.test(term)) return (hay) => hay.indexOf(term) >= 0
-            const re = new RegExp('(^|[^a-z0-9])' + escapeRe(term) + '([^a-z0-9]|$)', 'i')
-            return (hay) => re.test(hay)
+          const result = await searchLibrary({
+            query,
+            limit: Math.min(Number(args.limit) || 5, 15),
+            area: args.area,
+            year: args.year,
+            type: args.type,
+            level: args.level,
+            sort: args.sort,
+            /* 工具输出要用中文标题和推荐理由，这两串只在这里取 */
+            verbose: true,
           })
-
-          const scored = []
-          for (const it of items) {
-            const d = detailMap ? detailMap.get(it.v) : null
-            const titleBoth = it.t + ' ' + (zhTitles[it.v] || '')
-            const hay = [
-              titleBoth,
-              it.c || '',
-              (it.tags || []).join(' '),
-              (it.cats || []).join(' '),
-              (d && d.summary) || '',
-              (d && d.why_hn) || '',
-              (d && d.primary_topic) || '',
-            ]
-              .join(' ')
-              .toLowerCase()
-            let hits = 0
-            for (const m of matchers) if (m(hay)) hits += 1
-            if (!hits) continue
-            const titleLower = titleBoth.toLowerCase()
-            const titleHit = matchers.some((m) => m(titleLower))
-            scored.push({ it, d, hits, titleHit })
-          }
-          if (!scored.length) {
+          if (!result.items.length) {
             return tz(
               '没有找到匹配的视频。可以换更宽泛的关键词，中英文都试试。',
               'No matching videos. Try broader keywords, in English or Chinese.',
             )
           }
 
-          /* 先看命中词数，再看是否命中标题，最后用 HN 推荐强度排序 */
-          scored.sort(
-            (a, b) =>
-              b.hits - a.hits ||
-              (b.titleHit ? 1 : 0) - (a.titleHit ? 1 : 0) ||
-              (b.it.s || 0) - (a.it.s || 0),
-          )
-          const pick = scored.slice(0, Math.min(Number(args.limit) || 5, 15))
-
+          const fieldLabels = {
+            title: ['标题', 'title'],
+            title_zh: ['中文标题', 'Chinese title'],
+            channel: ['频道', 'channel'],
+            tags: ['标签', 'tags'],
+            categories: ['分类', 'category'],
+            topic: ['主题', 'topic'],
+            summary: ['摘要', 'summary'],
+            why_hn: ['HN 推荐理由', 'HN reason'],
+          }
           const nf = (n) => {
             const v = Number(n) || 0
             if (lang === 'zh') {
@@ -3453,10 +3808,9 @@ export function apply(ctx) {
             return String(v)
           }
 
-          return pick
-            .map((x, i) => {
-              const it = x.it
-              const zh = zhTitles[it.v] || ''
+          return result.items
+            .map((it, i) => {
+              const zh = (it.match && it.match.titleZh) || ''
               const title = lang === 'zh' && zh ? zh : it.t
               const alt = lang === 'zh' && zh && zh !== it.t ? '（' + it.t + '）' : ''
               const mins = Math.max(1, Math.round((it.d || 0) / 60))
@@ -3466,8 +3820,16 @@ export function apply(ctx) {
                 tz(nf(it.w) + '次观看', nf(it.w) + ' views'),
               ]
               if (it.r) bits.push(tz(it.r + ' 人推荐', it.r + ' recommenders'))
-              let line = (i + 1) + '. ' + title + alt + ' — ' + bits.filter(Boolean).join(' · ')
-              const why = (x.d && (x.d.why_hn || x.d.summary)) || ''
+              let line = i + 1 + '. ' + title + alt + ' — ' + bits.filter(Boolean).join(' · ')
+              const matched = it.match && Array.isArray(it.match.fields) ? it.match.fields : []
+              if (matched.length) {
+                const labels = matched
+                  .map((f) => (fieldLabels[f] ? fieldLabels[f][lang === 'zh' ? 0 : 1] : f))
+                  .join(tz('、', ', '))
+                line += '\n   ' + tz('匹配：', 'Matched: ') + labels
+                if (it.match.snippet) line += ' — ' + it.match.snippet
+              }
+              const why = (it.match && it.match.why) || ''
               if (why) {
                 line += '\n   ' + tz('HN：', 'HN: ') + (why.length > 110 ? why.slice(0, 110) + '…' : why)
               }

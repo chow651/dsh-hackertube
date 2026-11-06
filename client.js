@@ -52,11 +52,9 @@ window.__ModuleLoader__.load({
       taxP: null,
       detail: new Map(),
       origin: undefined,
-      lang: 'en',
+      lang: null,
       mediaOrigin: null,
       titles: {},
-      qMt: {},
-      catZh: null,
       titlesP: null,
       taxLang: null,
       /* 观看会话按视频 id 存：播放位置不能被下一条视频继承，暂停后也要保留 */
@@ -192,6 +190,67 @@ window.__ModuleLoader__.load({
     /** 界面文案：中文原句 + 英文对照，调用处不必写三元表达式 */
     const tx = (lang, zh, en) => (lang === 'zh' ? zh : en)
 
+    /* ---------------- 语言偏好 ---------------- */
+
+    const LANG_STORAGE_KEY = 'ht.lang'
+    /* 详情译文的等待上限：模型慢就放弃本轮，原文照旧可读 */
+    const TR_BUDGET_MS = 25000
+
+    function normalizeLang(value) {
+      return String(value || '').toLowerCase().startsWith('zh') ? 'zh' : 'en'
+    }
+
+    /** 本地偏好先于浏览器语言；dsh-app:// 下写不进去时静默退回浏览器语言。 */
+    function readStoredLang() {
+      try {
+        const v = localStorage.getItem(LANG_STORAGE_KEY)
+        return v === 'zh' || v === 'en' ? v : null
+      } catch {
+        return null
+      }
+    }
+
+    function browserLang() {
+      try {
+        /* DSH 宿主若明确声明中文，优先按它走；否则读浏览器语言列表 */
+        const docLang = typeof document !== 'undefined' && document.documentElement ? document.documentElement.lang : ''
+        if (docLang && String(docLang).toLowerCase().startsWith('zh')) return 'zh'
+        const nav =
+          (typeof window !== 'undefined' && window.navigator) ||
+          (typeof navigator !== 'undefined' ? navigator : null)
+        const list = nav && Array.isArray(nav.languages) && nav.languages.length ? nav.languages : nav ? [nav.language] : []
+        for (const item of list) {
+          const v = String(item || '').toLowerCase()
+          if (v) return normalizeLang(v)
+        }
+      } catch {
+        /* 无 navigator 的环境按英文处理 */
+      }
+      return 'en'
+    }
+
+    function initialLang() {
+      return readStoredLang() || browserLang()
+    }
+
+    function rememberLang(next) {
+      mem.lang = next
+      try {
+        localStorage.setItem(LANG_STORAGE_KEY, next)
+      } catch {
+        /* 私密模式写不进去，至少本次会话生效 */
+      }
+      try {
+        void fetch('/hackertube/api/prefs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ lang: next }),
+        }).catch(() => {})
+      } catch {
+        /* 离线时只留本地副本 */
+      }
+    }
+
     /* ---------------- 取数 ---------------- */
 
     function getJSON(url) {
@@ -262,7 +321,7 @@ window.__ModuleLoader__.load({
       return mem.taxP
     }
 
-    /** 标题译文表；后台按批生成，前端拿到多少用多少。中文搜索也依赖它，所以英文模式一样要拉 */
+    /** 标题译文表：界面显示用；Host 检索读同一份缓存，中文查询靠它扩展 */
     function loadTitles() {
       if (mem.titlesP) return mem.titlesP
       mem.titlesP = getJSON('/hackertube/api/titles?lang=zh&translate=1')
@@ -282,14 +341,20 @@ window.__ModuleLoader__.load({
       return item.t || tx(lang, '(无标题)', '(untitled)')
     }
 
+    /** 中文详情比原文多带一份缓存译文，缓存键必须带语言，两种结果不能互相顶掉。 */
+    function detailCacheKey(vid, lang) {
+      return lang === 'zh' ? vid + ':zh' : vid
+    }
+
+    /**
+     * 详情只回原文和已有的译文缓存，Host 不会在这里等模型或机翻，
+     * 所以带上 lang=zh 不会拖慢首屏，只是让已翻过的视频直接显示译文。
+     */
     function loadDetail(vid, lang) {
-      const key = lang === 'zh' ? vid + ':zh' : vid
+      const key = detailCacheKey(vid, lang)
       const hit = mem.detail.get(key)
       if (hit) return Promise.resolve(hit)
-      const q =
-        '/hackertube/api/video?vid=' +
-        encodeURIComponent(vid) +
-        (lang === 'zh' ? '&lang=zh' : '')
+      const q = '/hackertube/api/video?vid=' + encodeURIComponent(vid) + (lang === 'zh' ? '&lang=zh' : '')
       return getJSON(q).then((d) => {
         if (mem.detail.size > 40) mem.detail.delete(mem.detail.keys().next().value)
         mem.detail.set(key, d)
@@ -400,6 +465,16 @@ window.__ModuleLoader__.load({
       other: '其他',
     }
     const LV_ZH = { intro: '入门', intermediate: '进阶', general: '通用', advanced: '高阶' }
+    const MATCH_FIELD_ZH = {
+      title: '标题',
+      title_zh: '中文标题',
+      channel: '频道',
+      tags: '标签',
+      categories: '分类',
+      topic: '主题',
+      summary: '摘要',
+      why_hn: 'HN 推荐理由',
+    }
 
     /* ---------------- 样式 ---------------- */
 
@@ -436,6 +511,10 @@ window.__ModuleLoader__.load({
   display:inline-flex;align-items:center}
 .ht-chip:hover{background:var(--dsw-alias-bg-layer-2)}
 .ht-chip.on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base)}
+.ht-filters{flex:none;display:flex;flex-wrap:wrap;gap:8px;padding:10px 24px 0}
+.ht-filter{height:30px;padding:0 28px 0 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);
+  background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;font-size:12.5px;cursor:pointer;outline:none}
+.ht-filter:focus{border-color:rgba(255,102,0,.55)}
 .ht-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 24px 40px}
 .ht-recs{padding-top:18px}
 .ht-recs-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 10px}
@@ -470,6 +549,9 @@ window.__ModuleLoader__.load({
 .ht-meta > span + span:not(.ht-hn-mark)::before{content:"·";margin-right:8px;color:var(--dsw-alias-label-tertiary)}
 .ht-meta .ht-chan{font-weight:500}
 .ht-meta b{font-weight:400;color:var(--dsw-alias-label-primary)}
+.ht-match{margin:6px 0 0;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ht-match b{font-weight:500;color:var(--dsw-alias-label-tertiary)}
 .ht-actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 0}
 .ht-comments{margin:30px 0 8px;border-top:1px solid var(--dsw-alias-border-l1);padding-top:20px}
 .ht-comments-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:4px}
@@ -699,6 +781,10 @@ window.__ModuleLoader__.load({
 .ht-desc-p{margin:0 0 10px;font-size:13.5px;line-height:1.72;color:var(--dsw-alias-label-primary)}
 .ht-desc-p:last-child{margin-bottom:0}
 .ht-desc-why{color:var(--dsw-alias-label-secondary)}
+.ht-tr-badge{display:inline-block;margin-left:8px;padding:0 6px;border-radius:999px;vertical-align:1px;
+  font-size:11px;font-weight:600;font-style:normal;line-height:18px;
+  background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
+.ht-tr-busy{font-size:12px;font-weight:500;color:var(--dsw-alias-label-tertiary)}
 .ht-desc-quote{margin:12px 0 0;padding-left:12px;border-left:2px solid var(--dsw-alias-border-l3);
   font-size:13.5px;line-height:1.7;font-style:italic;color:var(--dsw-alias-label-secondary)}
 .ht-desc-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
@@ -870,6 +956,11 @@ window.__ModuleLoader__.load({
     /* ---------------- 卡片 ---------------- */
 
     function Card({ item, onOpen, lang }) {
+      const match = item.match
+      const matchFields =
+        match && Array.isArray(match.fields)
+          ? match.fields.map((f) => tx(lang, MATCH_FIELD_ZH[f] || f, f)).join(tx(lang, '、', ', '))
+          : ''
       return h(
         'button',
         { type: 'button', className: 'ht-card', 'data-vid': item.v, onClick: () => onOpen(item) },
@@ -893,6 +984,15 @@ window.__ModuleLoader__.load({
             item.w ? h('span', { key: 'w' }, tx(lang, fmtCount(item.w, lang) + ' 次观看', fmtCount(item.w, lang) + ' views')) : null,
             item.y ? h('span', { key: 'y' }, String(item.y)) : null,
           ),
+          match && match.snippet
+            ? h(
+                'p',
+                { className: 'ht-match' },
+                h('b', null, tx(lang, '匹配：', 'Match: ') + matchFields),
+                matchFields ? ' — ' : '',
+                match.snippet,
+              )
+            : null,
         ),
       )
     }
@@ -1573,6 +1673,9 @@ window.__ModuleLoader__.load({
       const [localBusy, setLocalBusy] = useState(false)
       const [depHint, setDepHint] = useState([])
       const [localErr, setLocalErr] = useState('')
+      const [trText, setTrText] = useState(null)
+      const [trSource, setTrSource] = useState({})
+      const [trBusy, setTrBusy] = useState(false)
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
       const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
@@ -1613,6 +1716,10 @@ window.__ModuleLoader__.load({
         setCtr({})
         setCtrOn({})
         setCtrBusy({})
+        setTrText(null)
+        setTrSource({})
+        setTrBusy(false)
+        /* 语言只影响这一次请求带不带 lang=zh；切语言后由下面的异步翻译补齐，不重拉详情 */
         loadDetail(item.v, lang)
           .then((d) => {
             if (alive) setDetail(d)
@@ -1667,8 +1774,18 @@ window.__ModuleLoader__.load({
 
       const hn = detail && detail.hn ? detail.hn : null
       const threadId = detail && detail.quote && detail.quote.id ? detail.quote.id : null
-      /* 中文模式下优先用 Host 返回的译文，没有则退回原文 */
-      const tr = (detail && detail.i18n) || {}
+      /* 中文模式下优先用已拿到的译文，没有则退回原文 */
+      const tr = lang === 'zh' && trText ? trText : {}
+      const trSourceFor = (field) => (lang === 'zh' && trText && trText[field] ? trSource[field] || null : null)
+      const trBadge = (field) => {
+        const source = trSourceFor(field)
+        if (!source) return null
+        return h(
+          'span',
+          { className: 'ht-tr-badge', key: 'tr-' + field },
+          source === 'model' ? tx(lang, '模型译', 'Model') : tx(lang, '机翻', 'Machine'),
+        )
+      }
       const quoteText =
         (lang === 'zh' ? tr.quote : null) || (detail && detail.quote && detail.quote.text ? detail.quote.text : '')
       const whyHnText = (lang === 'zh' ? tr.why_hn : null) || (detail && detail.why_hn) || ''
@@ -1681,12 +1798,71 @@ window.__ModuleLoader__.load({
       const hasDesc = !!(summaryText || whyHnText || quoteText || tags.length || (hn && hn.strong))
       const showMore = !descFit || descOpen
 
+      /* 详情返回的缓存译文直接显示；来源标识跟着译文一起进来 */
+      useEffect(() => {
+        if (!detail) return
+        const cached = detail.i18n && Object.keys(detail.i18n).some((k) => detail.i18n[k]) ? detail.i18n : null
+        setTrText(cached)
+        setTrSource(detail.i18nSource || {})
+      }, [detail])
+
+      /* 译文不阻塞详情：详情先出原文，缺的字段再异步补齐 */
+      useEffect(() => {
+        if (lang !== 'zh' || !detail) {
+          setTrBusy(false)
+          return undefined
+        }
+        const fields = []
+        if (typeof detail.summary === 'string' && detail.summary.trim()) fields.push('summary')
+        if (typeof detail.why_hn === 'string' && detail.why_hn.trim()) fields.push('why_hn')
+        if (detail.quote && typeof detail.quote.text === 'string' && detail.quote.text.trim()) fields.push('quote')
+        if (!fields.length) {
+          setTrBusy(false)
+          return undefined
+        }
+        /* 详情带的缓存译文和已经补到的译文都算数，任缺一项才补 */
+        const cached = detail.i18n || {}
+        const have = (field) => !!cached[field] || !!(trText && trText[field])
+        if (fields.every(have)) {
+          setTrBusy(false)
+          return undefined
+        }
+        let alive = true
+        setTrBusy(true)
+        /* 模型慢或卡住时不能让「正在翻译…」一直挂着：超时只是不再等，原文照旧可读 */
+        const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), TR_BUDGET_MS) : null
+        fetch('/hackertube/api/video/translate?vid=' + encodeURIComponent(item.v), ctrl ? { signal: ctrl.signal } : undefined)
+          .then((r) => {
+            if (!r.ok) throw new Error('HTTP ' + r.status)
+            return r.json()
+          })
+          .then((d) => {
+            if (!alive || !d || !d.i18n) return
+            setTrText(d.i18n)
+            setTrSource(d.i18nSource || {})
+            mem.detail.set(
+              detailCacheKey(item.v, 'zh'),
+              Object.assign({}, detail, { i18n: d.i18n, i18nSource: d.i18nSource || {} }),
+            )
+          })
+          .catch(() => {})
+          .then(() => {
+            if (timer) clearTimeout(timer)
+            if (alive) setTrBusy(false)
+          })
+        return () => {
+          alive = false
+          if (timer) clearTimeout(timer)
+        }
+      }, [lang, detail, item.v, trText])
+
       useEffect(() => {
         if (descOpen) return
         const el = descRef.current
         if (!el) return
         setDescFit(el.scrollHeight <= el.clientHeight + 2)
-      }, [detail, lang, descOpen, item.v])
+      }, [detail, lang, descOpen, item.v, trText, trBusy])
 
       /* 评论翻译：Host 按评论 id 缓存，已有的直接切显示，没有才发请求 */
       const runCommentTr = (ids) => {
@@ -1951,18 +2127,6 @@ window.__ModuleLoader__.load({
                 savedLater ? tx(lang, '已加入稍后看', 'Saved') : tx(lang, '稍后看', 'Watch later'),
               ),
               h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'ht-pill',
-                  onClick: () => {
-                    void makeShareCard(item, detail, quoteText)
-                  },
-                },
-                h(Ico, null, h('path', { d: 'M12 16V4M8 8l4-4 4 4M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3' })),
-                tx(lang, '分享卡片', 'Share card'),
-              ),
-              h(
                 'a',
                 {
                   className: 'ht-pill ht-pill-ghost',
@@ -1984,25 +2148,33 @@ window.__ModuleLoader__.load({
               ? h(
                   'section',
                   { className: 'ht-desc' + (descOpen ? '' : ' clamped') },
-                  ctLabel || lvLabel
+                  ctLabel || lvLabel || trBusy
                     ? h(
                         'div',
                         { className: 'ht-desc-head' },
                         ctLabel ? h('span', { key: 'ct' }, ctLabel) : null,
                         ctLabel && lvLabel ? h('span', { key: 'dot' }, '·') : null,
                         lvLabel ? h('span', { key: 'lv' }, lvLabel) : null,
+                        trBusy
+                          ? h('span', { key: 'tr', className: 'ht-tr-busy' }, tx(lang, '正在翻译…', 'Translating…'))
+                          : null,
                       )
                     : null,
                   h(
                     'div',
                     { className: 'ht-desc-body', ref: descRef },
-                    summaryText ? h('p', { className: 'ht-desc-p', key: 's' }, summaryText) : null,
-                    whyHnText ? h('p', { className: 'ht-desc-p ht-desc-why', key: 'w' }, whyHnText) : null,
+                    summaryText
+                      ? h('p', { className: 'ht-desc-p', key: 's' }, summaryText, trBadge('summary'))
+                      : null,
+                    whyHnText
+                      ? h('p', { className: 'ht-desc-p ht-desc-why', key: 'w' }, whyHnText, trBadge('why_hn'))
+                      : null,
                     quoteText
                       ? h(
                           'p',
                           { className: 'ht-desc-quote', key: 'q' },
                           tx(lang, '「' + quoteText + '」', '“' + quoteText + '”'),
+                          trBadge('quote'),
                         )
                       : null,
                     hn || tags.length
@@ -2477,12 +2649,20 @@ window.__ModuleLoader__.load({
       )
       const [err, setErr] = useState('')
       const [q, setQ] = useState('')
-      /* 中文查询机翻成英文后的检索词：标签只有英文，靠它才能命中 */
-      const [qMt, setQMt] = useState('')
       const [area, setArea] = useState('')
+      /* 筛选与排序都作为参数交给 Host 检索，客户端不再自己匹配或排序 */
+      const [year, setYear] = useState('')
+      const [type, setType] = useState('')
+      const [level, setLevel] = useState('')
+      const [sort, setSort] = useState('')
+      const [searchState, setSearchState] = useState({ key: '', items: [], total: 0, loading: false, error: '' })
       const [limit, setLimit] = useState(GRID_STEP)
       const [watching, setWatching] = useState(null)
-      const [lang, setLang] = useState(mem.lang || 'en')
+      const [lang, setLang] = useState(() => {
+        const next = mem.lang || initialLang()
+        mem.lang = next
+        return next
+      })
       const [view, setView] = useState('home')
       const [playlists, setPlaylists] = useState(null)
       const [plDetail, setPlDetail] = useState(null)
@@ -2490,12 +2670,13 @@ window.__ModuleLoader__.load({
       const [helpOpen, setHelpOpen] = useState(false)
       const [rec, setRec] = useState(null)
       const { saved, toggle, markSeen, dismiss } = useSaved()
-      const [titlesVersion, setTitlesVersion] = useState(0)
+      /* 计数没有读者：它一变就重渲染，让后到的中文标题显示出来 */
+      const [, bumpTitles] = useState(0)
 
-      /* 标题译文表在两种语言下都要：中文界面用来显示，英文界面用来支持中文搜索 */
+      /* 中文标题只用于显示；搜索已经在 Host 侧索引里读同一份译文表 */
       const ensureTitles = () => {
         void loadTitles().then((t) => {
-          if (Object.keys(t).length) setTitlesVersion((v) => v + 1)
+          if (Object.keys(t).length) bumpTitles((v) => v + 1)
         })
       }
       useEffect(() => {
@@ -2521,32 +2702,27 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
-      }, [phase, recKey, titlesVersion])
+      }, [phase, recKey])
 
-      /* 分类的中文名也参与检索：输入「数学」「安全」能命中整类，而不只是标题里带这两个字的视频 */
-      const [taxReady, setTaxReady] = useState(0)
+      /* 宿主端保存过语言偏好就跟随；本机有明确选择或用户刚手动切换时不被覆盖 */
       useEffect(() => {
-        if (mem.catZh) {
-          setTaxReady((v) => v + 1)
-          return undefined
-        }
         let alive = true
-        getJSON('/hackertube/api/taxonomy?lang=zh&translate=1')
+        /* localStorage 写不进去的宿主（dsh-app://）才需要宿主兜底 */
+        if (readStoredLang()) return undefined
+        getJSON('/hackertube/api/prefs')
           .then((d) => {
-            if (!alive || !d) return
-            const m = {}
-            for (const a of d.areas || []) {
-              if (a.nameZh) m['a:' + a.id] = a.nameZh
-              for (const c of a.categories || []) if (c.nameZh) m[c.id] = c.nameZh
-            }
-            mem.catZh = m
-            setTaxReady((v) => v + 1)
+            if (!alive || !d || langTouchedRef.current) return
+            const saved = d.lang === 'zh' || d.lang === 'en' ? d.lang : null
+            if (!saved || saved === mem.lang) return
+            mem.lang = saved
+            setLang(saved)
           })
           .catch(() => {})
         return () => {
           alive = false
         }
       }, [])
+
       const [reloadKey, setReloadKey] = useState(0)
       const [authUrl, setAuthUrl] = useState(null)
       const sentinelRef = useRef(null)
@@ -2555,6 +2731,7 @@ window.__ModuleLoader__.load({
       const listScrollRef = useRef(null)
       const listScrollTop = useRef(0)
       const watchPushedRef = useRef(false)
+      const langTouchedRef = useRef(false)
 
       /* 桌面端拿一个带 launch token 的 HTTP 地址，用于在新窗口获得安全上下文 */
       useEffect(() => {
@@ -2699,90 +2876,78 @@ window.__ModuleLoader__.load({
         }))
       }, [tax])
 
-      const catToArea = useMemo(() => {
-        const m = new Map()
-        const list = tax && Array.isArray(tax.areas) ? tax.areas : []
-        for (const a of list) {
-          for (const c of a.categories || []) m.set(c.id, a.id)
-        }
-        return m
-      }, [tax])
+      const years = useMemo(() => {
+        const set = new Set()
+        for (const it of items) if (Number(it.y)) set.add(Number(it.y))
+        return [...set].sort((a, b) => b - a)
+      }, [items])
+      const types = useMemo(() => {
+        const set = new Set()
+        for (const it of items) if (it.ct) set.add(String(it.ct))
+        return [...set].sort()
+      }, [items])
+      const levels = useMemo(() => {
+        const order = ['intro', 'intermediate', 'advanced', 'general']
+        const set = new Set()
+        for (const it of items) if (it.lv) set.add(String(it.lv))
+        return order.filter((x) => set.has(x))
+      }, [items])
 
-      const filtered = useMemo(() => {
-        if (!items.length) return []
-        /* 空格分词、全部命中才算命中；中文查译文、英文查原文，两种都能搜 */
-        const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean)
-        const mtTokens = String(qMt || '').toLowerCase().split(/\s+/).filter(Boolean)
-        let out = items
-        if (area) {
-          out = out.filter((it) =>
-            Array.isArray(it.cats) && it.cats.some((id) => catToArea.get(id) === area),
-          )
-        }
-        if (tokens.length) {
-          out = out.filter((it) => {
-            const zh = (mem.titles && mem.titles[it.v]) || ''
-            let catText = ''
-            if (mem.catZh && Array.isArray(it.cats)) {
-              /* 只用二级分类名，不用大区名：「安全」不该把数据库、操作系统的视频一起带出来 */
-              const parts = []
-              for (const id of it.cats) if (mem.catZh[id]) parts.push(mem.catZh[id])
-              catText = parts.join(' ')
-            }
-            const hay = (
-              (it.t || '') +
-              '\n' +
-              (it.c || '') +
-              '\n' +
-              zh +
-              '\n' +
-              catText +
-              '\n' +
-              (Array.isArray(it.tags) ? it.tags.join(' ') : '')
-            ).toLowerCase()
-            /* 原文命中，或者机翻后的英文命中，都算 */
-            if (tokens.every((tok) => hay.indexOf(tok) >= 0)) return true
-            return mtTokens.length > 0 && mtTokens.every((tok) => hay.indexOf(tok) >= 0)
-          })
-        }
-        return out
-      }, [items, q, qMt, area, catToArea, titlesVersion, taxReady])
+      /* 任何查询/筛选都走同一个 Host 检索操作；客户端只负责显示返回顺序 */
+      const searchActive = !!(q.trim() || area || year || type || level || sort)
+      const searchKey = [q.trim(), area, year, type, level, sort].join('\u0000')
 
-      /* 查询里带汉字才需要机翻；结果按查询串缓存，重复输入不再请求 */
       useEffect(() => {
-        const raw = q.trim()
-        if (!raw || !/[\u4e00-\u9fff]/.test(raw)) {
-          setQMt('')
-          return undefined
-        }
-        if (mem.qMt[raw] != null) {
-          setQMt(mem.qMt[raw])
+        if (!searchActive) {
+          setSearchState({ key: '', items: [], total: 0, loading: false, error: '' })
+          setLimit(GRID_STEP)
           return undefined
         }
         let alive = true
+        setSearchState((prev) => Object.assign({}, prev, { key: searchKey, loading: true, error: '' }))
         const timer = setTimeout(() => {
-          fetch('/hackertube/api/mt', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ text: raw, to: 'en' }),
-          })
-            .then((r) => r.json())
-            .then((d) => {
-              if (!alive || !d || typeof d.text !== 'string') return
-              mem.qMt[raw] = d.text
-              setQMt(d.text)
+          const params = new URLSearchParams()
+          const raw = q.trim()
+          if (raw) params.set('q', raw)
+          if (area) params.set('area', area)
+          if (year) params.set('year', year)
+          if (type) params.set('type', type)
+          if (level) params.set('level', level)
+          if (sort) params.set('sort', sort)
+          params.set('limit', String(GRID_CAP))
+          fetch('/hackertube/api/search?' + params.toString())
+            .then((r) => {
+              if (!r.ok) throw new Error('HTTP ' + r.status)
+              return r.json()
             })
-            .catch(() => {})
-        }, 300)
+            .then((d) => {
+              if (!alive) return
+              const list = d && Array.isArray(d.items) ? d.items : []
+              setSearchState({
+                key: searchKey,
+                items: list,
+                total: d && typeof d.total === 'number' ? d.total : list.length,
+                loading: false,
+                error: '',
+              })
+              setLimit(GRID_STEP)
+            })
+            .catch((e) => {
+              if (!alive) return
+              setSearchState({ key: searchKey, items: [], total: 0, loading: false, error: String((e && e.message) || e) })
+            })
+        }, 120)
         return () => {
           alive = false
           clearTimeout(timer)
         }
-      }, [q])
+      }, [searchKey])
 
-      useEffect(() => {
-        setLimit(GRID_STEP)
-      }, [q, area])
+      const filtered = searchActive ? searchState.items : items
+      const resultTotal = searchActive ? searchState.total : items.length
+      /* 输入变化到请求返回之间也算加载中：不然会先闪一下「没有匹配的视频」 */
+      const searchLoading = searchActive && (searchState.loading || searchState.key !== searchKey)
+      const searchError = searchActive ? searchState.error : ''
 
       /* 上报一次实测渲染结果：布局尺寸与关键计算样式，这是唯一能客观验证视觉的途径 */
       useEffect(() => {
@@ -3072,7 +3237,8 @@ window.__ModuleLoader__.load({
               className: 'ht-lang',
               onClick: () => {
                 const next = lang === 'zh' ? 'en' : 'zh'
-                mem.lang = next
+                langTouchedRef.current = true
+                rememberLang(next)
                 setLang(next)
               },
               title: lang === 'zh' ? '切换到英文' : '切换到中文',
@@ -3118,11 +3284,13 @@ window.__ModuleLoader__.load({
             'span',
             { className: 'ht-foot', style: { whiteSpace: 'nowrap' } },
             phase === 'ready'
-              ? tx(
-                  lang,
-                  filtered.length + ' 个视频',
-                  filtered.length.toLocaleString('en-US') + (filtered.length === 1 ? ' video' : ' videos'),
-                )
+              ? searchLoading
+                ? tx(lang, '检索中…', 'Searching…')
+                : tx(
+                    lang,
+                    resultTotal + ' 个视频',
+                    resultTotal.toLocaleString('en-US') + (resultTotal === 1 ? ' video' : ' videos'),
+                  )
               : '',
           ),
           authUrl
@@ -3165,6 +3333,64 @@ window.__ModuleLoader__.load({
             ),
           ),
         )) : null,
+        view === 'home' ? h(
+          'div',
+          { className: 'ht-filters' },
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'year',
+              value: year,
+              onChange: (e) => setYear(e.target.value),
+              'aria-label': tx(lang, '按年份筛选', 'Filter by year'),
+            },
+            h('option', { value: '' }, tx(lang, '全部年份', 'All years')),
+            years.map((y) => h('option', { key: y, value: String(y) }, String(y))),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'type',
+              value: type,
+              onChange: (e) => setType(e.target.value),
+              'aria-label': tx(lang, '按类型筛选', 'Filter by type'),
+            },
+            h('option', { value: '' }, tx(lang, '全部类型', 'All types')),
+            types.map((t) =>
+              h('option', { key: t, value: t }, lang === 'zh' ? CT_ZH[t] || t : t),
+            ),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'level',
+              value: level,
+              onChange: (e) => setLevel(e.target.value),
+              'aria-label': tx(lang, '按难度筛选', 'Filter by level'),
+            },
+            h('option', { value: '' }, tx(lang, '全部难度', 'All levels')),
+            levels.map((l) =>
+              h('option', { key: l, value: l }, lang === 'zh' ? LV_ZH[l] || l : l),
+            ),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'sort',
+              value: sort,
+              onChange: (e) => setSort(e.target.value),
+              'aria-label': tx(lang, '排序', 'Sort'),
+            },
+            h('option', { value: '' }, tx(lang, '默认排序', 'Default order')),
+            h('option', { value: 'score' }, tx(lang, 'HN 推荐分', 'HN score')),
+            h('option', { value: 'year' }, tx(lang, '最新发布', 'Newest')),
+            h('option', { value: 'views' }, tx(lang, '最多观看', 'Most viewed')),
+          ),
+        ) : null,
         view === 'home' && phase === 'loading' ? h(Skeleton, { label: loadingLabel }) : null,
         view === 'home' ? (h(
           'div',
@@ -3192,7 +3418,13 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
-          phase === 'ready' && !filtered.length
+          phase === 'ready' && searchLoading && !filtered.length
+            ? h('div', { className: 'ht-state' }, tx(lang, '检索中…', 'Searching…'))
+            : null,
+          phase === 'ready' && searchError
+            ? h('div', { className: 'ht-state' }, tx(lang, '检索失败：', 'Search failed: ') + searchError)
+            : null,
+          phase === 'ready' && !searchLoading && !searchError && !filtered.length
             ? h('div', { className: 'ht-state' }, tx(lang, '没有匹配的视频', 'No matching videos'))
             : null,
           phase === 'ready' && filtered.length
