@@ -46,6 +46,8 @@ const FALLBACK_TOTAL = 6454
 const TOTAL_BUDGET_MS = 120_000
 /* 缓存结构变更时递增，旧缓存直接作废 */
 const CACHE_VERSION = 2
+/* 列表刷新失败后的重试间隔：旧缓存可以先一直用，别每次打开都打满上游 */
+const LIST_RETRY_MS = 60_000
 
 const state = {
   ctx: null,
@@ -55,6 +57,19 @@ const state = {
   list: null,
   listAt: 0,
   listJson: null,
+  listP: null,
+  listMeta: {
+    stage: 'idle',
+    source: null,
+    stale: false,
+    revalidating: false,
+    enriched: 0,
+    total: 0,
+    error: null,
+    startedAt: 0,
+    updatedAt: 0,
+    nextTryAt: 0,
+  },
   browse: null,
   playlists: null,
   playlistsAt: 0,
@@ -134,10 +149,80 @@ function toSlim(o) {
   }
 }
 
-function setList(items, at) {
+function setList(items, at, source) {
   state.list = items
   state.listAt = at
   state.listJson = null
+  if (source) state.listMeta.source = source
+  state.listMeta.total = items.length
+  if (source === 'upstream') state.listMeta.enriched = items.length
+  state.listMeta.updatedAt = Date.now()
+}
+
+/** 前端轮询的首屏状态：阶段、来源、是否旧缓存、已补齐多少条。 */
+function listStatusPayload() {
+  const meta = state.listMeta
+  return {
+    stage: meta.stage,
+    source: meta.source,
+    stale: !!meta.stale,
+    revalidating: !!meta.revalidating,
+    total: meta.total || (state.list ? state.list.length : 0),
+    enriched: meta.enriched || 0,
+    error: meta.error || null,
+    startedAt: meta.startedAt || 0,
+    updatedAt: meta.updatedAt || 0,
+  }
+}
+
+/**
+ * 后台补齐 YouTube 元信息。先让导出/旧缓存返回给前端，65 页 /api/list
+ * 在后台翻完后再 merge 回同一份列表，并把完整快照写进 list.json。
+ */
+function startRevalidate(reason, stageOverride) {
+  if (state.listP) return state.listP
+  if (Date.now() < (state.listMeta.nextTryAt || 0)) return null
+  state.listP = (async () => {
+    const meta = state.listMeta
+    meta.revalidating = true
+    meta.error = null
+    meta.startedAt = Date.now()
+    meta.stage = stageOverride || (state.list ? 'metadata' : 'export')
+    meta.updatedAt = Date.now()
+    try {
+      const items = await fetchAllSlim((done, total) => {
+        meta.enriched = done
+        meta.total = total
+        meta.updatedAt = Date.now()
+      })
+      const base = state.list || []
+      const merged = base.length ? mergeMeta(base, items) : items
+      setList(merged, Date.now(), 'upstream')
+      meta.stale = false
+      meta.enriched = merged.length
+      meta.total = merged.length
+      await writeCache('list.json', { v: CACHE_VERSION, at: Date.now(), items: merged })
+      meta.stage = 'comments'
+      meta.updatedAt = Date.now()
+      try {
+        await loadMentions()
+      } catch {
+        /* 评论解析失败不影响列表可用 */
+      }
+      meta.stage = 'ready'
+      meta.nextTryAt = 0
+    } catch (err) {
+      meta.error = String((err && err.message) || err).slice(0, 200)
+      meta.nextTryAt = Date.now() + LIST_RETRY_MS
+      /* 已有本地列表就继续可浏览；没有列表时 /list 会返回 502 */
+      meta.stage = state.list ? 'ready' : 'error'
+    } finally {
+      meta.revalidating = false
+      meta.updatedAt = Date.now()
+      state.listP = null
+    }
+  })()
+  return state.listP
 }
 
 /* ---------------- 官方数据导出 ---------------- */
@@ -216,34 +301,44 @@ async function fetchExportZip() {
  */
 let exportReadyP = null
 
+async function exportFilesPresent() {
+  const dir = exportDir()
+  const sizes = await Promise.all(
+    EXPORT_FILES.map(async (n) => {
+      try {
+        return (await stat(join(dir, n))).size > 0
+      } catch {
+        return false
+      }
+    }),
+  )
+  return sizes.every(Boolean)
+}
+
 async function ensureExportReady() {
   if (exportReadyP) return exportReadyP
   exportReadyP = (async () => {
     const dir = exportDir()
     const manifest = await readCache('export/manifest.json')
-    if (manifest && Number(manifest.v) === EXPORT_VERSION) {
+    const versioned = !!(manifest && Number(manifest.v) === EXPORT_VERSION)
+    if (versioned) {
       const fresh = Date.now() - Number(manifest.at || 0) < EXPORT_TTL_MS
-      if (fresh) {
-        const sizes = await Promise.all(
-          EXPORT_FILES.map(async (n) => {
-            try {
-              return (await stat(join(dir, n))).size > 0
-            } catch {
-              return false
-            }
-          }),
-        )
-        if (sizes.every(Boolean)) return
+      if (fresh && (await exportFilesPresent())) return
+    }
+    try {
+      await mkdir(dir, { recursive: true })
+      const zip = await fetchExportZip()
+      const entries = unzipEntries(zip, EXPORT_FILES)
+      for (const n of EXPORT_FILES) {
+        if (!entries[n]) throw new Error('导出缺少文件：' + n)
+        await writeFile(join(dir, n), entries[n])
       }
+      await writeCache('export/manifest.json', { v: EXPORT_VERSION, at: Date.now(), bytes: zip.length })
+    } catch (err) {
+      /* 刷新失败但旧导出文件还在：离线时继续用旧快照，不把首屏拖进错误态 */
+      if (versioned && (await exportFilesPresent())) return
+      throw err
     }
-    await mkdir(dir, { recursive: true })
-    const zip = await fetchExportZip()
-    const entries = unzipEntries(zip, EXPORT_FILES)
-    for (const n of EXPORT_FILES) {
-      if (!entries[n]) throw new Error('导出缺少文件：' + n)
-      await writeFile(join(dir, n), entries[n])
-    }
-    await writeCache('export/manifest.json', { v: EXPORT_VERSION, at: Date.now(), bytes: zip.length })
   })().finally(() => {
     exportReadyP = null
   })
@@ -476,7 +571,7 @@ async function fetchPage(page) {
  * duration_s / views，卡片会缺封面和时长；只有 /api/list 带齐这些字段，
  * 代价是按 offset + n 翻完 65 页。gzip 后每页约 28KB。
  */
-async function fetchAllSlim() {
+async function fetchAllSlim(onProgress) {
   let total = FALLBACK_TOTAL
   try {
     const stats = await fetchJson(`${SOURCE}/api/stats`)
@@ -490,6 +585,15 @@ async function fetchAllSlim() {
   const out = []
   const failed = []
   let cursor = 0
+  const report = () => {
+    if (typeof onProgress !== 'function') return
+    try {
+      onProgress(out.length, total)
+    } catch {
+      /* 进度回调不影响抓取 */
+    }
+  }
+  report()
 
   const absorb = (page, value) => {
     if (!Array.isArray(value)) {
@@ -511,6 +615,7 @@ async function fetchAllSlim() {
       else failed.push(batch[i])
     })
     cursor += PAGE_CONCURRENCY
+    report()
   }
 
   /* 并发批里偶发失败的页单独补一次，别因为一页丢一百条 */
@@ -524,6 +629,7 @@ async function fetchAllSlim() {
         /* 仍失败则记在 failed 里 */
       }
     }
+    report()
   }
 
   const coverage = total ? out.length / total : 0
@@ -561,70 +667,78 @@ function mergeMeta(items, metaItems) {
 }
 
 async function loadList() {
-  const fresh = state.list && Date.now() - state.listAt < TTL_MS
-  if (fresh) return state.list
-
-  if (!state.list) {
-    const cached = await readCache('list.json')
-    if (
-      cached &&
-      cached.v === CACHE_VERSION &&
-      Array.isArray(cached.items) &&
-      cached.items.length
-    ) {
-      setList(cached.items, Number(cached.at) || 0)
-      if (Date.now() - state.listAt < TTL_MS) {
-        /* 命中缓存时也把导出与评论解析放到后台，打开第一个视频就不用等 */
-        void loadDataset()
-          .then(() => loadMentions())
-          .catch(() => {})
-        return state.list
-      }
+  /* 内存里已有列表：立即返回。超过 TTL 就标旧数据，后台刷新。 */
+  if (state.list) {
+    const fresh =
+      state.listAt > 0 &&
+      Date.now() - state.listAt < TTL_MS &&
+      state.listMeta.source !== 'export'
+    if (!fresh) {
+      if (state.listMeta.source !== 'export') state.listMeta.stale = true
+      const started = startRevalidate('memory-stale')
+      if (!started && state.list) state.listMeta.stage = 'ready'
     }
+    return state.list
   }
 
-  return once('list', async () => {
-    /* 冷启动并行做两件事：吃官方导出、补 YouTube 元信息。
-       导出给内容，/api/list 只给时长、播放量、发布时间和封面。 */
-    const metaTask = fetchAllSlim()
-      .then((items) => {
-        setList(items, Date.now())
-        void writeCache('list.json', { v: CACHE_VERSION, at: Date.now(), items })
-        return items
-      })
-      .catch((err) => {
-        void writeCache('diag.json', {
-          at: Date.now(),
-          stage: 'list',
-          error: String(err?.message ?? err),
-        })
-        return null
-      })
-
-    let ds = null
-    try {
-      ds = await loadDataset()
-    } catch (err) {
-      void writeCache('diag.json', {
-        at: Date.now(),
-        stage: 'export',
-        error: String(err?.message ?? err),
-      })
+  /* 磁盘旧缓存：先给用户看，过期就带 stale 标记并后台重新验证。 */
+  const cached = await readCache('list.json')
+  if (
+    cached &&
+    cached.v === CACHE_VERSION &&
+    Array.isArray(cached.items) &&
+    cached.items.length
+  ) {
+    const at = Number(cached.at) || 0
+    setList(cached.items, at, 'cache')
+    state.listMeta.stale = !(Date.now() - at < TTL_MS)
+    state.listMeta.enriched = cached.items.length
+    if (state.listMeta.stale) {
+      state.listMeta.stage = 'metadata'
+      const started = startRevalidate('stale-cache')
+      if (!started) state.listMeta.stage = 'ready'
+    } else {
+      state.listMeta.stage = 'ready'
+      /* 命中新鲜缓存时也把导出与评论解析放到后台，打开第一个视频就不用等 */
+      void loadDataset()
+        .then(() => loadMentions())
+        .catch(() => {})
     }
+    return state.list
+  }
 
-    const meta = await metaTask
-
-    if (ds) {
-      const merged = meta ? mergeMeta(ds.videos, meta) : ds.videos
-      setList(merged, Date.now())
-      /* 评论要等第一次打开视频才用到，先在后台上把 mentions 解析好 */
-      void loadMentions().catch(() => {})
-      return state.list
-    }
-    if (meta) return state.list
+  /* 首次安装：本地还没有列表时只能先等官方导出。阶段文案让用户知道在干什么。 */
+  state.listMeta.stage = 'export'
+  state.listMeta.source = null
+  state.listMeta.stale = false
+  state.listMeta.error = null
+  state.listMeta.startedAt = Date.now()
+  state.listMeta.updatedAt = Date.now()
+  try {
+    const ds = await loadDataset()
+    setList(ds.videos, 0, 'export')
+    state.listMeta.stage = 'metadata'
+    state.listMeta.total = ds.videos.length
+    state.listMeta.enriched = 0
+    state.listMeta.updatedAt = Date.now()
+    const started = startRevalidate('export-first')
+    if (!started) state.listMeta.stage = 'ready'
+    return state.list
+  } catch (err) {
+    void writeCache('diag.json', {
+      at: Date.now(),
+      stage: 'export',
+      error: String((err && err.message) || err),
+    })
+    /* 导出拿不到时退回上游列表：慢一点，但总比整个面板打不开好 */
+    state.listMeta.stage = 'metadata'
+    state.listMeta.error = String((err && err.message) || err).slice(0, 200)
+    state.listMeta.updatedAt = Date.now()
+    await startRevalidate('export-fallback', 'metadata')
     if (state.list) return state.list
+    state.listMeta.stage = 'error'
     throw new Error('列表不可用：导出与上游都失败')
-  })
+  }
 }
 
 /**
@@ -794,6 +908,20 @@ async function loadBrowse() {
       void writeCache('browse.json', { at: state.browseAt, taxonomy: data })
       return data
     } catch (err) {
+      /* /download 走独立限流；/api/browse 是同一份领域树的可用镜像 */
+      try {
+        const areas = await fetchJson(`${SOURCE}/api/browse`)
+        if (Array.isArray(areas) && areas.length) {
+          const data = { version: 'api-browse', areas }
+          state.browse = data
+          state.browseAt = Date.now()
+          state.browseJson = null
+          void writeCache('browse.json', { at: state.browseAt, taxonomy: data })
+          return data
+        }
+      } catch {
+        /* 两个来源都不可用时再报错 */
+      }
       if (state.browse) return state.browse
       throw err
     }
@@ -2396,7 +2524,7 @@ function buildChatMessages(systemPrompt, history, question) {
   ]
 }
 
-function send(res, code, body, type = 'application/json; charset=utf-8') {
+function send(res, code, body, type = 'application/json; charset=utf-8', extra = null) {
   const headers = {
     'Content-Type': type,
     'Cache-Control': 'no-store',
@@ -2405,6 +2533,7 @@ function send(res, code, body, type = 'application/json; charset=utf-8') {
   /* 桌面端页面在 dsh-app:// 下拿不到 HTTP 地址，借每次响应把它带过去，
      前端才能把播放器中转页放回安全上下文 */
   if (state.origin) headers['X-Hackertube-Origin'] = state.origin
+  if (extra) Object.assign(headers, extra)
   res.writeHead(code, headers)
   res.end(typeof body === 'string' ? body : JSON.stringify(body))
 }
@@ -2689,7 +2818,14 @@ async function handler(req, res) {
     if (route === '/list') {
       const items = await loadList()
       if (!state.listJson) state.listJson = JSON.stringify(items)
-      return send(res, 200, state.listJson)
+      return send(res, 200, state.listJson, undefined, {
+        'X-Hackertube-Stage': state.listMeta.stage || 'idle',
+        'X-Hackertube-Source': state.listMeta.source || '',
+        'X-Hackertube-Stale': state.listMeta.stale ? '1' : '0',
+      })
+    }
+    if (route === '/list/status') {
+      return json(res, 200, listStatusPayload())
     }
     if (route === '/playlists') {
       const list = await loadPlaylists(url.searchParams.get('force') === '1')

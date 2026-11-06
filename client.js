@@ -47,6 +47,7 @@ window.__ModuleLoader__.load({
     const mem = {
       list: null,
       listP: null,
+      status: null,
       tax: null,
       taxP: null,
       detail: new Map(),
@@ -224,6 +225,22 @@ window.__ModuleLoader__.load({
           })
       }
       return mem.listP
+    }
+
+    /** 首屏阶段状态：export → metadata → comments → ready；旧缓存时 stale=true。 */
+    function loadListStatus() {
+      return getJSON('/hackertube/api/list/status').catch(() => null)
+    }
+
+    /** 后台元信息补齐后，绕过 mem.list 重新取一次完整列表。 */
+    function refreshList() {
+      return getJSON('/hackertube/api/list')
+        .then((d) => {
+          if (!Array.isArray(d) || !d.length) return null
+          mem.list = d
+          return d
+        })
+        .catch(() => null)
     }
 
     function loadTaxonomy(lang) {
@@ -762,6 +779,14 @@ window.__ModuleLoader__.load({
 .ht-sechead{display:flex;align-items:baseline;gap:10px;padding:16px 24px 4px}
 .ht-sechead h2{margin:0;font-size:15px;font-weight:600}
 .ht-sechead p{margin:0;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.ht-loading-text{padding:16px 0 0;font-size:13px;color:var(--dsw-alias-label-secondary)}
+.ht-stagebar{display:flex;align-items:center;gap:8px;margin:0 24px;padding:8px 12px;border-radius:8px;
+  background:var(--dsw-alias-interactive-bg-hover);font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.ht-stagebar::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-brand-primary);
+  animation:ht-pulse 1.2s ease-in-out infinite}
+.ht-stale{margin:0 24px;padding:8px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-turn-trigger-bg);font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+@keyframes ht-pulse{0%,100%{opacity:.35}50%{opacity:1}}
 .ht-skel{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:32px 20px;padding-top:16px}
 .ht-skel div{display:flex;flex-direction:column;gap:8px}
 .ht-skel i{display:block;background:var(--dsw-alias-bg-skeleton);border-radius:12px}
@@ -2135,10 +2160,40 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Skeleton() {
+    /** 首屏/后台加载阶段文案；Host 只给状态，翻译留在前端。 */
+    function stageLabel(lang, status) {
+      const stage = status && status.stage
+      if (stage === 'export') {
+        return tx(lang, '正在读取本地视频导出…', 'Loading local video export…')
+      }
+      if (stage === 'metadata') {
+        const total = Number(status.total) || 0
+        const done = Number(status.enriched) || 0
+        return total
+          ? tx(lang, '正在同步视频元信息 ' + done + '/' + total + '…', 'Syncing video metadata ' + done + '/' + total + '…')
+          : tx(lang, '正在同步视频元信息…', 'Syncing video metadata…')
+      }
+      if (stage === 'comments') {
+        return tx(lang, '正在解析 HN 评论…', 'Parsing HN comments…')
+      }
+      if (stage === 'ready' || stage === 'idle') return ''
+      return tx(lang, '正在准备视频库…', 'Preparing the video library…')
+    }
+
+    /** 旧缓存提示：重新验证中说明在更新，失败后说明网络不可用。 */
+    function staleLabel(lang, status) {
+      if (!status || !status.stale) return ''
+      return status.revalidating
+        ? tx(lang, '显示的是本地旧缓存，正在后台更新…', 'Showing a stale local cache; refreshing in the background…')
+        : tx(lang, '显示的是本地旧缓存，网络不可用，内容可能不是最新', 'Showing a stale local cache; the network is unavailable, so content may be outdated')
+    }
+
+    function Skeleton(props) {
+      const label = props && props.label
       return h(
         'div',
         { className: 'ht-scroll' },
+        label ? h('div', { className: 'ht-loading-text' }, label) : null,
         h(
           'div',
           { className: 'ht-skel' },
@@ -2309,6 +2364,9 @@ window.__ModuleLoader__.load({
       const [items, setItems] = useState(mem.list || [])
       const [tax, setTax] = useState(mem.tax || null)
       const [phase, setPhase] = useState(mem.list ? 'ready' : 'loading')
+      const [loadStage, setLoadStage] = useState(
+        mem.status || { stage: mem.list ? 'ready' : 'idle', stale: false, revalidating: false, enriched: 0, total: 0 },
+      )
       const [err, setErr] = useState('')
       const [q, setQ] = useState('')
       /* 中文查询机翻成英文后的检索词：标签只有英文，靠它才能命中 */
@@ -2378,14 +2436,25 @@ window.__ModuleLoader__.load({
           .catch(() => {})
       }, [])
 
+      /* 列表与分类拆开：列表一到就渲染卡片，分类稍后补筛选条，互不阻塞首屏 */
       useEffect(() => {
         let alive = true
-        Promise.all([loadList(), loadTaxonomy(lang)])
-          .then(([list, taxonomy]) => {
+        if (!mem.list) setPhase('loading')
+        loadList()
+          .then(async (list) => {
             if (!alive) return
             setItems(list)
-            setTax(taxonomy)
             setPhase('ready')
+            /* 列表回来时同步问一次阶段，后台还在补元信息就继续展示进度 */
+            const prev = mem.status && mem.status.stage
+            const status = await loadListStatus()
+            if (!alive || !status) return
+            mem.status = status
+            setLoadStage(status)
+            if (status.stage === 'ready' && prev !== 'ready' && status.enriched > 0) {
+              const fresh = await refreshList()
+              if (alive && fresh) setItems(fresh)
+            }
           })
           .catch((e) => {
             if (!alive) return
@@ -2395,7 +2464,51 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
+      }, [reloadKey])
+
+      useEffect(() => {
+        let alive = true
+        loadTaxonomy(lang)
+          .then((taxonomy) => {
+            if (alive) setTax(taxonomy)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
       }, [reloadKey, lang])
+
+      /* 首屏阶段轮询：export → metadata → comments → ready；完成时把补齐后的列表换进来 */
+      useEffect(() => {
+        let alive = true
+        let timer = null
+        const tick = async () => {
+          const status = await loadListStatus()
+          if (!alive) return
+          if (!status) {
+            timer = setTimeout(tick, 2000)
+            return
+          }
+          const prev = mem.status && mem.status.stage
+          mem.status = status
+          setLoadStage(status)
+          if (status.stage === 'ready' && prev !== 'ready' && status.enriched > 0) {
+            const fresh = await refreshList()
+            if (alive && fresh) {
+              setItems(fresh)
+              setPhase('ready')
+            }
+          }
+          if ((status.stage !== 'ready' && status.stage !== 'error') || status.revalidating) {
+            timer = setTimeout(tick, 1000)
+          }
+        }
+        tick()
+        return () => {
+          alive = false
+          if (timer) clearTimeout(timer)
+        }
+      }, [reloadKey])
 
       /* 深链恢复：地址里带 ht-watch 的视频在列表就绪后直接打开 */
       useEffect(() => {
@@ -2804,6 +2917,9 @@ window.__ModuleLoader__.load({
       })()
 
       const shown = filtered.slice(0, limit)
+      const stageText = stageLabel(lang, loadStage)
+      const staleText = staleLabel(lang, loadStage)
+      const loadingLabel = stageText || tx(lang, '正在准备视频库…', 'Preparing the video library…')
 
       return h(
         'div',
@@ -2912,7 +3028,7 @@ window.__ModuleLoader__.load({
             ),
           ),
         )) : null,
-        view === 'home' && phase === 'loading' ? h(Skeleton) : null,
+        view === 'home' && phase === 'loading' ? h(Skeleton, { label: loadingLabel }) : null,
         view === 'home' ? (h(
           'div',
           {
@@ -2922,6 +3038,8 @@ window.__ModuleLoader__.load({
               listScrollTop.current = e.currentTarget.scrollTop || 0
             },
           },
+          phase === 'ready' && staleText ? h('div', { className: 'ht-stale', role: 'status' }, staleText) : null,
+          phase === 'ready' && stageText ? h('div', { className: 'ht-stagebar', role: 'status' }, stageText) : null,
           phase === 'error'
             ? h(
                 'div',
