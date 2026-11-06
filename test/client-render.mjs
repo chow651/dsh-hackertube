@@ -123,6 +123,11 @@ let depsBody = {
 
 let fetchCalls = 0
 const fetchLog = []
+const fetchPosts = []
+let recommendMode = 'cold'
+let recommendItems = [{ ...LIST[2], reason: { kind: 'hn', score: 22, recommenders: 19 } }]
+
+
 const searchCalls = []
 const chatCalls = []
 const chatPlans = []
@@ -214,6 +219,7 @@ const statusBody = () => ({
 
 global.fetch = async (url, options = {}) => {
   fetchCalls += 1
+  if (options && options.method === 'POST') fetchPosts.push({ url: String(url), body: options.body })
   const u = String(url)
   if (u.includes('/hackertube/api/search')) {
     const qs = new URL(u, 'http://fixture.local').searchParams
@@ -259,6 +265,18 @@ global.fetch = async (url, options = {}) => {
   }
   if (u.includes('/list/status')) {
     return { ok: true, status: 200, json: async () => statusBody() }
+  }
+  if (u.includes('/recommend')) {
+    const query = new URL(u, 'http://fixture.local').searchParams
+    const dismissed = new Set(String(query.get('dismissed') || '').split(',').filter(Boolean))
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        mode: recommendMode,
+        items: recommendItems.filter((item) => !dismissed.has(item.v)),
+      }),
+    }
   }
   if (/\/hackertube\/api\/list(\?|$)/.test(u)) {
     if (listGate) await listGate
@@ -1409,6 +1427,97 @@ console.log('\n--- T05 language & translation ---')
   check('T05 english watch keeps original detail', body.includes('An animated introduction to vectors.'), body.slice(0, 200))
   check('T05 english watch skips translation request', translateRequests === 0, String(translateRequests))
   check('T05 english watch has no provenance label', !/模型译|机翻/.test(body), '')
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+console.log('\n--- T06 taste profile ---')
+
+function instanceText(inst) {
+  const out = []
+  const walk = (node) => {
+    if (node === null || node === undefined) return
+    if (typeof node === 'string' || typeof node === 'number') {
+      out.push(String(node))
+      return
+    }
+    if (Array.isArray(node)) {
+      node.forEach(walk)
+      return
+    }
+    if (node.children) node.children.forEach(walk)
+    else if (node.props && node.props.children !== undefined) walk(node.props.children)
+  }
+  walk(inst)
+  return out.join(' | ')
+}
+
+/* 有 like：首页出现推荐行，逐个给出「因为你喜欢…」的理由 */
+{
+  resetRoute()
+  recommendMode = 'likes'
+  recommendItems = [
+    { ...LIST[1], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } },
+    { ...LIST[2], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } },
+  ]
+  const t = await freshTree()
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 60))
+  })
+  const body = treeText(t)
+  check('T06 home recommendation row', /为你推荐|Recommended for you/.test(body), body.slice(0, 160))
+  check(
+    'T06 like explanation visible',
+    /因为你喜欢|Because you liked/.test(body) && body.includes('Vectors, the first chapter'),
+    body.slice(0, 200),
+  )
+  const recs = findClass(t, 'ht-rec')
+  check('T06 recommendation cards rendered', recs.length === 2, String(recs.length))
+  check('T06 every recommendation has a reason', recs.every((r) => /因为你喜欢|Because you liked/.test(instanceText(r))))
+  check('T06 recommendation title visible', recs.some((r) => instanceText(r).includes('A talk about type systems')), '')
+
+  /* 不感兴趣：写入 prefs，重新取推荐后该条消失，顺序变化 */
+  const hide = findClass(t, 'ht-rec-hide')[0]
+  check('T06 not interested action present', !!hide)
+  await act(async () => {
+    hide.props.onClick()
+    await new Promise((r) => setTimeout(r, 520))
+  })
+  const prefPosts = fetchPosts.filter((p) => p.url.includes('/prefs'))
+  check(
+    'T06 dismiss persists to prefs',
+    prefPosts.some((p) => String(p.body || '').includes('"dismissed"') && String(p.body || '').includes('b2')),
+    prefPosts.map((p) => p.body).join(' / ').slice(0, 180),
+  )
+  check('T06 dismiss refetches with feedback', fetchLog.some((u) => String(u).includes('/recommend') && String(u).includes('dismissed=b2')), '')
+  const recsAfter = findClass(t, 'ht-rec')
+  check(
+    'T06 dismissed item leaves the row',
+    recsAfter.length === 1 && instanceText(recsAfter[0]).includes('Intro to large language models'),
+    recsAfter.map(instanceText).join(' / ').slice(0, 180),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 没有 like：冷启动用播放列表与 HN 分数，理由同样可见 */
+{
+  resetRoute()
+  recommendMode = 'cold'
+  recommendItems = [
+    { ...LIST[2], reason: { kind: 'playlist', title: 'Start here', slug: 'start-here' } },
+    { ...LIST[1], reason: { kind: 'hn', score: 22, recommenders: 9 } },
+  ]
+  const t = await freshTree()
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 60))
+  })
+  const body = treeText(t)
+  check('T06 cold-start row visible', /编辑精选|Editor's picks/.test(body), body.slice(0, 160))
+  check('T06 cold playlist reason visible', /来自播放列表|From playlist/.test(body) && body.includes('Start here'), body.slice(0, 200))
+  check('T06 cold HN reason visible', /HN 高分推荐|Highly recommended on HN/.test(body), body.slice(0, 220))
   await act(async () => {
     t.unmount()
   })

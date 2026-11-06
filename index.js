@@ -17,6 +17,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inflateRawSync } from 'node:zlib'
+import { normalizeIds, recommend } from './recommend.js'
 
 /* 仓库里预生成的译文，首次安装时直接铺到缓存目录 */
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -482,7 +483,7 @@ async function loadVectors() {
   if (npyState.vec) return npyState
   const files = await readExport(['embeddings.npy', 'embedding_ids.json'])
   const npy = files['embeddings.npy']
-  if (npy.toString('latin1', 1, 7) !== 'NUMPY') throw new Error('embeddings.npy 头不对')
+  if (npy.toString('latin1', 1, 6) !== 'NUMPY') throw new Error('embeddings.npy 头不对')
   const major = npy[6]
   const headerLen = major === 1 ? npy.readUInt16LE(8) : npy.readUInt32LE(8)
   const headerStart = major === 1 ? 10 : 12
@@ -2899,7 +2900,7 @@ function mergePrefsWrite(body) {
     const old = prev && typeof prev === 'object' ? prev : {}
     const clean = {}
     /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
-    for (const key of ['likes', 'later', 'seen']) {
+    for (const key of ['likes', 'later', 'seen', 'dismissed']) {
       const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
       clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
     }
@@ -3104,7 +3105,12 @@ async function handler(req, res) {
           return json(res, 200, {
             ok: true,
             lang: clean.lang || null,
-            counts: { likes: clean.likes.length, later: clean.later.length, seen: clean.seen.length },
+            counts: {
+              likes: clean.likes.length,
+              later: clean.later.length,
+              seen: clean.seen.length,
+              dismissed: clean.dismissed.length,
+            },
           })
         })
         return
@@ -3114,6 +3120,7 @@ async function handler(req, res) {
         likes: Array.isArray(saved && saved.likes) ? saved.likes : [],
         later: Array.isArray(saved && saved.later) ? saved.later : [],
         seen: Array.isArray(saved && saved.seen) ? saved.seen : [],
+        dismissed: Array.isArray(saved && saved.dismissed) ? saved.dismissed : [],
         lang: saved && (saved.lang === 'zh' || saved.lang === 'en') ? saved.lang : null,
       })
     }
@@ -3186,6 +3193,57 @@ async function handler(req, res) {
   if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
 
   try {
+    if (route === '/recommend') {
+      /* 首页推荐画像：likes 来自 prefs；query 参数覆盖 prefs，让前端在保存前也能立刻刷新 */
+      const saved = (await readCache('prefs.json')) || {}
+      const listParam = (name) => {
+        if (!url.searchParams.has(name)) return normalizeIds(saved[name])
+        return normalizeIds(String(url.searchParams.get(name) || '').split(','))
+      }
+      const likes = listParam('likes')
+      const seen = listParam('seen')
+      const dismissed = listParam('dismissed')
+      const items = await loadList()
+      let dataset = null
+      let vectors = null
+      try {
+        dataset = await loadDataset()
+      } catch {
+        /* 导出不可用时只靠列表里的 HN 分数冷启动 */
+      }
+      try {
+        vectors = await loadVectors()
+      } catch {
+        /* 没有 embeddings.npy 时降级到共推荐图 */
+      }
+      let playlists = []
+      if (!likes.length) {
+        /* 冷启动才有播放列表依赖；超时就用 HN 分数兜底，首页不能等上游 */
+        try {
+          playlists = await Promise.race([
+            loadPlaylists(),
+            new Promise((resolve) => {
+              const timer = setTimeout(() => resolve([]), 2500)
+              if (timer && typeof timer.unref === 'function') timer.unref()
+            }),
+          ])
+        } catch {
+          playlists = []
+        }
+        if (!Array.isArray(playlists)) playlists = []
+      }
+      const payload = recommend({
+        videos: items.length ? items : dataset ? dataset.videos : [],
+        likes,
+        seen,
+        dismissed,
+        related: dataset ? dataset.related : null,
+        vectors,
+        playlists,
+        limit: Number(url.searchParams.get('limit')) || 10,
+      })
+      return json(res, 200, payload)
+    }
     if (route === '/search') {
       const result = await searchLibrary({
         query: url.searchParams.get('q') || '',
