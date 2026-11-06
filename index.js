@@ -1807,6 +1807,55 @@ async function translateDetailMT(detail) {
   return cache
 }
 
+/** 详情里需要翻译的字段；没有 quote 正文时不翻 quote。 */
+function detailTranslationFields(detail) {
+  const fields = ['summary', 'why_hn']
+  if (detail && detail.quote && typeof detail.quote.text === 'string' && detail.quote.text.trim()) fields.push('quote')
+  return fields
+}
+
+/** 汇总两个译文缓存，并给每个字段标上 model（模型译）或 machine（机翻）来源。 */
+function buildDetailI18n(vid, detail, llmCache, mtCache) {
+  const i18n = {}
+  const i18nSource = {}
+  for (const field of detailTranslationFields(detail)) {
+    const key = `${vid}:${field}`
+    const model = llmCache && llmCache[key]
+    const machine = mtCache && mtCache[key]
+    i18n[field] = model || machine || null
+    i18nSource[field] = model ? 'model' : machine ? 'machine' : null
+  }
+  return { i18n, i18nSource }
+}
+
+/** 只读缓存：详情首屏用，不触发模型或机翻请求。 */
+async function cachedDetailI18n(vid, detail) {
+  const [llmCache, mtCache] = await Promise.all([loadI18n('zh'), loadI18n('zh-mt')])
+  return buildDetailI18n(vid, detail, llmCache, mtCache)
+}
+
+/** 异步补齐详情译文：模型优先，缺失字段走机翻；返回来源标识。 */
+async function ensureDetailI18n(ctx, vid, detail) {
+  let llmCache = {}
+  if (ctx) {
+    try {
+      llmCache = await translateDetail(ctx, detail, 'zh')
+    } catch {
+      llmCache = {}
+    }
+  }
+  const missing = detailTranslationFields(detail).filter((field) => !llmCache[`${vid}:${field}`])
+  let mtCache = {}
+  if (missing.length) {
+    try {
+      mtCache = await translateDetailMT(detail)
+    } catch {
+      mtCache = {}
+    }
+  }
+  return buildDetailI18n(vid, detail, llmCache, mtCache)
+}
+
 /** 模型偶尔把批内编号带进译文，剥掉行首的 "N. " / "N、" / "N)" */
 function stripLeadingIndex(text) {  return String(text)
     .replace(/^\s*\d+\s*[.、)．]\s*/, '')
@@ -2524,14 +2573,24 @@ async function handler(req, res) {
           } catch {
             return json(res, 400, { error: 'bad json' })
           }
+          const prev = await readCache('prefs.json')
+          const old = prev && typeof prev === 'object' ? prev : {}
           const clean = {}
+          /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
           for (const key of ['likes', 'later', 'seen']) {
-            const list = body && Array.isArray(body[key]) ? body[key] : []
+            const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
             clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
           }
+          const nextLang = body && (body.lang === 'zh' || body.lang === 'en') ? body.lang : null
+          if (nextLang) clean.lang = nextLang
+          else if (old.lang === 'zh' || old.lang === 'en') clean.lang = old.lang
           clean.at = Date.now()
           await writeCache('prefs.json', clean)
-          return json(res, 200, { ok: true, counts: { likes: clean.likes.length, later: clean.later.length, seen: clean.seen.length } })
+          return json(res, 200, {
+            ok: true,
+            lang: clean.lang || null,
+            counts: { likes: clean.likes.length, later: clean.later.length, seen: clean.seen.length },
+          })
         })
         return
       }
@@ -2540,6 +2599,7 @@ async function handler(req, res) {
         likes: Array.isArray(saved && saved.likes) ? saved.likes : [],
         later: Array.isArray(saved && saved.later) ? saved.later : [],
         seen: Array.isArray(saved && saved.seen) ? saved.seen : [],
+        lang: saved && (saved.lang === 'zh' || saved.lang === 'en') ? saved.lang : null,
       })
     }
   /* 搜索框的中文查询先机翻成英文，再去命中英文标签与频道 */
@@ -2645,38 +2705,21 @@ async function handler(req, res) {
       const vid = url.searchParams.get('vid')
       if (!vid) return json(res, 400, { error: 'vid required' })
       const detail = await loadVideo(vid)
+      /* 详情先返回原文；中文只带已有缓存，绝不在这里等模型或机翻 */
+      const payload = Object.assign({}, detail, { comments: pickComments(vid) })
       if (url.searchParams.get('lang') === 'zh') {
-        /* 模型在就用模型翻；没有模型或没翻出来，退到机翻，同样落盘缓存 */
-        let llmCache = {}
-        if (state.ctx) {
-          try {
-            llmCache = await translateDetail(state.ctx, detail, 'zh')
-          } catch {
-            llmCache = {}
-          }
-        }
-        const pick = (field) => llmCache[`${vid}:${field}`] || null
-        const needMt = !pick('summary') || !pick('why_hn') || !!(detail.quote && !pick('quote'))
-        let mtCache = {}
-        if (needMt) {
-          try {
-            mtCache = await translateDetailMT(detail)
-          } catch {
-            mtCache = {}
-          }
-        }
-        const merge = (field) => llmCache[`${vid}:${field}`] || mtCache[`${vid}:${field}`] || null
-        return json(res, 200, {
-          ...detail,
-          comments: pickComments(vid),
-          i18n: {
-            summary: merge('summary'),
-            why_hn: merge('why_hn'),
-            quote: merge('quote'),
-          },
-        })
+        const cached = await cachedDetailI18n(vid, detail)
+        payload.i18n = cached.i18n
+        payload.i18nSource = cached.i18nSource
       }
-      return json(res, 200, Object.assign({}, detail, { comments: pickComments(vid) }))
+      return json(res, 200, payload)
+    }
+    if (route === '/video/translate') {
+      const vid = url.searchParams.get('vid')
+      if (!vid) return json(res, 400, { error: 'vid required' })
+      const detail = await loadVideo(vid)
+      const translation = await ensureDetailI18n(state.ctx, vid, detail)
+      return json(res, 200, { vid, i18n: translation.i18n, i18nSource: translation.i18nSource })
     }
     if (route === '/media') {
       const vid = url.searchParams.get('vid')
