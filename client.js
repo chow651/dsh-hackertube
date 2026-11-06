@@ -55,8 +55,6 @@ window.__ModuleLoader__.load({
       lang: null,
       mediaOrigin: null,
       titles: {},
-      qMt: {},
-      catZh: null,
       titlesP: null,
       taxLang: null,
       /* 观看会话按视频 id 存：播放位置不能被下一条视频继承，暂停后也要保留 */
@@ -323,7 +321,7 @@ window.__ModuleLoader__.load({
       return mem.taxP
     }
 
-    /** 标题译文表；后台按批生成，前端拿到多少用多少。中文搜索也依赖它，所以英文模式一样要拉 */
+    /** 标题译文表：界面显示用；Host 检索读同一份缓存，中文查询靠它扩展 */
     function loadTitles() {
       if (mem.titlesP) return mem.titlesP
       mem.titlesP = getJSON('/hackertube/api/titles?lang=zh&translate=1')
@@ -467,6 +465,16 @@ window.__ModuleLoader__.load({
       other: '其他',
     }
     const LV_ZH = { intro: '入门', intermediate: '进阶', general: '通用', advanced: '高阶' }
+    const MATCH_FIELD_ZH = {
+      title: '标题',
+      title_zh: '中文标题',
+      channel: '频道',
+      tags: '标签',
+      categories: '分类',
+      topic: '主题',
+      summary: '摘要',
+      why_hn: 'HN 推荐理由',
+    }
 
     /* ---------------- 样式 ---------------- */
 
@@ -503,6 +511,10 @@ window.__ModuleLoader__.load({
   display:inline-flex;align-items:center}
 .ht-chip:hover{background:var(--dsw-alias-bg-layer-2)}
 .ht-chip.on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base)}
+.ht-filters{flex:none;display:flex;flex-wrap:wrap;gap:8px;padding:10px 24px 0}
+.ht-filter{height:30px;padding:0 28px 0 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);
+  background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;font-size:12.5px;cursor:pointer;outline:none}
+.ht-filter:focus{border-color:rgba(255,102,0,.55)}
 .ht-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 24px 40px}
 .ht-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:32px 20px;padding-top:16px}
 .ht-card.kbd{outline:2px solid var(--dsw-alias-label-primary);outline-offset:3px;border-radius:12px}
@@ -526,6 +538,9 @@ window.__ModuleLoader__.load({
 .ht-meta > span + span:not(.ht-hn-mark)::before{content:"·";margin-right:8px;color:var(--dsw-alias-label-tertiary)}
 .ht-meta .ht-chan{font-weight:500}
 .ht-meta b{font-weight:400;color:var(--dsw-alias-label-primary)}
+.ht-match{margin:6px 0 0;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ht-match b{font-weight:500;color:var(--dsw-alias-label-tertiary)}
 .ht-actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 0}
 .ht-comments{margin:30px 0 8px;border-top:1px solid var(--dsw-alias-border-l1);padding-top:20px}
 .ht-comments-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:4px}
@@ -930,6 +945,11 @@ window.__ModuleLoader__.load({
     /* ---------------- 卡片 ---------------- */
 
     function Card({ item, onOpen, lang }) {
+      const match = item.match
+      const matchFields =
+        match && Array.isArray(match.fields)
+          ? match.fields.map((f) => tx(lang, MATCH_FIELD_ZH[f] || f, f)).join(tx(lang, '、', ', '))
+          : ''
       return h(
         'button',
         { type: 'button', className: 'ht-card', 'data-vid': item.v, onClick: () => onOpen(item) },
@@ -953,6 +973,15 @@ window.__ModuleLoader__.load({
             item.w ? h('span', { key: 'w' }, tx(lang, fmtCount(item.w, lang) + ' 次观看', fmtCount(item.w, lang) + ' views')) : null,
             item.y ? h('span', { key: 'y' }, String(item.y)) : null,
           ),
+          match && match.snippet
+            ? h(
+                'p',
+                { className: 'ht-match' },
+                h('b', null, tx(lang, '匹配：', 'Match: ') + matchFields),
+                matchFields ? ' — ' : '',
+                match.snippet,
+              )
+            : null,
         ),
       )
     }
@@ -2512,9 +2541,13 @@ window.__ModuleLoader__.load({
       )
       const [err, setErr] = useState('')
       const [q, setQ] = useState('')
-      /* 中文查询机翻成英文后的检索词：标签只有英文，靠它才能命中 */
-      const [qMt, setQMt] = useState('')
       const [area, setArea] = useState('')
+      /* 筛选与排序都作为参数交给 Host 检索，客户端不再自己匹配或排序 */
+      const [year, setYear] = useState('')
+      const [type, setType] = useState('')
+      const [level, setLevel] = useState('')
+      const [sort, setSort] = useState('')
+      const [searchState, setSearchState] = useState({ key: '', items: [], total: 0, loading: false, error: '' })
       const [limit, setLimit] = useState(GRID_STEP)
       const [watching, setWatching] = useState(null)
       const [lang, setLang] = useState(() => {
@@ -2528,12 +2561,13 @@ window.__ModuleLoader__.load({
       const [plSlug, setPlSlug] = useState(null)
       const [helpOpen, setHelpOpen] = useState(false)
       const { saved, toggle, markSeen } = useSaved()
-      const [titlesVersion, setTitlesVersion] = useState(0)
+      /* 计数没有读者：它一变就重渲染，让后到的中文标题显示出来 */
+      const [, bumpTitles] = useState(0)
 
-      /* 标题译文表在两种语言下都要：中文界面用来显示，英文界面用来支持中文搜索 */
+      /* 中文标题只用于显示；搜索已经在 Host 侧索引里读同一份译文表 */
       const ensureTitles = () => {
         void loadTitles().then((t) => {
-          if (Object.keys(t).length) setTitlesVersion((v) => v + 1)
+          if (Object.keys(t).length) bumpTitles((v) => v + 1)
         })
       }
       useEffect(() => {
@@ -2559,30 +2593,6 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      /* 分类的中文名也参与检索：输入「数学」「安全」能命中整类，而不只是标题里带这两个字的视频 */
-      const [taxReady, setTaxReady] = useState(0)
-      useEffect(() => {
-        if (mem.catZh) {
-          setTaxReady((v) => v + 1)
-          return undefined
-        }
-        let alive = true
-        getJSON('/hackertube/api/taxonomy?lang=zh&translate=1')
-          .then((d) => {
-            if (!alive || !d) return
-            const m = {}
-            for (const a of d.areas || []) {
-              if (a.nameZh) m['a:' + a.id] = a.nameZh
-              for (const c of a.categories || []) if (c.nameZh) m[c.id] = c.nameZh
-            }
-            mem.catZh = m
-            setTaxReady((v) => v + 1)
-          })
-          .catch(() => {})
-        return () => {
-          alive = false
-        }
-      }, [])
       const [reloadKey, setReloadKey] = useState(0)
       const [authUrl, setAuthUrl] = useState(null)
       const sentinelRef = useRef(null)
@@ -2736,90 +2746,78 @@ window.__ModuleLoader__.load({
         }))
       }, [tax])
 
-      const catToArea = useMemo(() => {
-        const m = new Map()
-        const list = tax && Array.isArray(tax.areas) ? tax.areas : []
-        for (const a of list) {
-          for (const c of a.categories || []) m.set(c.id, a.id)
-        }
-        return m
-      }, [tax])
+      const years = useMemo(() => {
+        const set = new Set()
+        for (const it of items) if (Number(it.y)) set.add(Number(it.y))
+        return [...set].sort((a, b) => b - a)
+      }, [items])
+      const types = useMemo(() => {
+        const set = new Set()
+        for (const it of items) if (it.ct) set.add(String(it.ct))
+        return [...set].sort()
+      }, [items])
+      const levels = useMemo(() => {
+        const order = ['intro', 'intermediate', 'advanced', 'general']
+        const set = new Set()
+        for (const it of items) if (it.lv) set.add(String(it.lv))
+        return order.filter((x) => set.has(x))
+      }, [items])
 
-      const filtered = useMemo(() => {
-        if (!items.length) return []
-        /* 空格分词、全部命中才算命中；中文查译文、英文查原文，两种都能搜 */
-        const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean)
-        const mtTokens = String(qMt || '').toLowerCase().split(/\s+/).filter(Boolean)
-        let out = items
-        if (area) {
-          out = out.filter((it) =>
-            Array.isArray(it.cats) && it.cats.some((id) => catToArea.get(id) === area),
-          )
-        }
-        if (tokens.length) {
-          out = out.filter((it) => {
-            const zh = (mem.titles && mem.titles[it.v]) || ''
-            let catText = ''
-            if (mem.catZh && Array.isArray(it.cats)) {
-              /* 只用二级分类名，不用大区名：「安全」不该把数据库、操作系统的视频一起带出来 */
-              const parts = []
-              for (const id of it.cats) if (mem.catZh[id]) parts.push(mem.catZh[id])
-              catText = parts.join(' ')
-            }
-            const hay = (
-              (it.t || '') +
-              '\n' +
-              (it.c || '') +
-              '\n' +
-              zh +
-              '\n' +
-              catText +
-              '\n' +
-              (Array.isArray(it.tags) ? it.tags.join(' ') : '')
-            ).toLowerCase()
-            /* 原文命中，或者机翻后的英文命中，都算 */
-            if (tokens.every((tok) => hay.indexOf(tok) >= 0)) return true
-            return mtTokens.length > 0 && mtTokens.every((tok) => hay.indexOf(tok) >= 0)
-          })
-        }
-        return out
-      }, [items, q, qMt, area, catToArea, titlesVersion, taxReady])
+      /* 任何查询/筛选都走同一个 Host 检索操作；客户端只负责显示返回顺序 */
+      const searchActive = !!(q.trim() || area || year || type || level || sort)
+      const searchKey = [q.trim(), area, year, type, level, sort].join('\u0000')
 
-      /* 查询里带汉字才需要机翻；结果按查询串缓存，重复输入不再请求 */
       useEffect(() => {
-        const raw = q.trim()
-        if (!raw || !/[\u4e00-\u9fff]/.test(raw)) {
-          setQMt('')
-          return undefined
-        }
-        if (mem.qMt[raw] != null) {
-          setQMt(mem.qMt[raw])
+        if (!searchActive) {
+          setSearchState({ key: '', items: [], total: 0, loading: false, error: '' })
+          setLimit(GRID_STEP)
           return undefined
         }
         let alive = true
+        setSearchState((prev) => Object.assign({}, prev, { key: searchKey, loading: true, error: '' }))
         const timer = setTimeout(() => {
-          fetch('/hackertube/api/mt', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ text: raw, to: 'en' }),
-          })
-            .then((r) => r.json())
-            .then((d) => {
-              if (!alive || !d || typeof d.text !== 'string') return
-              mem.qMt[raw] = d.text
-              setQMt(d.text)
+          const params = new URLSearchParams()
+          const raw = q.trim()
+          if (raw) params.set('q', raw)
+          if (area) params.set('area', area)
+          if (year) params.set('year', year)
+          if (type) params.set('type', type)
+          if (level) params.set('level', level)
+          if (sort) params.set('sort', sort)
+          params.set('limit', String(GRID_CAP))
+          fetch('/hackertube/api/search?' + params.toString())
+            .then((r) => {
+              if (!r.ok) throw new Error('HTTP ' + r.status)
+              return r.json()
             })
-            .catch(() => {})
-        }, 300)
+            .then((d) => {
+              if (!alive) return
+              const list = d && Array.isArray(d.items) ? d.items : []
+              setSearchState({
+                key: searchKey,
+                items: list,
+                total: d && typeof d.total === 'number' ? d.total : list.length,
+                loading: false,
+                error: '',
+              })
+              setLimit(GRID_STEP)
+            })
+            .catch((e) => {
+              if (!alive) return
+              setSearchState({ key: searchKey, items: [], total: 0, loading: false, error: String((e && e.message) || e) })
+            })
+        }, 120)
         return () => {
           alive = false
           clearTimeout(timer)
         }
-      }, [q])
+      }, [searchKey])
 
-      useEffect(() => {
-        setLimit(GRID_STEP)
-      }, [q, area])
+      const filtered = searchActive ? searchState.items : items
+      const resultTotal = searchActive ? searchState.total : items.length
+      /* 输入变化到请求返回之间也算加载中：不然会先闪一下「没有匹配的视频」 */
+      const searchLoading = searchActive && (searchState.loading || searchState.key !== searchKey)
+      const searchError = searchActive ? searchState.error : ''
 
       /* 上报一次实测渲染结果：布局尺寸与关键计算样式，这是唯一能客观验证视觉的途径 */
       useEffect(() => {
@@ -3149,11 +3147,13 @@ window.__ModuleLoader__.load({
             'span',
             { className: 'ht-foot', style: { whiteSpace: 'nowrap' } },
             phase === 'ready'
-              ? tx(
-                  lang,
-                  filtered.length + ' 个视频',
-                  filtered.length.toLocaleString('en-US') + (filtered.length === 1 ? ' video' : ' videos'),
-                )
+              ? searchLoading
+                ? tx(lang, '检索中…', 'Searching…')
+                : tx(
+                    lang,
+                    resultTotal + ' 个视频',
+                    resultTotal.toLocaleString('en-US') + (resultTotal === 1 ? ' video' : ' videos'),
+                  )
               : '',
           ),
           authUrl
@@ -3196,6 +3196,64 @@ window.__ModuleLoader__.load({
             ),
           ),
         )) : null,
+        view === 'home' ? h(
+          'div',
+          { className: 'ht-filters' },
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'year',
+              value: year,
+              onChange: (e) => setYear(e.target.value),
+              'aria-label': tx(lang, '按年份筛选', 'Filter by year'),
+            },
+            h('option', { value: '' }, tx(lang, '全部年份', 'All years')),
+            years.map((y) => h('option', { key: y, value: String(y) }, String(y))),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'type',
+              value: type,
+              onChange: (e) => setType(e.target.value),
+              'aria-label': tx(lang, '按类型筛选', 'Filter by type'),
+            },
+            h('option', { value: '' }, tx(lang, '全部类型', 'All types')),
+            types.map((t) =>
+              h('option', { key: t, value: t }, lang === 'zh' ? CT_ZH[t] || t : t),
+            ),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'level',
+              value: level,
+              onChange: (e) => setLevel(e.target.value),
+              'aria-label': tx(lang, '按难度筛选', 'Filter by level'),
+            },
+            h('option', { value: '' }, tx(lang, '全部难度', 'All levels')),
+            levels.map((l) =>
+              h('option', { key: l, value: l }, lang === 'zh' ? LV_ZH[l] || l : l),
+            ),
+          ),
+          h(
+            'select',
+            {
+              className: 'ht-filter',
+              'data-filter': 'sort',
+              value: sort,
+              onChange: (e) => setSort(e.target.value),
+              'aria-label': tx(lang, '排序', 'Sort'),
+            },
+            h('option', { value: '' }, tx(lang, '默认排序', 'Default order')),
+            h('option', { value: 'score' }, tx(lang, 'HN 推荐分', 'HN score')),
+            h('option', { value: 'year' }, tx(lang, '最新发布', 'Newest')),
+            h('option', { value: 'views' }, tx(lang, '最多观看', 'Most viewed')),
+          ),
+        ) : null,
         view === 'home' && phase === 'loading' ? h(Skeleton, { label: loadingLabel }) : null,
         view === 'home' ? (h(
           'div',
@@ -3220,7 +3278,13 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
-          phase === 'ready' && !filtered.length
+          phase === 'ready' && searchLoading && !filtered.length
+            ? h('div', { className: 'ht-state' }, tx(lang, '检索中…', 'Searching…'))
+            : null,
+          phase === 'ready' && searchError
+            ? h('div', { className: 'ht-state' }, tx(lang, '检索失败：', 'Search failed: ') + searchError)
+            : null,
+          phase === 'ready' && !searchLoading && !searchError && !filtered.length
             ? h('div', { className: 'ht-state' }, tx(lang, '没有匹配的视频', 'No matching videos'))
             : null,
           phase === 'ready' && filtered.length
