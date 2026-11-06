@@ -10,6 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { createServer } from 'node:http'
 import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
@@ -18,6 +19,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inflateRawSync } from 'node:zlib'
 import { normalizeIds, recommend } from './recommend.js'
+import { createResolver } from './mirror.js'
 
 /* 仓库里预生成的译文，首次安装时直接铺到缓存目录 */
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -89,6 +91,24 @@ const state = {
 function cacheRoot() {
   const base = process.env.DSH_PROFILE_DIR || join(homedir(), '.dsh')
   return join(base, '.dsh-hackertube')
+}
+
+/**
+ * 备用片源解析器。惰性创建——没用到就不握手，也不占缓存文件。
+ * 判定与缓存都在 mirror.js 里，这里只负责把列表字段喂进去。
+ */
+let mirrorResolver = null
+function getMirror() {
+  if (mirrorResolver) return mirrorResolver
+  mirrorResolver = createResolver({
+    fetchImpl: fetch,
+    hashFn: (s) => createHash('md5').update(s).digest('hex'),
+    cacheFile: join(cacheRoot(), 'mirror.json'),
+    readFile: (p, enc) => readFile(p, enc),
+    writeFile: (p, value, enc) => writeFile(p, value, enc),
+    mkdir: (p, opt) => mkdir(p, opt),
+  })
+  return mirrorResolver
 }
 
 async function readCache(name) {
@@ -3573,6 +3593,26 @@ async function handler(req, res) {
       const lang = url.searchParams.get('lang') || 'zh'
       const result = await loadSubs(vid, lang !== 'en')
       return json(res, result.status, result.body)
+    }
+    /* 备用片源：有就回一条链接，没有就回空对象。前端据此决定要不要渲染按钮。 */
+    if (route === '/mirror') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad-vid' })
+      }
+      const items = await loadList()
+      const item = items.find((x) => x.v === vid)
+      if (!item || !item.d || !item.t) return json(res, 200, {})
+      const zhTitles = await loadI18n('zh-titles').catch(() => ({}))
+      const hit = await getMirror().resolve({
+        id: item.v,
+        title: item.t,
+        titleZh: zhTitles[item.v] || '',
+        channel: item.c || '',
+        duration: item.d,
+        published: item.p || null,
+      })
+      return json(res, 200, hit || {})
     }
     return json(res, 404, { error: 'not found' })
   } catch (err) {

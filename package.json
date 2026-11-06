@@ -27,6 +27,8 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./recommend": "./recommend.js",
+    "./mirror": "./mirror.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
@@ -34,6 +36,7 @@
     "index.js",
     "client.js",
     "recommend.js",
+    "mirror.js",
     "cordis.patch.yml",
     "locale/*.json",
     "data/*.json",
@@ -41,7 +44,8 @@
     "README.en.md"
   ],
   "scripts": {
-    "test": "node test/watch-session.mjs && node test/host-smoke.mjs && node test/client-render.mjs client.js"
+    "test": "node test/mirror.mjs && node test/watch-session.mjs && node test/host-smoke.mjs && node test/client-render.mjs client.js",
+    "test:mirror-live": "node test/mirror-live.mjs"
   },
   "devDependencies": {
     "react": "^18.3.1",

@@ -190,6 +190,15 @@ window.__ModuleLoader__.load({
     /** 界面文案：中文原句 + 英文对照，调用处不必写三元表达式 */
     const tx = (lang, zh, en) => (lang === 'zh' ? zh : en)
 
+    /** 备用片源的档位标：官方 / 中字 / 中文 / 转载 */
+    function mirrorTag(lang, label) {
+      if (lang === 'zh') return label
+      if (label === '官方') return 'Official'
+      if (label === '中字') return 'Subbed'
+      if (label === '中文') return 'Translated'
+      return 'Repost'
+    }
+
     /* ---------------- 语言偏好 ---------------- */
 
     const LANG_STORAGE_KEY = 'ht.lang'
@@ -653,6 +662,8 @@ window.__ModuleLoader__.load({
 .ht-pill svg{flex:none}
 .ht-pill-ghost{background:transparent;border:1px solid var(--dsw-alias-border-l2)}
 .ht-pill-ghost:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.ht-pill-tag{padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.5;
+  background:rgba(0,174,236,.14);color:#0b7fa8}
 .ht-hn-mark{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:999px;
   background:rgba(255,102,0,.12);color:#b4460a;font-size:12px;font-weight:600}
 .ht-hn-mark i{width:5px;height:5px;border-radius:50%;background:#ff6600;display:inline-block}
@@ -1511,6 +1522,8 @@ window.__ModuleLoader__.load({
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
       const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
+      /* 备用片源：命中才渲染按钮，没命中就一直保持 null，界面上什么都不出现 */
+      const [mirror, setMirror] = useState(null)
 
       /* 播放位置按视频隔离：暂停后 relay 不再发事件，这里仍保留最后一次的值 */
       useEffect(() => {
@@ -1574,6 +1587,23 @@ window.__ModuleLoader__.load({
           })
           .catch(() => {
             if (alive) setRelated([])
+          })
+        return () => {
+          alive = false
+        }
+      }, [item.v])
+
+      /* 备用片源异步查，不挡正文：拿到就补一个按钮，没拿到就不出现。
+         结果在 Host 侧落盘缓存，同一个视频第二次打开是 0 延迟。 */
+      useEffect(() => {
+        let alive = true
+        setMirror(null)
+        getJSON('/hackertube/api/mirror?vid=' + encodeURIComponent(item.v))
+          .then((d) => {
+            if (alive && d && d.url) setMirror(d)
+          })
+          .catch(() => {
+            /* 查不到不是错误，只是没有别的源 */
           })
         return () => {
           alive = false
@@ -1972,6 +2002,31 @@ window.__ModuleLoader__.load({
                 h(Ico, { fill: true }, h('path', { d: 'M23 12s-4.2-6.5-11-6.5S1 12 1 12s4.2 6.5 11 6.5S23 12 23 12zm-11 4a4 4 0 1 1 0-8 4 4 0 0 1 0 8z' })),
                 tx(lang, '在 YouTube 观看', 'Watch on YouTube'),
               ),
+              /* 备用片源。只有查到了才出现，查不到就完全没有这个入口。 */
+              mirror && mirror.url
+                ? h(
+                    'a',
+                    {
+                      className: 'ht-pill ht-pill-ghost',
+                      href: mirror.url,
+                      target: '_blank',
+                      rel: 'noreferrer noopener',
+                      title:
+                        (mirror.up || '') +
+                        (mirror.play ? ' · ' + fmtCount(mirror.play, lang) + tx(lang, ' 次播放', ' views') : ''),
+                    },
+                    h(
+                      Ico,
+                      null,
+                      h('rect', { x: 3, y: 7.5, width: 18, height: 12.5, rx: 3 }),
+                      h('path', { d: 'M8.5 3.5L12 7l3.5-3.5M7.5 12.5v3M16.5 12.5v3' }),
+                    ),
+                    tx(lang, '在 B 站观看', 'Watch on Bilibili'),
+                    mirror.label
+                      ? h('span', { className: 'ht-pill-tag' }, mirrorTag(lang, mirror.label))
+                      : null,
+                  )
+                : null,
             ),
             err
               ? h('p', { className: 'ht-note' }, tx(lang, '详情加载失败：', 'Failed to load details: ') + err)
