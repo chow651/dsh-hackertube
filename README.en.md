@@ -4,7 +4,7 @@
 
 Browse and watch the videos Hacker News has recommended over two decades, without leaving the DeepSeek Harness panel. A high-quality English video library within reach, which makes the harness a richer and more enjoyable place to work.
 
-![Home](docs/home.png)
+![Home](docs/home-en.png)
 
 The dataset comes from [HackerTube](https://karpathy.bearblog.dev/hacker-tube/) by Andrej Karpathy. The site ships a complete data export, and the author describes its purpose in his post:
 
@@ -13,6 +13,33 @@ The dataset comes from [HackerTube](https://karpathy.bearblog.dev/hacker-tube/) 
 This plugin consumes that official export. It is an unofficial project and is not affiliated with Andrej Karpathy, Hacker News, or YouTube.
 
 The original site works fine on its own. Moving it into the panel changes two things. You no longer switch windows, and the interface is fully available in Chinese, including titles, categories, summaries, and comments.
+
+## Browse by category
+
+The 6,454 videos sort into 16 areas, and each area splits into subcategories, 150 in total. When you do not know what to watch, start from the categories page.
+
+![Categories page](docs/categories-en.png)
+
+| Area | Subcategories | Videos |
+|---|---:|---:|
+| Software Engineering & Languages | 11 | 980 |
+| Systems, Networks & Security | 10 | 702 |
+| AI, Machine Learning & Data | 9 | 576 |
+| Mathematics & Theoretical CS | 9 | 360 |
+| Hardware & Electronics | 8 | 582 |
+| Computing History & Culture | 8 | 1026 |
+| Design, Graphics & Visual Media | 9 | 439 |
+| Business, Startups & Economics | 9 | 644 |
+| Politics, History & Society | 9 | 1018 |
+| Physics, Space & Chemistry | 8 | 600 |
+| Life Sciences, Mind & Health | 11 | 598 |
+| Earth, Energy & Environment | 8 | 354 |
+| Engineering, Transport & Making | 12 | 805 |
+| Games & Game Development | 8 | 355 |
+| Arts, Comedy, Music & Film | 12 | 1344 |
+| Ideas, Learning & Language | 9 | 689 |
+
+A video can belong to more than one area, so the video counts add up to more than 6,454.
 
 ## Installation
 
@@ -58,7 +85,7 @@ After installing, enable `dsh-hackertube` in the plugin list and refresh the pag
 
 ## Features
 
-![Watch page](docs/watch.png)
+![Watch page](docs/watch-en.png)
 
 The panel holds 6,454 videos across 16 areas and 150 categories, ordered by how strongly Hacker News recommends them. The home grid loads 60 cards at first and appends more as you scroll.
 
