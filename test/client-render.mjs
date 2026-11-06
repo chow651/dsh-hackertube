@@ -37,6 +37,8 @@ const LIST = [
   { v: 'b2', t: 'A talk about type systems', c: 'Some Conf', d: 3700, th: 'https://i.ytimg.com/vi/b2/mqdefault.jpg', p: '2019-06-01T00:00:00Z', w: 99284, ct: 'talk', lv: 'advanced', y: 2019, cats: ['prog'], tags: ['types'], s: 22, r: 9 },
   { v: 'c3', t: 'Intro to large language models', c: 'Andrej Karpathy', d: 3588, th: 'https://i.ytimg.com/vi/c3/mqdefault.jpg', p: '2023-11-23T00:00:00Z', w: 4298019, ct: 'talk', lv: 'intro', y: 2023, cats: ['ml'], tags: ['llm'], s: 22, r: 19 },
 ]
+/* 本地导出的首屏形态：标题/频道/缩略图已有，时长与播放量等元信息还没补齐 */
+const LIST_EXPORT = LIST.map((o) => ({ ...o, d: 0, w: 0, p: null, y: null }))
 const TAX = {
   version: 'x',
   areas: [
@@ -56,14 +58,37 @@ const DETAIL = {
 
 let fetchCalls = 0
 const fetchLog = []
+let statusStage = 'export'
+let statusExtra = {}
+let listGate = null
+
+const statusBody = () => ({
+  stage: statusStage,
+  source: statusStage === 'ready' ? 'upstream' : 'export',
+  stale: false,
+  revalidating: statusStage !== 'ready',
+  enriched: statusStage === 'ready' ? LIST.length : 0,
+  total: LIST.length,
+  error: null,
+  ...statusExtra,
+})
+
 global.fetch = async (url) => {
   fetchCalls += 1
   fetchLog.push(String(url))
+  if (url.includes('/list/status')) {
+    return { ok: true, status: 200, json: async () => statusBody() }
+  }
+  if (/\/hackertube\/api\/list(\?|$)/.test(String(url))) {
+    if (listGate) await listGate
+    return { ok: true, status: 200, json: async () => (statusStage === 'ready' ? LIST : LIST_EXPORT) }
+  }
   const body = url.includes('/browse') ? TAX : url.includes('/video') ? DETAIL : LIST
   return { ok: true, status: 200, json: async () => body }
 }
 
-const listCalls = () => fetchLog.filter((u) => u.indexOf('/hackertube/api/list') >= 0).length
+const listCalls = () =>
+  fetchLog.filter((u) => /\/hackertube\/api\/list(\?|$)/.test(String(u))).length
 
 /* ---------- 载入 client.js ---------- */
 
@@ -128,11 +153,13 @@ async function render() {
   return tree
 }
 
+let releaseList = null
+listGate = new Promise((resolve) => {
+  releaseList = resolve
+})
+
 const tree = await render()
 const json = () => JSON.stringify(tree.toJSON())
-
-check('root container rendered', json().includes('ht-root'), '')
-check('data fetched', listCalls() >= 1, listCalls() + ' list calls')
 
 const text = () => {
   const out = []
@@ -146,7 +173,46 @@ const text = () => {
   return out.join(' | ')
 }
 
+check('root container rendered', json().includes('ht-root'), '')
+check('data fetched', listCalls() >= 1, listCalls() + ' list calls')
+
+/* 首屏：列表请求还没回来时，骨架屏要说清当前阶段 */
+await act(async () => {
+  await new Promise((r) => setTimeout(r, 30))
+})
+check('first paint stage visible', /正在读取本地视频导出|Loading local video export/.test(text()), text().slice(0, 180))
+check('skeleton visible before list', json().includes('ht-skel'), '')
+
+/* 列表先到：卡片立刻出现；元信息同步与旧缓存状态在后台可见 */
+statusStage = 'metadata'
+statusExtra = { stale: true }
+await act(async () => {
+  releaseList()
+  await new Promise((r) => setTimeout(r, 40))
+})
+const firstBody = text()
+check('renders 3 titles before metadata completes', LIST.every((it) => firstBody.includes(it.t)), firstBody.slice(0, 140))
+check('export cards shown without enriched metadata', !/12\.9M/.test(firstBody), firstBody.slice(0, 140))
+check('background sync stage visible', /正在同步视频元信息|Syncing video metadata/.test(firstBody), '')
+check('background progress count visible', /0\/3/.test(firstBody), firstBody.slice(0, 140))
+check('stale cache marker visible', /旧缓存|stale/i.test(firstBody), '')
+
+/* 评论解析阶段也要有文案 */
+statusStage = 'comments'
+await act(async () => {
+  await new Promise((r) => setTimeout(r, 1100))
+})
+check('comments stage visible', /正在解析 HN 评论|Parsing HN comments/.test(text()), text().slice(0, 180))
+
+/* 后台完成：阶段条与旧缓存提示消失 */
+statusStage = 'ready'
+statusExtra = {}
+await act(async () => {
+  await new Promise((r) => setTimeout(r, 1100))
+})
 const body = text()
+check('sync stage clears', !/正在同步视频元信息|正在解析 HN 评论/.test(body), '')
+check('stale marker clears', !/旧缓存|stale/i.test(body), '')
 check('renders 3 titles', LIST.every((it) => body.includes(it.t)), body.slice(0, 120))
 check('shows recommender count', body.includes('17') && /(人推荐|recommenders?)/.test(body), '')
 check('shows view count truncated', /12\.9M (次观看|views)/.test(body), '')
