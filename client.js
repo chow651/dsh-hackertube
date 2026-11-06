@@ -488,6 +488,9 @@ window.__ModuleLoader__.load({
 .ht-lang{flex:none;height:32px;min-width:52px;padding:0 12px;border-radius:16px;cursor:pointer;  font:inherit;font-size:13px;border:1px solid var(--dsw-alias-border-l1);
   background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
 .ht-lang:hover{background:var(--dsw-alias-bg-layer-2)}
+.ht-shuffle{flex:none;width:32px;height:32px;padding:0;border-radius:16px;cursor:pointer;font:inherit;display:inline-grid;place-items:center;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);transition:color .16s cubic-bezier(.32,.72,0,1),background .16s cubic-bezier(.32,.72,0,1),transform .16s cubic-bezier(.32,.72,0,1)}
+.ht-shuffle:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.ht-shuffle:active{transform:rotate(-18deg)}
 .ht-search{flex:1;max-width:640px;display:flex;min-width:0;position:relative;
   border:1px solid var(--dsw-alias-border-l1);border-radius:18px;overflow:hidden;
   background:var(--dsw-alias-bg-layer-1);
@@ -516,17 +519,6 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;font-size:12.5px;cursor:pointer;outline:none}
 .ht-filter:focus{border-color:rgba(255,102,0,.55)}
 .ht-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 24px 40px}
-.ht-recs{padding-top:18px}
-.ht-recs-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 10px}
-.ht-recs-head h2{margin:0;font-size:15px;font-weight:600}
-.ht-recs-head span{font-size:12.5px;color:var(--dsw-alias-label-secondary)}
-.ht-recs-row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(200px,240px);gap:16px;overflow-x:auto;padding:0 0 8px}
-.ht-rec{min-width:0}
-.ht-rec-open{display:block;width:100%;padding:0;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.ht-rec .ht-title{font-size:14px;line-height:19px;height:38px;margin-top:8px}
-.ht-rec-why{margin:4px 0 0;min-height:32px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary)}
-.ht-rec-hide{margin-top:4px;padding:0;border:0;background:none;font:inherit;font-size:12px;color:var(--dsw-alias-label-tertiary);cursor:pointer}
-.ht-rec-hide:hover{color:var(--dsw-alias-label-primary);text-decoration:underline}
 .ht-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:32px 20px;padding-top:16px}
 .ht-card.kbd{outline:2px solid var(--dsw-alias-label-primary);outline-offset:3px;border-radius:12px}
 .ht-card{display:block;min-width:0;cursor:pointer;background:none;border:0;padding:0;
@@ -998,93 +990,6 @@ window.__ModuleLoader__.load({
     }
 
     /* ---------------- 首页推荐行（T06 推荐画像） ---------------- */
-
-    function recTitleOf(lang, reason) {
-      if (!reason) return ''
-      if (reason.kind === 'like') {
-        const zh = reason.vid && mem.titles ? mem.titles[reason.vid] : ''
-        return lang === 'zh' && zh ? zh : reason.title || ''
-      }
-      return reason.title || ''
-    }
-
-    function recReasonText(lang, reason) {
-      if (!reason) return ''
-      const title = recTitleOf(lang, reason)
-      if (reason.kind === 'like') {
-        return title
-          ? tx(lang, '因为你喜欢《' + title + '》', 'Because you liked “' + title + '”')
-          : tx(lang, '因为你喜欢的视频', 'Because you liked a similar video')
-      }
-      if (reason.kind === 'playlist') {
-        return title
-          ? tx(lang, '来自播放列表「' + title + '」', 'From playlist “' + title + '”')
-          : tx(lang, '来自编辑播放列表', 'From a curated playlist')
-      }
-      if (reason.kind === 'hn') {
-        const n = Number(reason.recommenders) || 0
-        if (n > 0) {
-          return tx(
-            lang,
-            'HN 高分推荐 · ' + n + ' 人推荐',
-            'Highly recommended on HN · ' + n + (n === 1 ? ' recommender' : ' recommenders'),
-          )
-        }
-        return tx(lang, 'HN 高分推荐', 'Highly recommended on HN')
-      }
-      return ''
-    }
-
-    function RecommendRow(props) {
-      const rec = props.rec
-      const lang = props.lang
-      const items = rec && Array.isArray(rec.items) ? rec.items : []
-      if (!items.length) return null
-      const liked = rec.mode === 'likes'
-      return h(
-        'section',
-        { className: 'ht-recs', 'aria-label': tx(lang, '为你推荐', 'Recommended for you') },
-        h(
-          'div',
-          { className: 'ht-recs-head' },
-          h('h2', null, liked ? tx(lang, '为你推荐', 'Recommended for you') : tx(lang, '编辑精选', "Editor's picks")),
-          h(
-            'span',
-            null,
-            liked
-              ? tx(lang, '根据你喜欢的视频', 'Based on videos you liked')
-              : tx(lang, '来自编辑播放列表与 HN 高分', 'From curated playlists and high-signal HN picks'),
-          ),
-        ),
-        h(
-          'div',
-          { className: 'ht-recs-row' },
-          items.map((item) =>
-            h(
-              'div',
-              { key: item.v, className: 'ht-rec', 'data-vid': item.v },
-              h(
-                'button',
-                { type: 'button', className: 'ht-rec-open', onClick: () => props.onOpen(item) },
-                h(
-                  'div',
-                  { className: 'ht-thumb' },
-                  item.th ? h('img', { src: item.th, alt: '', loading: 'lazy' }) : null,
-                  item.d ? h('span', { className: 'ht-dur' }, fmtDur(item.d)) : null,
-                ),
-                h('p', { className: 'ht-title' }, titleOf(item, lang)),
-              ),
-              h('p', { className: 'ht-rec-why' }, recReasonText(lang, item.reason)),
-              h(
-                'button',
-                { type: 'button', className: 'ht-rec-hide', onClick: () => props.onDismiss(item.v) },
-                tx(lang, '不感兴趣', 'Not interested'),
-              ),
-            ),
-          ),
-        ),
-      )
-    }
 
     /* ---------------- 分享卡片 ---------------- */
 
@@ -2328,12 +2233,7 @@ window.__ModuleLoader__.load({
         const next = saved.seen.filter((x) => x !== vid).concat(vid).slice(-200)
         update(Object.assign({}, saved, { seen: next }))
       }
-      /* 首页「不感兴趣」：记录到 prefs，下一轮推荐直接排除 */
-      const dismiss = (vid) => {
-        const next = saved.dismissed.filter((x) => x !== vid).concat(vid).slice(-400)
-        update(Object.assign({}, saved, { dismissed: next }))
-      }
-      return { saved, toggle, markSeen, dismiss }
+      return { saved, toggle, markSeen }
     }
 
     /* ---------------- 视图组件 ---------------- */
@@ -2599,7 +2499,9 @@ window.__ModuleLoader__.load({
       const [plSlug, setPlSlug] = useState(null)
       const [helpOpen, setHelpOpen] = useState(false)
       const [rec, setRec] = useState(null)
-      const { saved, toggle, markSeen, dismiss } = useSaved()
+      /* 每次「换一批」换一个 seed，Host 按它重新抽前排 */
+      const [recSeed, setRecSeed] = useState(() => Math.floor(Math.random() * 1e9) + 1)
+      const { saved, toggle, markSeen } = useSaved()
       /* 计数没有读者：它一变就重渲染，让后到的中文标题显示出来 */
       const [, bumpTitles] = useState(0)
 
@@ -2624,6 +2526,7 @@ window.__ModuleLoader__.load({
         params.set('seen', saved.seen.slice(-200).join(','))
         params.set('dismissed', saved.dismissed.slice(-200).join(','))
         params.set('limit', '10')
+        params.set('seed', String(recSeed))
         getJSON('/hackertube/api/recommend?' + params.toString())
           .then((data) => {
             if (alive && data && Array.isArray(data.items)) setRec(data)
@@ -2632,7 +2535,7 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
-      }, [phase, recKey])
+      }, [phase, recKey, recSeed])
 
       /* 宿主端保存过语言偏好就跟随；本机有明确选择或用户刚手动切换时不被覆盖 */
       useEffect(() => {
@@ -2874,7 +2777,24 @@ window.__ModuleLoader__.load({
         }
       }, [searchKey])
 
-      const filtered = searchActive ? searchState.items : items
+      /* 推荐只决定先后，不新增一栏：把推荐到的视频提到列表最前，其余保持原顺序 */
+      const orderedItems = useMemo(() => {
+        const list = rec && Array.isArray(rec.items) ? rec.items : []
+        if (!list.length || !items.length) return items
+        const byId = new Map(items.map((it) => [it.v, it]))
+        const front = []
+        const moved = new Set()
+        for (const r of list) {
+          const hit = r && byId.get(r.v)
+          if (!hit || moved.has(hit.v)) continue
+          front.push(hit)
+          moved.add(hit.v)
+        }
+        if (!front.length) return items
+        return front.concat(items.filter((it) => !moved.has(it.v)))
+      }, [items, rec])
+
+      const filtered = searchActive ? searchState.items : orderedItems
       const resultTotal = searchActive ? searchState.total : items.length
       /* 输入变化到请求返回之间也算加载中：不然会先闪一下「没有匹配的视频」 */
       const searchLoading = searchActive && (searchState.loading || searchState.key !== searchKey)
@@ -2968,13 +2888,6 @@ window.__ModuleLoader__.load({
           setWatchHash(it.v, 'replace')
         }
         setWatching(it)
-      }
-
-      const dismissRecommendation = (vid) => {
-        setRec((cur) =>
-          cur && Array.isArray(cur.items) ? Object.assign({}, cur, { items: cur.items.filter((it) => it.v !== vid) }) : cur,
-        )
-        dismiss(vid)
       }
 
       const closeWatch = () => {
@@ -3165,6 +3078,28 @@ window.__ModuleLoader__.load({
             'button',
             {
               type: 'button',
+              className: 'ht-shuffle',
+              'data-testid': 'ht-shuffle',
+              onClick: () => setRecSeed(Math.floor(Math.random() * 1e9) + 1),
+              title: tx(lang, '换一批：重新排列首页前排', 'Shuffle: reorder the front of the grid'),
+              'aria-label': tx(lang, '换一批', 'Shuffle'),
+            },
+            h(
+              'svg',
+              { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+              h('path', {
+                d: 'M4 7h9l3-3M4 17h9l3 3M17 4l3 3-3 3M17 14l3 3-3 3',
+                stroke: 'currentColor',
+                strokeWidth: 1.8,
+                strokeLinecap: 'round',
+                strokeLinejoin: 'round',
+              }),
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
               className: 'ht-lang',
               onClick: () => {
                 const next = lang === 'zh' ? 'en' : 'zh'
@@ -3334,9 +3269,6 @@ window.__ModuleLoader__.load({
           },
           phase === 'ready' && staleText ? h('div', { className: 'ht-stale', role: 'status' }, staleText) : null,
           phase === 'ready' && stageText ? h('div', { className: 'ht-stagebar', role: 'status' }, stageText) : null,
-          phase === 'ready' && !q.trim() && !area && rec && Array.isArray(rec.items) && rec.items.length
-            ? h(RecommendRow, { rec, lang, onOpen: openItem, onDismiss: dismissRecommendation })
-            : null,
           phase === 'error'
             ? h(
                 'div',
