@@ -59,6 +59,9 @@ window.__ModuleLoader__.load({
       taxLang: null,
       /* 观看会话按视频 id 存：播放位置不能被下一条视频继承，暂停后也要保留 */
       sessions: new Map(),
+      /* 落盘的播放进度：vid -> { t, d, at }，用于续播与历史列表 */
+      progress: new Map(),
+      progressP: null,
       playheadSubs: new Set(),
       /* 播放错误按视频 id 存：中转页的 yt-error / api-error 会先到全局监听，再由观看页订阅 */
       playback: new Map(),
@@ -276,6 +279,61 @@ window.__ModuleLoader__.load({
         }
         return r.json()
       })
+    }
+
+    /* ---------------- 播放进度 ---------------- */
+
+    /** 面板打开时拉一次全部进度，之后靠本地更新，避免每开一条视频打一次请求。 */
+    function ensureProgress() {
+      if (mem.progressP) return mem.progressP
+      mem.progressP = getJSON('/hackertube/api/progress')
+        .then((d) => {
+          const entries = d && d.entries && typeof d.entries === 'object' ? d.entries : {}
+          mem.progress = new Map(Object.entries(entries))
+          return mem.progress
+        })
+        .catch(() => mem.progress)
+      return mem.progressP
+    }
+
+    /** 续播点：太靠前没有意义，差 20 秒到结尾就不算。 */
+    function resumeAt(vid, duration) {
+      const entry = mem.progress.get(vid)
+      if (!entry) return 0
+      const t = Number(entry.t) || 0
+      const d = Number(duration) || Number(entry.d) || 0
+      if (t < 15) return 0
+      if (d > 0 && t > d - 20) return 0
+      return Math.floor(t)
+    }
+
+    function rememberProgress(vid, position) {
+      if (!vid || !position) return
+      const t = Number(position.t) || 0
+      const d = Number(position.d) || 0
+      if (t < 15) return
+      if (d > 0 && t > d - 20) {
+        /* 看完了就把进度清掉，历史里不再显示「继续观看」 */
+        mem.progress.delete(vid)
+        return
+      }
+      mem.progress.set(vid, { t: Math.round(t), d: Math.round(d), at: Date.now() })
+    }
+
+    function saveProgress(vid, position) {
+      rememberProgress(vid, position)
+      const entry = mem.progress.get(vid)
+      if (!entry) return
+      try {
+        void fetch('/hackertube/api/progress', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ vid, t: entry.t, d: entry.d }),
+          keepalive: true,
+        }).catch(() => {})
+      } catch {
+        /* 离线时只留内存副本 */
+      }
     }
 
     function loadList() {
@@ -769,6 +827,9 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);color:inherit;font-weight:500;display:inline-flex;
   align-items:center;gap:6px;margin-bottom:16px}
 .ht-back:hover{background:var(--dsw-alias-bg-layer-2)}
+.ht-resume{margin:8px 0 0;font-size:13px;color:var(--dsw-alias-label-secondary);display:flex;align-items:center;gap:8px}
+.ht-resume-reset{padding:0;border:0;background:none;font:inherit;font-size:12.5px;color:var(--dsw-alias-label-tertiary);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.ht-resume-reset:hover{color:var(--dsw-alias-label-primary)}
 .ht-h1{font-size:21px;line-height:1.32;font-weight:600;letter-spacing:-.2px;margin:16px 0 0}
 .ht-channel{margin:10px 0 0;font-size:14px;font-weight:500}
 /* 简介卡：浅灰底、默认折叠三行、底部渐隐，展开后完整显示 */
@@ -1522,6 +1583,8 @@ window.__ModuleLoader__.load({
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
       const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
+      /* 上次看到的位置；0 表示从头开始 */
+      const [resumeFrom, setResumeFrom] = useState(0)
       /* 备用片源：命中才渲染按钮，没命中就一直保持 null，界面上什么都不出现 */
       const [mirror, setMirror] = useState(null)
 
@@ -1534,6 +1597,24 @@ window.__ModuleLoader__.load({
         mem.playheadSubs.add(sub)
         return () => {
           mem.playheadSubs.delete(sub)
+          /* 离开这条视频时补一次落盘：看得短、还没到 15 秒节流点也不会丢 */
+          const last = watchSession(item.v).playhead
+          if (last) saveProgress(item.v, last)
+        }
+      }, [item.v])
+
+      /* 续播：进度来自记忆里的 map，没有就先拉一次，再交给中转页 seek */
+      useEffect(() => {
+        let alive = true
+        const known = resumeAt(item.v, item.d)
+        if (known) setResumeFrom(known)
+        ensureProgress().then(() => {
+          if (!alive) return
+          const at = resumeAt(item.v, item.d)
+          if (at) setResumeFrom(at)
+        })
+        return () => {
+          alive = false
         }
       }, [item.v])
 
@@ -1913,7 +1994,13 @@ window.__ModuleLoader__.load({
                         key: 'embed-' + playerKey,
                         className: 'ht-video',
                         title: item.t,
-                        src: origin + '/embed?vid=' + encodeURIComponent(item.v) + '&lang=' + (lang === 'zh' ? 'zh' : 'en'),
+                        src:
+                      origin +
+                      '/embed?vid=' +
+                      encodeURIComponent(item.v) +
+                      '&lang=' +
+                      (lang === 'zh' ? 'zh' : 'en') +
+                      (resumeFrom ? '&start=' + resumeFrom : ''),
                         allow:
                           'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
                         allowFullScreen: true,
@@ -1944,6 +2031,25 @@ window.__ModuleLoader__.load({
                 )
               : null,
             h('h1', { className: 'ht-h1' }, titleOf(item, lang)),
+            resumeFrom
+              ? h(
+                  'p',
+                  { className: 'ht-resume' },
+                  tx(lang, '从上次的 ', 'Resumed at ') + fmtDur(resumeFrom),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-resume-reset',
+                      onClick: () => {
+                        setResumeFrom(0)
+                        setPlayerKey((k) => k + 1)
+                      },
+                    },
+                    tx(lang, '从头开始', 'Start over'),
+                  ),
+                )
+              : null,
             item.c ? h('p', { className: 'ht-channel' }, item.c) : null,
             h(
               'div',
@@ -3473,6 +3579,12 @@ window.__ModuleLoader__.load({
               if (!vid) return
               const position = { t: Number(data.t) || 0, d: Number(data.d) || 0, at: Date.now() }
               watchSession(vid).playhead = position
+              /* 每 15 秒落一次盘，页面关掉也不会丢 */
+              const lastWrite = watchSession(vid).savedAt || 0
+              if (Date.now() - lastWrite > 15000) {
+                watchSession(vid).savedAt = Date.now()
+                saveProgress(vid, position)
+              }
               for (const fn of mem.playheadSubs) {
                 try {
                   fn(vid, position)

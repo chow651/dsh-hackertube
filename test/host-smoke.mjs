@@ -339,6 +339,39 @@ if (liveUpstream) {
   }
 }
 
+/* 11.5 播放进度：写入、读回、看完清理 */
+{
+  const post = async (body) => {
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = '/hackertube/api/progress'
+    req.headers = { host: '127.0.0.1:54321' }
+    const res = fakeRes()
+    const done = handler(req, res)
+    req.emit('data', Buffer.from(JSON.stringify(body)))
+    req.emit('end')
+    await done
+    /* 路由在 end 回调里异步写响应，等它落定 */
+    for (let i = 0; i < 40 && !res.statusCode; i += 1) await new Promise((r) => setTimeout(r, 25))
+    return res
+  }
+  const written = await post({ vid: 'fNk_zzaMoSs', t: 300, d: 592 })
+  check('progress saved', written.statusCode === 200, 'got ' + written.statusCode)
+  const one = await call('/hackertube/api/progress?vid=fNk_zzaMoSs')
+  const entry = JSON.parse(one.body).entry
+  check('progress read back', !!entry && entry.t === 300, JSON.stringify(entry))
+
+  /* 差 20 秒到结尾视为看完，进度要清掉 */
+  await post({ vid: 'fNk_zzaMoSs', t: 585, d: 592 })
+  const cleared = JSON.parse((await call('/hackertube/api/progress?vid=fNk_zzaMoSs')).body).entry
+  check('finished video clears progress', cleared === null, JSON.stringify(cleared))
+
+  /* 太靠前不记录 */
+  await post({ vid: 'FITJMJjASUs', t: 4, d: 3202 })
+  const early = JSON.parse((await call('/hackertube/api/progress?vid=FITJMJjASUs')).body).entry
+  check('early playhead ignored', early === null, JSON.stringify(early))
+}
+
 /* 12. 给 agent 用的 hackertube_search */
 {
   const tool = tools['hackertube_search']
