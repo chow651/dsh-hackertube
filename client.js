@@ -426,6 +426,17 @@ window.__ModuleLoader__.load({
 .ht-chip:hover{background:var(--dsw-alias-bg-layer-2)}
 .ht-chip.on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base)}
 .ht-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 24px 40px}
+.ht-recs{padding-top:18px}
+.ht-recs-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 10px}
+.ht-recs-head h2{margin:0;font-size:15px;font-weight:600}
+.ht-recs-head span{font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.ht-recs-row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(200px,240px);gap:16px;overflow-x:auto;padding:0 0 8px}
+.ht-rec{min-width:0}
+.ht-rec-open{display:block;width:100%;padding:0;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.ht-rec .ht-title{font-size:14px;line-height:19px;height:38px;margin-top:8px}
+.ht-rec-why{margin:4px 0 0;min-height:32px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+.ht-rec-hide{margin-top:4px;padding:0;border:0;background:none;font:inherit;font-size:12px;color:var(--dsw-alias-label-tertiary);cursor:pointer}
+.ht-rec-hide:hover{color:var(--dsw-alias-label-primary);text-decoration:underline}
 .ht-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:32px 20px;padding-top:16px}
 .ht-card.kbd{outline:2px solid var(--dsw-alias-label-primary);outline-offset:3px;border-radius:12px}
 .ht-card{display:block;min-width:0;cursor:pointer;background:none;border:0;padding:0;
@@ -860,6 +871,95 @@ window.__ModuleLoader__.load({
               : null,
             item.w ? h('span', { key: 'w' }, tx(lang, fmtCount(item.w, lang) + ' 次观看', fmtCount(item.w, lang) + ' views')) : null,
             item.y ? h('span', { key: 'y' }, String(item.y)) : null,
+          ),
+        ),
+      )
+    }
+
+    /* ---------------- 首页推荐行（T06 推荐画像） ---------------- */
+
+    function recTitleOf(lang, reason) {
+      if (!reason) return ''
+      if (reason.kind === 'like') {
+        const zh = reason.vid && mem.titles ? mem.titles[reason.vid] : ''
+        return lang === 'zh' && zh ? zh : reason.title || ''
+      }
+      return reason.title || ''
+    }
+
+    function recReasonText(lang, reason) {
+      if (!reason) return ''
+      const title = recTitleOf(lang, reason)
+      if (reason.kind === 'like') {
+        return title
+          ? tx(lang, '因为你喜欢《' + title + '》', 'Because you liked “' + title + '”')
+          : tx(lang, '因为你喜欢的视频', 'Because you liked a similar video')
+      }
+      if (reason.kind === 'playlist') {
+        return title
+          ? tx(lang, '来自播放列表「' + title + '」', 'From playlist “' + title + '”')
+          : tx(lang, '来自编辑播放列表', 'From a curated playlist')
+      }
+      if (reason.kind === 'hn') {
+        const n = Number(reason.recommenders) || 0
+        if (n > 0) {
+          return tx(
+            lang,
+            'HN 高分推荐 · ' + n + ' 人推荐',
+            'Highly recommended on HN · ' + n + (n === 1 ? ' recommender' : ' recommenders'),
+          )
+        }
+        return tx(lang, 'HN 高分推荐', 'Highly recommended on HN')
+      }
+      return ''
+    }
+
+    function RecommendRow(props) {
+      const rec = props.rec
+      const lang = props.lang
+      const items = rec && Array.isArray(rec.items) ? rec.items : []
+      if (!items.length) return null
+      const liked = rec.mode === 'likes'
+      return h(
+        'section',
+        { className: 'ht-recs', 'aria-label': tx(lang, '为你推荐', 'Recommended for you') },
+        h(
+          'div',
+          { className: 'ht-recs-head' },
+          h('h2', null, liked ? tx(lang, '为你推荐', 'Recommended for you') : tx(lang, '编辑精选', "Editor's picks")),
+          h(
+            'span',
+            null,
+            liked
+              ? tx(lang, '根据你喜欢的视频', 'Based on videos you liked')
+              : tx(lang, '来自编辑播放列表与 HN 高分', 'From curated playlists and high-signal HN picks'),
+          ),
+        ),
+        h(
+          'div',
+          { className: 'ht-recs-row' },
+          items.map((item) =>
+            h(
+              'div',
+              { key: item.v, className: 'ht-rec', 'data-vid': item.v },
+              h(
+                'button',
+                { type: 'button', className: 'ht-rec-open', onClick: () => props.onOpen(item) },
+                h(
+                  'div',
+                  { className: 'ht-thumb' },
+                  item.th ? h('img', { src: item.th, alt: '', loading: 'lazy' }) : null,
+                  item.d ? h('span', { className: 'ht-dur' }, fmtDur(item.d)) : null,
+                ),
+                h('p', { className: 'ht-title' }, titleOf(item, lang)),
+              ),
+              h('p', { className: 'ht-rec-why' }, recReasonText(lang, item.reason)),
+              h(
+                'button',
+                { type: 'button', className: 'ht-rec-hide', onClick: () => props.onDismiss(item.v) },
+                tx(lang, '不感兴趣', 'Not interested'),
+              ),
+            ),
           ),
         ),
       )
@@ -1956,6 +2056,7 @@ window.__ModuleLoader__.load({
         likes: readArr('ht.likes'),
         later: readArr('ht.later'),
         seen: readArr('ht.seen'),
+        dismissed: readArr('ht.dismissed'),
       }))
       const saveTimer = useRef(null)
       /* dsh-app:// 下的 localStorage 不保证可用或跨会话，真正的存档放在 host 端 */
@@ -1968,6 +2069,7 @@ window.__ModuleLoader__.load({
               likes: Array.isArray(d.likes) ? d.likes : [],
               later: Array.isArray(d.later) ? d.later : [],
               seen: Array.isArray(d.seen) ? d.seen : [],
+              dismissed: Array.isArray(d.dismissed) ? d.dismissed : [],
             })
           })
           .catch(() => {})
@@ -1980,13 +2082,14 @@ window.__ModuleLoader__.load({
         writeArr('ht.likes', next.likes)
         writeArr('ht.later', next.later)
         writeArr('ht.seen', next.seen)
+        writeArr('ht.dismissed', next.dismissed)
         if (saveTimer.current) clearTimeout(saveTimer.current)
         saveTimer.current = setTimeout(() => {
           try {
             void fetch('/hackertube/api/prefs', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ likes: next.likes, later: next.later, seen: next.seen }),
+              body: JSON.stringify({ likes: next.likes, later: next.later, seen: next.seen, dismissed: next.dismissed }),
             }).catch(() => {})
           } catch {
             /* 离线时只留本地副本 */
@@ -2003,7 +2106,12 @@ window.__ModuleLoader__.load({
         const next = saved.seen.filter((x) => x !== vid).concat(vid).slice(-200)
         update(Object.assign({}, saved, { seen: next }))
       }
-      return { saved, toggle, markSeen }
+      /* 首页「不感兴趣」：记录到 prefs，下一轮推荐直接排除 */
+      const dismiss = (vid) => {
+        const next = saved.dismissed.filter((x) => x !== vid).concat(vid).slice(-400)
+        update(Object.assign({}, saved, { dismissed: next }))
+      }
+      return { saved, toggle, markSeen, dismiss }
     }
 
     /* ---------------- 视图组件 ---------------- */
@@ -2260,7 +2368,8 @@ window.__ModuleLoader__.load({
       const [plDetail, setPlDetail] = useState(null)
       const [plSlug, setPlSlug] = useState(null)
       const [helpOpen, setHelpOpen] = useState(false)
-      const { saved, toggle, markSeen } = useSaved()
+      const [rec, setRec] = useState(null)
+      const { saved, toggle, markSeen, dismiss } = useSaved()
       const [titlesVersion, setTitlesVersion] = useState(0)
 
       /* 标题译文表在两种语言下都要：中文界面用来显示，英文界面用来支持中文搜索 */
@@ -2272,6 +2381,27 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         ensureTitles()
       }, [])
+
+      /* 首页推荐画像：把当前 likes / seen / dismissed 带给 Host，马上按最新状态算。
+         保存 prefs 有 400ms 防抖，如果等 POST 落盘再取会拿到上一版画像。 */
+      const recKey = saved.likes.join(',') + '|' + saved.seen.join(',') + '|' + saved.dismissed.join(',')
+      useEffect(() => {
+        if (phase !== 'ready' || !items.length) return undefined
+        let alive = true
+        const params = new URLSearchParams()
+        params.set('likes', saved.likes.slice(-80).join(','))
+        params.set('seen', saved.seen.slice(-200).join(','))
+        params.set('dismissed', saved.dismissed.slice(-200).join(','))
+        params.set('limit', '10')
+        getJSON('/hackertube/api/recommend?' + params.toString())
+          .then((data) => {
+            if (alive && data && Array.isArray(data.items)) setRec(data)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [phase, recKey, titlesVersion])
 
       /* 分类的中文名也参与检索：输入「数学」「安全」能命中整类，而不只是标题里带这两个字的视频 */
       const [taxReady, setTaxReady] = useState(0)
@@ -2624,6 +2754,13 @@ window.__ModuleLoader__.load({
         setWatching(it)
       }
 
+      const dismissRecommendation = (vid) => {
+        setRec((cur) =>
+          cur && Array.isArray(cur.items) ? Object.assign({}, cur, { items: cur.items.filter((it) => it.v !== vid) }) : cur,
+        )
+        dismiss(vid)
+      }
+
       const closeWatch = () => {
         if (watchPushedRef.current) {
           watchPushedRef.current = false
@@ -2920,6 +3057,9 @@ window.__ModuleLoader__.load({
           },
           phase === 'ready' && staleText ? h('div', { className: 'ht-stale', role: 'status' }, staleText) : null,
           phase === 'ready' && stageText ? h('div', { className: 'ht-stagebar', role: 'status' }, stageText) : null,
+          phase === 'ready' && !q.trim() && !area && rec && Array.isArray(rec.items) && rec.items.length
+            ? h(RecommendRow, { rec, lang, onOpen: openItem, onDismiss: dismissRecommendation })
+            : null,
           phase === 'error'
             ? h(
                 'div',

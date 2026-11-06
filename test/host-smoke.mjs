@@ -3,6 +3,7 @@
  * 验证路由注册、上游拉取、瘦身、磁盘缓存、错误路径。
  */
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -13,6 +14,11 @@ const SELF = fileURLToPath(import.meta.url)
 /* 子进程模式：用固定 fixture 驱动首屏缓存/导出场景，不打真实上游 */
 if (process.env.HT_FIRST_PAINT_FIXTURE === '1') {
   process.exit(await runFirstPaintFixture())
+}
+
+/* 子进程模式：用固定 fixture 驱动推荐画像，不打真实上游 */
+if (process.env.HT_RECOMMEND_FIXTURE === '1') {
+  process.exit(await runRecommendFixture())
 }
 
 const tmp = mkdtempSync(join(tmpdir(), 'ht-smoke-'))
@@ -608,6 +614,289 @@ async function runFirstPaintFixture() {
   return failures ? 1 : 0
 }
 
+/* ---------- 固定 fixture：推荐画像（T06） ---------- */
+
+/** 写一个 NumPy v1 float16 矩阵；只用于 fixture，不引入科学计算依赖。 */
+function writeNpyFloat16(rows) {
+  const dim = rows[0].length
+  let header =
+    "{'descr': '<f2', 'fortran_order': False, 'shape': (" +
+    rows.length +
+    ', ' +
+    dim +
+    '), }'
+  while ((10 + header.length + 1) % 64 !== 0) header += ' '
+  header += '\n'
+  const buf = Buffer.alloc(10 + header.length + rows.length * dim * 2)
+  buf.write('\x93NUMPY', 0, 'latin1')
+  buf[6] = 1
+  buf[7] = 0
+  buf.writeUInt16LE(header.length, 8)
+  buf.write(header, 10, 'latin1')
+  let off = 10 + header.length
+  for (const row of rows) {
+    for (const value of row) {
+      buf.writeUInt16LE(float16Bits(value), off)
+      off += 2
+    }
+  }
+  return buf
+}
+
+function float16Bits(value) {
+  if (value === 0) return 0
+  const sign = value < 0 ? 0x8000 : 0
+  const a = Math.abs(value)
+  const exp = Math.floor(Math.log2(a))
+  const e = exp + 15
+  if (e <= 0) return sign | Math.round(a / 2 ** -24)
+  if (e >= 31) return sign | 0x7c00
+  const frac = Math.round((a / 2 ** exp - 1) * 1024)
+  return sign | (e << 10) | (frac & 0x3ff)
+}
+
+async function runRecommendFixture() {
+  const scenario = process.env.HT_RECOMMEND_SCENARIO || 'likes'
+  const tmp = mkdtempSync(join(tmpdir(), 'ht-recommend-'))
+  process.env.DSH_PROFILE_DIR = tmp
+  const root = join(tmp, '.dsh-hackertube')
+
+  const spec = [
+    ['likevid1', 'Liked video about graphs', 20, 10],
+    ['simvec01', 'Similar vector one', 12, 4],
+    ['simvec02', 'Similar vector two', 8, 2],
+    ['relpick1', 'Related graph pick', 6, 1],
+    ['seenvid1', 'Already watched', 30, 12],
+    ['othervid1', 'Unrelated high score', 50, 20],
+    ['othervid2', 'Another unrelated', 40, 15],
+    ['playpick1', 'Playlist pick', 15, 5],
+  ]
+  const videos = spec.map(([vid, title, score, recommenders], i) => ({
+    vid,
+    url: 'https://www.youtube.com/watch?v=' + vid,
+    title,
+    channel: 'Fixture Channel',
+    summary: title + ' summary',
+    why_hn: title + ' reason',
+    content_type: 'talk',
+    level: 'intro',
+    tags: [title.toLowerCase()],
+    categories: [{ id: 'prog', name: 'Programming', area: 'software', area_name: 'Software' }],
+    score,
+    hn: { mentions: recommenders + 2, recommenders },
+    published: '2020-01-0' + (i + 1) + 'T00:00:00Z',
+  }))
+  const vectorRows = [
+    ['likevid1', [1, 0, 0, 0]],
+    ['simvec01', [0.75, 0.25, 0, 0]],
+    ['simvec02', [0.5, 0.5, 0, 0]],
+    ['relpick1', [0, 1, 0, 0]],
+    ['seenvid1', [1, 0, 0, 0]],
+    ['othervid1', [0, 0, 1, 0]],
+    ['othervid2', [0, 0, 0, 1]],
+    ['playpick1', [0.25, 0.25, 0.5, 0]],
+  ]
+
+  mkdirSync(join(root, 'export'), { recursive: true })
+  writeFileSync(join(root, 'export', 'videos.jsonl'), videos.map((o) => JSON.stringify(o)).join('\n'))
+  writeFileSync(
+    join(root, 'export', 'related.jsonl'),
+    videos
+      .map((o) =>
+        JSON.stringify({
+          vid: o.vid,
+          related: o.vid === 'likevid1' ? [{ vid: 'relpick1', shared_recommenders: 2 }, { vid: 'simvec01', shared_recommenders: 1 }] : [],
+        }),
+      )
+      .join('\n'),
+  )
+  writeFileSync(
+    join(root, 'export', 'mentions.jsonl'),
+    JSON.stringify({ vid: 'likevid1', hn_comment_id: 1, author: 'fixture', month: '2020-01', stance: 'rec', why: 'good', text: 'Great talk' }) + '\n',
+  )
+  writeFileSync(join(root, 'export', 'embeddings.npy'), writeNpyFloat16(vectorRows.map((r) => r[1])))
+  writeFileSync(join(root, 'export', 'embedding_ids.json'), JSON.stringify(vectorRows.map((r) => r[0])))
+  writeFileSync(join(root, 'export', 'manifest.json'), JSON.stringify({ v: 1, at: Date.now(), bytes: 1234 }))
+
+  const prefs =
+    scenario === 'cold'
+      ? { likes: [], later: [], seen: [], at: Date.now() }
+      : { likes: ['likevid1'], later: [], seen: ['seenvid1'], at: Date.now() }
+  writeFileSync(join(root, 'prefs.json'), JSON.stringify(prefs))
+
+  global.fetch = async (url) => {
+    const raw = String(url)
+    if (raw.indexOf('/api/stats') >= 0) {
+      return { ok: true, status: 200, json: async () => ({ videos: videos.length }) }
+    }
+    if (raw.indexOf('/api/list?offset=') >= 0) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          videos.map((o) => ({
+            vid: o.vid,
+            title: o.title,
+            channel: o.channel,
+            duration_s: 600,
+            thumbnail: 'https://i.ytimg.com/vi/' + o.vid + '/hqdefault.jpg',
+            published: o.published,
+            views: 1000,
+            categories: o.categories,
+            tags: o.tags,
+            score: o.score,
+            hn: o.hn,
+          })),
+      }
+    }
+    if (raw.indexOf('/api/playlists') >= 0) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => [
+          { slug: 'start-here', title: 'Start here', tier: 'start', cover: ['playpick1', 'seenvid1'], count: 2, minutes: 20 },
+        ],
+      }
+    }
+    throw new Error('fixture upstream blocked: ' + raw)
+  }
+
+  let handler = null
+  const registered = []
+  const { apply } = await import('../index.js')
+  const ctx = {
+    get(name) {
+      if (name === 'webServer') {
+        return {
+          register: (route) => {
+            registered.push(route)
+            handler = route.handler
+            return () => {}
+          },
+        }
+      }
+      return undefined
+    },
+    effect(fn) {
+      return fn()
+    },
+    inject(names, cb) {
+      if (names.indexOf('tools') >= 0) cb({ tools: { register: () => {} } })
+    },
+  }
+  apply(ctx)
+
+  let failures = 0
+  const fxcheck = (name, ok, extra = '') => {
+    console.log((ok ? 'ok   ' : 'FAIL ') + name + (extra ? ' — ' + extra : ''))
+    if (!ok) failures += 1
+  }
+  const fakeRes = () => ({
+    statusCode: 0,
+    headers: {},
+    body: '',
+    writeHead(code, headers) {
+      this.statusCode = code
+      this.headers = headers
+    },
+    end(chunk) {
+      this.body = chunk === undefined ? '' : String(chunk)
+    },
+  })
+  const call = async (path) => {
+    const res = fakeRes()
+    await handler({ method: 'GET', url: path, headers: { host: '127.0.0.1:54321' } }, res)
+    return res
+  }
+  const callPost = async (path, payload) => {
+    const res = fakeRes()
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = path
+    req.headers = { host: '127.0.0.1:54321' }
+    const finished = new Promise((resolve) => {
+      const rawEnd = res.end
+      res.end = function (chunk) {
+        rawEnd.call(this, chunk)
+        resolve()
+      }
+    })
+    handler(req, res)
+    req.emit('data', Buffer.from(JSON.stringify(payload)))
+    req.emit('end')
+    await finished
+    return res
+  }
+  const read = (res) => JSON.parse(res.body)
+
+  if (!handler) {
+    console.error('FAIL: route handler was not registered in recommend fixture')
+    return 1
+  }
+
+  if (scenario === 'feedback') {
+    const before = read(await call('/hackertube/api/recommend'))
+    const beforeItems = Array.isArray(before.items) ? before.items : []
+    fxcheck('T06 feedback starts with a like feed', before.mode === 'likes' && beforeItems.length > 1, String(before.mode))
+    fxcheck('T06 feedback first item known', beforeItems[0] && beforeItems[0].v === 'simvec01', beforeItems[0] && beforeItems[0].v)
+
+    const posted = await callPost('/hackertube/api/prefs', {
+      likes: ['likevid1'],
+      later: [],
+      seen: ['seenvid1'],
+      dismissed: ['simvec01'],
+    })
+    fxcheck('T06 feedback saved', posted.statusCode === 200, 'got ' + posted.statusCode)
+    const prefs = read(await call('/hackertube/api/prefs'))
+    fxcheck('T06 dismissed persisted', Array.isArray(prefs.dismissed) && prefs.dismissed.indexOf('simvec01') >= 0, JSON.stringify(prefs.dismissed))
+
+    const after = read(await call('/hackertube/api/recommend'))
+    const afterItems = Array.isArray(after.items) ? after.items : []
+    fxcheck('T06 dismissed item dropped', !afterItems.some((x) => x.v === 'simvec01'))
+    fxcheck('T06 order changes after feedback', afterItems[0] && afterItems[0].v !== 'simvec01', afterItems[0] && afterItems[0].v)
+    fxcheck('T06 feedback keeps explanations', afterItems.length > 0 && afterItems.every((x) => x.reason && x.reason.kind === 'like'))
+  }
+
+  if (scenario === 'cold') {
+    const res = await call('/hackertube/api/recommend')
+    fxcheck('T06 cold recommend 200', res.statusCode === 200, 'got ' + res.statusCode)
+    const data = read(res)
+    fxcheck('T06 cold mode', data.mode === 'cold', String(data.mode))
+    const items = Array.isArray(data.items) ? data.items : []
+    fxcheck('T06 cold has recommendations', items.length >= 4, String(items.length))
+    fxcheck(
+      'T06 cold uses playlist first',
+      items[0] && items[0].v === 'playpick1' && items[0].reason && items[0].reason.kind === 'playlist',
+      JSON.stringify(items[0] && { v: items[0].v, reason: items[0].reason }),
+    )
+    fxcheck('T06 cold playlist reason names playlist', items[0] && items[0].reason && items[0].reason.title === 'Start here', items[0] && items[0].reason && items[0].reason.title)
+    fxcheck('T06 cold fills with HN score', items.some((x) => x.reason && x.reason.kind === 'hn'))
+    fxcheck('T06 cold every item has a reason', items.every((x) => x.reason && x.reason.kind))
+  }
+
+  if (scenario === 'likes') {
+    const res = await call('/hackertube/api/recommend')
+    fxcheck('T06 recommend 200', res.statusCode === 200, 'got ' + res.statusCode)
+    const data = read(res)
+    fxcheck('T06 like mode', data.mode === 'likes', String(data.mode))
+    const items = Array.isArray(data.items) ? data.items : []
+    fxcheck('T06 has recommendations', items.length >= 4, String(items.length))
+    fxcheck('T06 top item follows embeddings', items[0] && items[0].v === 'simvec01', items[0] && items[0].v)
+    fxcheck(
+      'T06 explanation because you liked',
+      items[0] && items[0].reason && items[0].reason.kind === 'like' && items[0].reason.vid === 'likevid1',
+      JSON.stringify(items[0] && items[0].reason),
+    )
+    fxcheck('T06 reason carries source title', items[0] && items[0].reason && items[0].reason.title === 'Liked video about graphs', items[0] && items[0].reason && items[0].reason.title)
+    fxcheck('T06 related graph candidate included', items.some((x) => x.v === 'relpick1'))
+    fxcheck('T06 watched item excluded', !items.some((x) => x.v === 'seenvid1'))
+    fxcheck('T06 every item has a reason', items.every((x) => x.reason && x.reason.kind === 'like'))
+  }
+
+  console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | recommend fixture: ' + scenario)
+  return failures ? 1 : 0
+}
+
 /* 固定 fixture 场景在独立子进程跑，避免真实上游与模块级状态互相污染 */
 for (const scenario of ['export-first', 'stale-offline']) {
   const r = spawnSync(process.execPath, [SELF], {
@@ -618,6 +907,17 @@ for (const scenario of ['export-first', 'stale-offline']) {
   if (r.stdout) process.stdout.write(r.stdout)
   if (r.stderr) process.stderr.write(r.stderr)
   check('first-paint fixture: ' + scenario, r.status === 0, 'exit ' + r.status)
+}
+
+for (const scenario of ['likes', 'cold', 'feedback']) {
+  const r = spawnSync(process.execPath, [SELF], {
+    env: { ...process.env, HT_RECOMMEND_FIXTURE: '1', HT_RECOMMEND_SCENARIO: scenario },
+    encoding: 'utf8',
+    timeout: 30000,
+  })
+  if (r.stdout) process.stdout.write(r.stdout)
+  if (r.stderr) process.stderr.write(r.stderr)
+  check('taste-profile fixture: ' + scenario, r.status === 0, 'exit ' + r.status)
 }
 
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | cache dir: ' + tmp)

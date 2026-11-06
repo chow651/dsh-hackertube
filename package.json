@@ -33,6 +33,7 @@
   "files": [
     "index.js",
     "client.js",
+    "recommend.js",
     "cordis.patch.yml",
     "locale/*.json",
     "data/*.json",
