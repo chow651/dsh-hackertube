@@ -1350,10 +1350,14 @@ async function streamOnce(ctx, route, prompt, opts) {
 
 async function streamOnceInner(ctx, route, prompt, opts) {
   const llm = ctx.get('llm')
+  const messages =
+    Array.isArray(opts.messages) && opts.messages.length
+      ? opts.messages
+      : [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
   const stream = llm.stream({
     provider: route.provider,
     model: route.model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    messages,
     ...(opts.maxTokens ? { maxOutputTokens: opts.maxTokens } : {}),
   })
   let out = ''
@@ -2218,12 +2222,73 @@ function parseVtt(text) {
 const SUBS_ZH = ['zh-Hans', 'zh-CN', 'zh', 'zh-Hant', 'zh-TW']
 const SUBS_EN = ['en', 'en-US', 'en-GB']
 
+/** 字幕失败短缓存：同一条视频反复提问时不重复跑 yt-dlp。 */
+const SUBS_FAIL_TTL_MS = 60_000
+/* 问答里的字幕只是上下文之一，给它一个明确的预算，不让面板看起来卡死 */
+const CHAT_SUBS_BUDGET_MS = 20_000
+
+function subsFile(vid, wantZh, kind) {
+  return join(subsDir(), `${vid}.${wantZh ? 'zh' : 'en'}.${kind}`)
+}
+
+function subsFailureStatus(reason) {
+  if (reason === 'missing-dependency') return 424
+  if (reason === 'timeout') return 504
+  return reason === 'error' ? 502 : 409
+}
+
+function subsFailureResult(payload) {
+  return { status: subsFailureStatus(payload.reason), body: payload }
+}
+
+async function readSubsFailure(vid, wantZh) {
+  try {
+    const parsed = JSON.parse(await readFile(subsFile(vid, wantZh, 'fail.json'), 'utf8'))
+    if (parsed && Date.now() - Number(parsed.at || 0) < SUBS_FAIL_TTL_MS) return parsed
+  } catch {
+    /* 没有失败缓存 */
+  }
+  return null
+}
+
+async function writeSubsFailure(vid, wantZh, reason, extra) {
+  const payload = { reason, at: Date.now(), ...(extra || {}) }
+  await mkdir(subsDir(), { recursive: true }).catch(() => {})
+  await writeFile(subsFile(vid, wantZh, 'fail.json'), JSON.stringify(payload)).catch(() => {})
+  return payload
+}
+
+function clearSubsFailure(vid, wantZh) {
+  void rm(subsFile(vid, wantZh, 'fail.json'), { force: true }).catch(() => {})
+}
+
+function chatSubsBudgetMs() {
+  const raw = Number(process.env.DSH_HACKERTUBE_SUBS_BUDGET_MS)
+  if (Number.isFinite(raw) && raw >= 1000) return Math.min(raw, 120_000)
+  return CHAT_SUBS_BUDGET_MS
+}
+
+/** 给一个 Promise 加硬上限；超时走 fallback，不让字幕检索拖住回答。 */
+function withBudget(promise, ms, fallback) {
+  let timer = null
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallback()), ms)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
 /**
  * 取一条视频的字幕。
  * 只做三件事：查缓存、调 yt-dlp、把失败翻译成可执行的提示。
  * 依赖缺失或上游风控时如实上报，不尝试自行修复环境。
+ * 失败会短时间缓存，避免每个问题都重跑一遍慢管线。
  */
-async function loadSubs(vid, wantZh) {
+async function loadSubs(vid, wantZh, options = {}) {
+  const budgetMs = Math.max(1000, Math.min(Number(options.budgetMs) || 120_000, 180_000))
   const dir = subsDir()
   const cacheFile = join(dir, `${vid}.${wantZh ? 'zh' : 'en'}.json`)
   try {
@@ -2233,12 +2298,16 @@ async function loadSubs(vid, wantZh) {
     /* 未缓存 */
   }
 
+  const cachedFailure = await readSubsFailure(vid, wantZh)
+  if (cachedFailure) return subsFailureResult(cachedFailure)
+
   const deps = await probeDeps()
   if (!deps.ytdlp.ok) {
-    return {
-      status: 424,
-      body: { reason: 'missing-dependency', need: 'yt-dlp', hint: deps.ytdlp.hint },
-    }
+    const payload = await writeSubsFailure(vid, wantZh, 'missing-dependency', {
+      need: 'yt-dlp',
+      hint: deps.ytdlp.hint,
+    })
+    return subsFailureResult(payload)
   }
 
   await mkdir(dir, { recursive: true })
@@ -2267,7 +2336,7 @@ async function loadSubs(vid, wantZh) {
   if (hasCookies) args.push('--cookies', cookieFile)
   args.push(`https://www.youtube.com/watch?v=${vid}`)
 
-  const res = await runCmd('yt-dlp', args, 120_000)
+  const res = await runCmd('yt-dlp', args, budgetMs)
 
   let files = []
   try {
@@ -2278,22 +2347,25 @@ async function loadSubs(vid, wantZh) {
 
   if (!files.length) {
     await rm(tmp, { recursive: true, force: true }).catch(() => {})
+    if (res.err === 'timeout') {
+      const payload = await writeSubsFailure(vid, wantZh, 'timeout', {
+        hint: `字幕获取超过 ${Math.round(budgetMs / 1000)} 秒，本轮只使用视频简介。`,
+      })
+      return subsFailureResult(payload)
+    }
     if (/sign in to confirm|not a bot|cookies/i.test(res.err)) {
-      return {
-        status: 409,
-        body: {
-          reason: 'needs-cookies',
-          hint:
-            'YouTube 要求登录校验。用浏览器扩展导出 Netscape 格式 cookies.txt，' +
-            `放到 ${cookieFile}，然后重试。`,
-          cookiePath: cookieFile,
-        },
-      }
+      const payload = await writeSubsFailure(vid, wantZh, 'needs-cookies', {
+        hint:
+          'YouTube 要求登录校验。用浏览器扩展导出 Netscape 格式 cookies.txt，' +
+          `放到 ${cookieFile}，然后重试。`,
+        cookiePath: cookieFile,
+      })
+      return subsFailureResult(payload)
     }
-    return {
-      status: 409,
-      body: { reason: 'no-captions', hint: '这条视频没有可用字幕，需要本地转写' },
-    }
+    const payload = await writeSubsFailure(vid, wantZh, 'no-captions', {
+      hint: '这条视频没有可用字幕，需要本地转写',
+    })
+    return subsFailureResult(payload)
   }
 
   /* 文件名形如 <vid>.<lang>.vtt，按优先级挑一条 */
@@ -2322,7 +2394,8 @@ async function loadSubs(vid, wantZh) {
   await rm(tmp, { recursive: true, force: true }).catch(() => {})
 
   if (!cues.length) {
-    return { status: 409, body: { reason: 'no-captions', hint: '字幕文件为空' } }
+    const failed = await writeSubsFailure(vid, wantZh, 'no-captions', { hint: '字幕文件为空' })
+    return subsFailureResult(failed)
   }
 
   const payload = {
@@ -2334,7 +2407,122 @@ async function loadSubs(vid, wantZh) {
     at: Date.now(),
   }
   void writeFile(cacheFile, JSON.stringify(payload)).catch(() => {})
+  clearSubsFailure(vid, wantZh)
   return { status: 200, body: payload }
+}
+
+/** 把秒数格式化成字幕时间戳 [m:ss] / [h:mm:ss]。 */
+function cueClock(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0))
+  const hh = Math.floor(s / 3600)
+  const mm = Math.floor((s % 3600) / 60)
+  const ss = s % 60
+  const pad = (n) => (n < 10 ? '0' + n : String(n))
+  return hh ? `${hh}:${pad(mm)}:${pad(ss)}` : `${mm}:${pad(ss)}`
+}
+
+/** 取播放位置附近的字幕窗口；位置未知时退回视频开头。 */
+function pickSubtitleWindow(cues, at) {
+  if (!Array.isArray(cues) || !cues.length) return []
+  const t = Number(at)
+  if (Number.isFinite(t) && t > 0) {
+    const from = Math.max(0, t - 180)
+    const to = t + 180
+    const hit = cues.filter((c) => c.end >= from && c.start <= to)
+    if (hit.length) return hit.slice(0, 200)
+    return cues.slice(0, 60)
+  }
+  return cues.slice(0, 120)
+}
+
+/**
+ * 字幕检索结果转成回答上下文。成功的带时间戳文本，失败的带明确原因。
+ * text 只在 Host 内部给模型用，publicSubtitle 才返回给浏览器。
+ */
+function subtitleContext(vid, at, result) {
+  const body = (result && result.body) || {}
+  if (result && result.status === 200 && Array.isArray(body.cues) && body.cues.length) {
+    const windowCues = pickSubtitleWindow(body.cues, at)
+    return {
+      status: 'ok',
+      hasSubtitles: true,
+      lang: body.lang || '',
+      window: {
+        start: windowCues[0].start,
+        end: windowCues[windowCues.length - 1].end,
+        count: windowCues.length,
+      },
+      text: windowCues.map((c) => `[${cueClock(c.start)}] ${c.text}`).join('\n'),
+    }
+  }
+  return {
+    status: body.reason || 'error',
+    hasSubtitles: false,
+    hint: body.hint || '',
+    ...(body.cookiePath ? { cookiePath: body.cookiePath } : {}),
+    ...(body.need ? { need: body.need } : {}),
+  }
+}
+
+function publicSubtitle(info) {
+  const out = { status: info.status, hasSubtitles: !!info.hasSubtitles }
+  if (info.lang) out.lang = info.lang
+  if (info.window) out.window = info.window
+  if (info.hint) out.hint = info.hint
+  if (info.cookiePath) out.cookiePath = info.cookiePath
+  if (info.need) out.need = info.need
+  return out
+}
+
+function subtitlePromptBlock(info) {
+  if (info.hasSubtitles) {
+    return '\n\n以下是该视频在播放位置附近的字幕片段（带时间戳）：\n' + info.text + '\n'
+  }
+  const label =
+    {
+      'no-captions': '本条视频没有可用字幕',
+      'needs-cookies': '字幕需要 YouTube cookies 才能获取',
+      'missing-dependency': '字幕管线缺少依赖',
+      timeout: '字幕获取超时',
+    }[info.status] || '字幕不可用'
+  return `\n\n（${label}，以下回答只能基于标题、简介和 HN 推荐理由，不要假装看过字幕。）\n`
+}
+
+/** 有预算的字幕检索：成功失败都收敛成可展示的状态。 */
+async function loadSubtitleContext(vid, at, budgetMs) {
+  const fallback = () => {
+    const hint = `字幕获取超过 ${Math.round(budgetMs / 1000)} 秒，本轮只使用视频简介。`
+    void writeSubsFailure(vid, false, 'timeout', { hint })
+    return { status: 504, body: { reason: 'timeout', hint } }
+  }
+  try {
+    const result = await withBudget(loadSubs(vid, false, { budgetMs }), budgetMs + 5000, fallback)
+    return subtitleContext(vid, at, result)
+  } catch (err) {
+    return { status: 'error', hasSubtitles: false, hint: String(err?.message ?? err).slice(0, 200) }
+  }
+}
+
+function sanitizeChatHistory(input) {
+  if (!Array.isArray(input)) return []
+  const out = []
+  for (const raw of input.slice(-20)) {
+    if (!raw || typeof raw !== 'object') continue
+    const role = raw.role === 'assistant' || raw.role === 'ai' ? 'assistant' : raw.role === 'user' ? 'user' : null
+    if (!role) continue
+    const text = String(raw.text ?? raw.content ?? '').trim().slice(0, 4000)
+    if (text) out.push({ role, text })
+  }
+  return out
+}
+
+/** system prompt 带视频与字幕上下文，历史对话按角色跟在后面。 */
+function buildChatMessages(systemPrompt, history, question) {
+  return [
+    { role: 'system', content: [{ type: 'text', text: systemPrompt }] },
+    ...history.map((h) => ({ role: h.role, content: [{ type: 'text', text: h.text }] })),
+    { role: 'user', content: [{ type: 'text', text: question }] },
+  ]
 }
 
 function send(res, code, body, type = 'application/json; charset=utf-8', extra = null) {
@@ -2386,89 +2574,105 @@ async function handler(req, res) {
         return json(res, 400, { error: 'vid and question required' })
       }
       if (!state.ctx) return json(res, 503, { error: 'llm unavailable' })
-      try {
-        const detail = await loadVideo(vid).catch(() => null)
+      const at = Number(body.at)
+      const playhead = Number.isFinite(at) && at > 0 ? at : 0
+      const history = sanitizeChatHistory(body.history)
+      const answerLang = body.lang === 'en' ? 'en' : 'zh'
+      const budgetMs = chatSubsBudgetMs()
+
+      const prepare = async () => {
+        const [detail, subtitle] = await Promise.all([
+          loadVideo(vid).catch(() => null),
+          loadSubtitleContext(vid, playhead, budgetMs),
+        ])
         const title = (detail && (detail.title || detail.t)) || vid
-        /* 有字幕就带上播放位置附近的片段，没有就只靠元数据回答 */
-        let subtitleContext = ''
-        try {
-          const subs = await loadSubs(vid, false)
-          if (subs.status === 200 && subs.body.cues && subs.body.cues.length) {
-            const at = Number(body.at)
-            const cues = subs.body.cues
-            let slice = cues
-            if (Number.isFinite(at) && at > 0) {
-              const from = Math.max(0, at - 180)
-              const to = at + 180
-              slice = cues.filter((c) => c.end >= from && c.start <= to)
-              if (!slice.length) slice = cues.slice(0, 60)
-            } else {
-              slice = cues.slice(0, 120)
-            }
-            subtitleContext =
-              '\n\n以下是该视频的字幕片段（带时间戳）：\n' +
-              slice
-                .slice(0, 200)
-                .map((c) => `[${Math.floor(c.start / 60)}:${String(Math.floor(c.start % 60)).padStart(2, '0')}] ${c.text}`)
-                .join('\n')
-          }
-        } catch {
-          /* 字幕不可用时退化为只读元数据 */
-        }
-        const answerLang = body.lang === 'en' ? 'en' : 'zh'
-        const prompt =
+        const systemPrompt =
           `你在帮用户理解一个 Hacker News 推荐过的技术视频。\n` +
           `视频标题：${title}\n` +
           (detail && detail.channel ? `频道：${detail.channel}\n` : '') +
           (detail && detail.summary ? `简介：${detail.summary}\n` : '') +
           (detail && detail.why_hn ? `HN 推荐理由：${detail.why_hn}\n` : '') +
-          subtitleContext +
-          `\n\n用户的问题：${question}\n\n` +
+          subtitlePromptBlock(subtitle) +
+          `\n\n回答要求：` +
           (answerLang === 'en'
-            ? '要求：用英文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。'
-            : '要求：用简体中文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。')
-        if (body.stream === true) {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-store',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          })
-          if (typeof res.flushHeaders === 'function') res.flushHeaders()
-          let closed = false
-          const finish = (payload) => {
-            if (closed) return
-            closed = true
-            try {
-              res.write('data: ' + JSON.stringify(payload) + '\n\n')
-              res.write('data: [DONE]\n\n')
-              res.end()
-            } catch {
-              /* 客户端提前断开 */
-            }
-          }
-          res.on('close', () => {
-            closed = true
-          })
-          try {
-            const answer = await askLlm(state.ctx, prompt, {
-              onDelta: (piece) => {
-                if (closed) return
-                try {
-                  res.write('data: ' + JSON.stringify({ delta: piece }) + '\n\n')
-                } catch {
-                  closed = true
-                }
-              },
-            })
-            finish({ done: true, answer, hasSubtitles: !!subtitleContext })
-          } catch (err) {
-            finish({ error: String(err?.message ?? err).slice(0, 200) })
-          }
-          return
+            ? '用英文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。'
+            : '用简体中文回答，紧扣视频内容；如果上下文里没有相关信息，直接说明看不到这部分内容，不要编造。')
+        return {
+          subtitle,
+          systemPrompt,
+          messages: buildChatMessages(systemPrompt, history, question),
         }
-        const answer = await askLlm(state.ctx, prompt)
-        return json(res, 200, { answer, hasSubtitles: !!subtitleContext })
+      }
+
+      if (body.stream === true) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-store',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        })
+        if (typeof res.flushHeaders === 'function') res.flushHeaders()
+        let closed = false
+        const writeEvent = (payload) => {
+          if (closed) return
+          try {
+            res.write('data: ' + JSON.stringify(payload) + '\n\n')
+          } catch {
+            closed = true
+          }
+        }
+        const finish = (payload) => {
+          if (closed) return
+          try {
+            res.write('data: ' + JSON.stringify(payload) + '\n\n')
+            res.write('data: [DONE]\n\n')
+            res.end()
+          } catch {
+            /* 客户端提前断开 */
+          }
+          closed = true
+        }
+        res.on('close', () => {
+          closed = true
+        })
+        /* 先告诉前端进入字幕阶段，再开始可能很慢的 yt-dlp */
+        writeEvent({ stage: 'subtitles' })
+        try {
+          const { subtitle, systemPrompt, messages } = await prepare()
+          if (closed) return
+          writeEvent({
+            stage: 'answer',
+            subtitle: publicSubtitle(subtitle),
+            subtitleStatus: subtitle.status,
+          })
+          const answer = await askLlm(state.ctx, systemPrompt, {
+            messages,
+            onDelta: (piece) => writeEvent({ delta: piece }),
+          })
+          finish({
+            done: true,
+            answer,
+            hasSubtitles: !!subtitle.hasSubtitles,
+            subtitle: publicSubtitle(subtitle),
+            subtitleStatus: subtitle.status,
+            subtitleHint: subtitle.hint || '',
+          })
+        } catch (err) {
+          finish({ error: String(err?.message ?? err).slice(0, 200) })
+        }
+        return
+      }
+
+      try {
+        const { subtitle, systemPrompt, messages } = await prepare()
+        const answer = await askLlm(state.ctx, systemPrompt, { messages })
+        return json(res, 200, {
+          answer,
+          hasSubtitles: !!subtitle.hasSubtitles,
+          subtitle: publicSubtitle(subtitle),
+          subtitleStatus: subtitle.status,
+          subtitleHint: subtitle.hint || '',
+        })
       } catch (err) {
         return json(res, 502, { error: String(err?.message ?? err).slice(0, 200) })
       }
