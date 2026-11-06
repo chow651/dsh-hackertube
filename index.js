@@ -3244,6 +3244,8 @@ async function handler(req, res) {
         vectors,
         playlists,
         limit: Number(url.searchParams.get('limit')) || 10,
+        /* 「换一批」换的是 seed：同一个 seed 顺序稳定，换一个就重新抽样 */
+        seed: Number(url.searchParams.get('seed')) || 1,
       })
       return json(res, 200, payload)
     }
