@@ -103,10 +103,63 @@ let depsBody = {
 
 let fetchCalls = 0
 const fetchLog = []
-global.fetch = async (url) => {
+const chatCalls = []
+const chatPlans = []
+
+/** 把事件序列包装成 client.js 会消费的 SSE Response。 */
+function sseResponse(events) {
+  const text = events
+    .map((event) => (typeof event === 'string' ? event : 'data: ' + JSON.stringify(event) + '\n\n'))
+    .join('')
+  const bytes = new TextEncoder().encode(text)
+  let sent = false
+  return {
+    ok: true,
+    status: 200,
+    headers: {
+      get: (name) => (String(name).toLowerCase() === 'content-type' ? 'text/event-stream; charset=utf-8' : null),
+    },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            if (!sent) {
+              sent = true
+              return { done: false, value: bytes }
+            }
+            return { done: true, value: undefined }
+          },
+        }
+      },
+    },
+    json: async () => ({}),
+  }
+}
+
+global.fetch = async (url, options = {}) => {
   fetchCalls += 1
   fetchLog.push(String(url))
   const u = String(url)
+  if (u.includes('/hackertube/api/chat')) {
+    const payload = JSON.parse(String(options.body || '{}'))
+    chatCalls.push(payload)
+    const plan = chatPlans.shift()
+    if (plan && plan.pending) return new Promise(() => {})
+    return sseResponse(
+      plan || [
+        { stage: 'subtitles' },
+        { stage: 'answer', subtitle: { status: 'ok', hasSubtitles: true, window: { start: 60, end: 90, count: 2 } } },
+        { delta: '默认回答' },
+        {
+          done: true,
+          answer: '默认回答',
+          hasSubtitles: true,
+          subtitle: { status: 'ok', hasSubtitles: true, window: { start: 60, end: 90, count: 2 } },
+        },
+        'data: [DONE]\n\n',
+      ],
+    )
+  }
   let body = LIST
   if (u.includes('/browse') || u.includes('/taxonomy')) body = TAX
   else if (u.includes('/video')) body = DETAIL
@@ -588,6 +641,193 @@ console.log('\n--- T02 navigation ---')
     })
   }
   check('T02 rail jump scrolls to rail', !!rail && rail.instance.scrolledIntoView === true, rail && String(rail.instance.scrolledIntoView))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* ---------- T04：AI 观看会话按视频隔离 ---------- */
+
+console.log('\n--- T04 watch session ---')
+
+const flushTasks = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  for (let i = 0; i < 30; i += 1) await Promise.resolve()
+}
+const askInput = (t) =>
+  t.root
+    .findAllByType('input')
+    .find((i) => /就当前进度提问|Ask about this moment|思考中|Thinking/.test(String(i.props.placeholder || '')))
+const askForm = (t) => t.root.findAllByType('form').find((f) => String(f.props.className || '') === 'ht-rail-form')
+async function sendQuestion(t, text) {
+  const input = askInput(t)
+  check('T04 rail input present', !!input, '')
+  await act(async () => {
+    input.props.onChange({ target: { value: text } })
+  })
+  const form = askForm(t)
+  check('T04 rail form present', !!form, '')
+  await act(async () => {
+    form.props.onSubmit({ preventDefault() {} })
+    await flushTasks()
+  })
+}
+async function openCardAt(t, index) {
+  const card = t.root.findAllByType('button').filter((b) => String(b.props.className || '') === 'ht-card')[index]
+  await act(async () => {
+    card.props.onClick()
+  })
+}
+function subtitleDone(status, answer, extra = {}) {
+  return [
+    { stage: 'subtitles' },
+    { stage: 'answer', subtitle: Object.assign({ status, hasSubtitles: status === 'ok' }, extra) },
+    { delta: answer },
+    {
+      done: true,
+      answer,
+      hasSubtitles: status === 'ok',
+      subtitle: Object.assign({ status, hasSubtitles: status === 'ok' }, extra),
+    },
+    'data: [DONE]\n\n',
+  ]
+}
+
+/* 播放位置不因暂停过期；请求带历史；切换视频消息清空 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  await act(async () => {
+    win.__emit('message', { data: { __ht: 'time', t: 125, d: 600, vid: 'a1' } })
+  })
+  check('T04 playhead visible', treeText(t).includes('2:05'), treeText(t).slice(0, 220))
+
+  chatPlans.push(subtitleDone('ok', '回答一', { window: { start: 60, end: 90, count: 2 } }))
+  await sendQuestion(t, '第一个问题')
+  check('T04 first chat call', chatCalls.length === 1, String(chatCalls.length))
+  check('T04 first request playhead', chatCalls[0] && chatCalls[0].at === 125, JSON.stringify(chatCalls[0] && chatCalls[0].at))
+  check(
+    'T04 first request no history',
+    chatCalls[0] && Array.isArray(chatCalls[0].history) && chatCalls[0].history.length === 0,
+    JSON.stringify(chatCalls[0] && chatCalls[0].history),
+  )
+  check('T04 answer rendered', treeText(t).includes('回答一'), treeText(t).slice(-200))
+  check(
+    'T04 subtitle window visible',
+    /已读取 2 条字幕|Read 2 subtitle lines/.test(treeText(t)) && treeText(t).includes('1:00–1:30'),
+    treeText(t).slice(-220),
+  )
+
+  const realNow = Date.now
+  try {
+    Date.now = () => realNow() + 60_000
+    chatPlans.push(subtitleDone('ok', '回答二', { window: { start: 120, end: 150, count: 3 } }))
+    await sendQuestion(t, '第二个问题')
+  } finally {
+    Date.now = realNow
+  }
+  check('T04 second chat call', chatCalls.length === 2, String(chatCalls.length))
+  check(
+    'T04 paused playhead retained',
+    chatCalls[1] && chatCalls[1].at === 125,
+    JSON.stringify(chatCalls[1] && chatCalls[1].at),
+  )
+  const history = (chatCalls[1] && chatCalls[1].history) || []
+  check(
+    'T04 follow-up carries history',
+    history.length === 2 &&
+      history[0].role === 'user' &&
+      history[0].text === '第一个问题' &&
+      history[1].role === 'assistant' &&
+      history[1].text === '回答一',
+    JSON.stringify(history),
+  )
+
+  const rel = findClass(t, 'ht-rel')
+  await act(async () => {
+    rel[0].props.onClick()
+  })
+  const switched = treeText(t)
+  check(
+    'T04 switch clears ai messages',
+    !switched.includes('第一个问题') && !switched.includes('第二个问题'),
+    switched.slice(0, 220),
+  )
+  check('T04 switch clears playhead display', !/当前播放位置|Playhead/.test(switched), '')
+
+  await act(async () => {
+    win.__emit('message', { data: { __ht: 'time', t: 30, d: 600, vid: 'b2' } })
+    win.__emit('message', { data: { __ht: 'time', t: 300, d: 600, vid: 'a1' } })
+  })
+  check(
+    'T04 new video keeps own playhead',
+    treeText(t).includes('0:30') && !treeText(t).includes('5:00'),
+    treeText(t).slice(0, 220),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 无字幕 / cookies 缺失 / 超时三种状态都必须可见 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  chatPlans.push(subtitleDone('no-captions', '仅简介回答', { hint: '这条视频没有可用字幕，需要本地转写' }))
+  await sendQuestion(t, '这段在讲什么？')
+  const body = treeText(t)
+  check(
+    'T04 no-captions visible',
+    /没有可用字幕|No subtitles/.test(body) && /仅基于视频简介|description only/.test(body),
+    body.slice(-260),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+{
+  resetRoute()
+  const t = await freshTree()
+  await openCardAt(t, 1)
+  chatPlans.push(
+    subtitleDone('needs-cookies', '需要配置的回答', {
+      hint: 'YouTube 要求登录校验。导出 Netscape 格式 cookies.txt，放到 C:\\temp\\cookies.txt，然后重试。',
+      cookiePath: 'C:\\temp\\cookies.txt',
+    }),
+  )
+  await sendQuestion(t, '这段在讲什么？')
+  const body = treeText(t)
+  check('T04 cookies hint visible', /cookies\.txt/.test(body) && /登录校验/.test(body), body.slice(-300))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+{
+  resetRoute()
+  const t = await freshTree()
+  await openCardAt(t, 2)
+  chatPlans.push(subtitleDone('timeout', '超时回答', { hint: '字幕获取超时（20 秒）' }))
+  await sendQuestion(t, '这段在讲什么？')
+  const body = treeText(t)
+  check('T04 timeout visible', /超时|timed out/.test(body) && /仅基于视频简介|description only/.test(body), body.slice(-260))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 取字幕期间有可见阶段，而不是无反馈等待 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  chatPlans.push({ pending: true })
+  await sendQuestion(t, '这段在讲什么？')
+  const body = treeText(t)
+  check('T04 subtitle stage visible', /正在取当前播放位置附近的字幕|Loading subtitles/.test(body), body.slice(-260))
   await act(async () => {
     t.unmount()
   })

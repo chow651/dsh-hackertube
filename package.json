@@ -40,7 +40,7 @@
     "README.en.md"
   ],
   "scripts": {
-    "test": "node test/host-smoke.mjs && node test/client-render.mjs client.js"
+    "test": "node test/watch-session.mjs && node test/host-smoke.mjs && node test/client-render.mjs client.js"
   },
   "devDependencies": {
     "react": "^18.3.1",
