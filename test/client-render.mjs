@@ -15,13 +15,25 @@ if (!CLIENT) {
 /* ---------- 环境 mock ---------- */
 
 const styleEls = []
+const docListeners = new Map()
 global.document = {
   head: { appendChild() {} },
+  activeElement: null,
   createElement() {
     const el = { setAttribute() {}, remove() {}, textContent: '' }
     styleEls.push(el)
     return el
   },
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, new Set())
+    docListeners.get(type).add(fn)
+  },
+  removeEventListener(type, fn) {
+    if (docListeners.has(type)) docListeners.get(type).delete(fn)
+  },
+}
+global.document.__emit = (type, event) => {
+  for (const fn of docListeners.get(type) || []) fn(event)
 }
 global.IntersectionObserver = class {
   constructor(cb) {
@@ -30,6 +42,34 @@ global.IntersectionObserver = class {
   observe() {}
   unobserve() {}
   disconnect() {}
+}
+
+/** react-test-renderer 的宿主节点替身：滚动位置与 scrollIntoView 都留痕，供行为断言。
+ *  re-render 会反复调用 createNodeMock，滚动容器按 className 固定同一份替身，
+ *  否则 ref 指向的节点和测试持有的节点不是同一个对象。 */
+const stableNodes = new Map()
+function makeNodeMock(element) {
+  const cls = element && element.props ? String(element.props.className || '') : ''
+  const stable = cls === 'ht-scroll' || cls === 'ht-watch' || cls === 'ht-rail'
+  if (stable && stableNodes.has(cls)) return stableNodes.get(cls)
+  const node = {
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    style: {},
+    scrolledIntoView: false,
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
+    getBoundingClientRect: () => ({ width: 900, height: 640 }),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    scrollIntoView() {
+      node.scrolledIntoView = true
+    },
+    focus() {},
+    blur() {},
+  }
+  if (stable) stableNodes.set(cls, node)
+  return node
 }
 
 const LIST = [
@@ -55,6 +95,13 @@ const DETAIL = {
   hn: { mentions: 20, recommenders: 17, strong: 14, first: '2018', last: '2026' },
   tags: ['linear algebra', 'visual intuition'],
 }
+const RELATED = [LIST[1], LIST[2]]
+
+let depsBody = {
+  ytdlp: { ok: true, version: 'test' },
+  ffmpeg: { ok: true, version: 'test' },
+  whisper: { ok: false, hint: 'pip install faster-whisper' },
+}
 
 let fetchCalls = 0
 const fetchLog = []
@@ -76,14 +123,23 @@ const statusBody = () => ({
 global.fetch = async (url) => {
   fetchCalls += 1
   fetchLog.push(String(url))
-  if (url.includes('/list/status')) {
+  const u = String(url)
+  if (u.includes('/list/status')) {
     return { ok: true, status: 200, json: async () => statusBody() }
   }
-  if (/\/hackertube\/api\/list(\?|$)/.test(String(url))) {
+  if (/\/hackertube\/api\/list(\?|$)/.test(u)) {
     if (listGate) await listGate
     return { ok: true, status: 200, json: async () => (statusStage === 'ready' ? LIST : LIST_EXPORT) }
   }
-  const body = url.includes('/browse') ? TAX : url.includes('/video') ? DETAIL : LIST
+  let body = LIST
+  if (u.includes('/browse') || u.includes('/taxonomy')) body = TAX
+  else if (u.includes('/video')) body = DETAIL
+  else if (u.includes('/related')) body = RELATED
+  else if (u.includes('/deps')) body = depsBody
+  else if (u.includes('/config')) body = { origin: 'http://127.0.0.1:54321', authUrl: null, mediaOrigin: 'http://127.0.0.1:18090' }
+  else if (u.includes('/prefs')) body = { likes: [], later: [], seen: [] }
+  else if (u.includes('/titles')) body = { entries: {} }
+  else if (u.includes('/mt')) body = { text: '' }
   return { ok: true, status: 200, json: async () => body }
 }
 
@@ -93,11 +149,48 @@ const listCalls = () =>
 /* ---------- 载入 client.js ---------- */
 
 let captured = null
+const winListeners = new Map()
+const historyEntries = ['']
+const historyCalls = []
 const win = {
   __ModuleLoader__: {
     load(cfg) {
       captured = cfg
     },
+  },
+  location: { pathname: '/', search: '', hash: '' },
+  addEventListener(type, fn) {
+    if (!winListeners.has(type)) winListeners.set(type, new Set())
+    winListeners.get(type).add(fn)
+  },
+  removeEventListener(type, fn) {
+    if (winListeners.has(type)) winListeners.get(type).delete(fn)
+  },
+}
+win.__emit = (type, event) => {
+  for (const fn of winListeners.get(type) || []) fn(event)
+}
+const applyHistoryUrl = (url) => {
+  const s = String(url || '')
+  const i = s.indexOf('#')
+  win.location.hash = i >= 0 ? s.slice(i) : ''
+}
+win.history = {
+  pushState(state, title, url) {
+    historyCalls.push(['push', url])
+    historyEntries.push(url)
+    applyHistoryUrl(url)
+  },
+  replaceState(state, title, url) {
+    historyCalls.push(['replace', url])
+    historyEntries[historyEntries.length - 1] = url
+    applyHistoryUrl(url)
+  },
+  back() {
+    historyCalls.push(['back'])
+    historyEntries.pop()
+    applyHistoryUrl(historyEntries[historyEntries.length - 1] || '')
+    win.__emit('popstate', {})
   },
 }
 const code = fs.readFileSync(CLIENT, 'utf8')
@@ -148,7 +241,7 @@ check('style injected', styleEls.length === 1 && styleEls[0].textContent.length 
 async function render() {
   let tree = null
   await act(async () => {
-    tree = create(React.createElement(main.comp, {}))
+    tree = create(React.createElement(main.comp, {}), { createNodeMock: makeNodeMock })
   })
   return tree
 }
@@ -305,9 +398,266 @@ check('unmounted without error', true)
 
 /* 重开面板：模块级缓存应命中，不重复请求列表 */
 const before = listCalls()
-const tree2 = await act(async () => create(React.createElement(main.comp, {})))
+const tree2 = await act(async () => create(React.createElement(main.comp, {}), { createNodeMock: makeNodeMock }))
 check('reopen skips list refetch', listCalls() === before, 'list calls ' + before + ' → ' + listCalls())
 check('reopen shows data immediately', /3 (个视频|videos)/.test(JSON.stringify(tree2.toJSON())), '')
+
+/* ---------- T02：播放失败可见、可兜底、可返回 ---------- */
+
+await act(async () => {
+  tree2.unmount()
+})
+
+function treeText(t) {
+  const out = []
+  const walk = (n) => {
+    if (n === null || n === undefined) return
+    if (typeof n === 'string' || typeof n === 'number') out.push(String(n))
+    else if (Array.isArray(n)) n.forEach(walk)
+    else if (n.children) n.children.forEach(walk)
+  }
+  walk(t.toJSON())
+  return out.join(' | ')
+}
+const findClass = (t, cls) => t.root.findAll((n) => n.props && String(n.props.className || '') === cls)
+const findButton = (t, re) => t.root.findAllByType('button').find((b) => re.test(String(b.props.children)))
+async function freshTree() {
+  let t = null
+  await act(async () => {
+    t = create(React.createElement(main.comp, {}), { createNodeMock: makeNodeMock })
+  })
+  return t
+}
+async function openFirstCard(t) {
+  const card = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-card')
+  await act(async () => {
+    card.props.onClick()
+  })
+}
+function resetRoute() {
+  win.location.hash = ''
+  historyEntries.length = 0
+  historyEntries.push('')
+}
+async function emitPlaybackError(kind, code) {
+  await act(async () => {
+    win.__emit('message', { data: { __ht: kind, code, vid: 'a1' } })
+  })
+}
+
+console.log('\n--- T02 playback resilience ---')
+
+/* yt-error：可见错误 + YouTube 行动 + 重试 + 本地兜底入口 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  await emitPlaybackError('yt-error', 153)
+  const body = treeText(t)
+  check('T02 yt-error visible', /153/.test(body) && /(YouTube|内嵌|embed)/i.test(body), body.slice(0, 180))
+  const yt = t.root.findAllByType('a').find((a) => String(a.props.href || '').includes('youtube.com/watch?v=a1'))
+  check('T02 yt-error YouTube action', !!yt, yt && yt.props.href)
+  const retry = findButton(t, /(重试播放器|Retry player)/)
+  check('T02 yt-error retry action', !!retry)
+  const local = findButton(t, /(尝试本地直连|Try local)/)
+  check('T02 yt-error local fallback action', !!local)
+  await act(async () => {
+    retry.props.onClick()
+  })
+  const restored =
+    t.root.findAllByType('iframe').length === 1 ||
+    t.root.findAll((n) => n.props && String(n.props.className || '').includes('ht-video-wait')).length === 1
+  check('T02 retry restores player slot', restored && !/Retry the player/.test(treeText(t)), '')
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* api-error：YouTube IFrame API 脚本加载失败也有文案 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  await emitPlaybackError('api-error', null)
+  check('T02 api-error visible', /(播放器脚本|player script)/i.test(treeText(t)), treeText(t).slice(0, 160))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 缺依赖：给出 yt-dlp / ffmpeg 的具体安装提示，而不是黑屏 */
+{
+  resetRoute()
+  depsBody = {
+    ytdlp: { ok: false, hint: 'pip install -U yt-dlp' },
+    ffmpeg: { ok: false, hint: '安装 ffmpeg 并加入 PATH' },
+  }
+  const t = await freshTree()
+  await openFirstCard(t)
+  await emitPlaybackError('yt-error', 150)
+  const local = findButton(t, /(尝试本地直连|Try local)/)
+  await act(async () => {
+    local.props.onClick()
+    await Promise.resolve()
+  })
+  const body = treeText(t)
+  check('T02 yt-dlp dependency hint', /yt-dlp/.test(body) && /pip install -U yt-dlp/.test(body), body.slice(0, 200))
+  check('T02 ffmpeg dependency hint', /ffmpeg/.test(body) && /加入 PATH|PATH/.test(body), body.slice(0, 200))
+  check('T02 no local video when deps missing', t.root.findAllByType('video').length === 0, '')
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 依赖齐全：本地直连可用，并可在流式与缓存播放间切换 */
+{
+  resetRoute()
+  depsBody = {
+    ytdlp: { ok: true, version: 'test' },
+    ffmpeg: { ok: true, version: 'test' },
+    whisper: { ok: false },
+  }
+  const t = await freshTree()
+  await openFirstCard(t)
+  await emitPlaybackError('yt-error', 153)
+  const local = findButton(t, /(尝试本地直连|Try local)/)
+  await act(async () => {
+    local.props.onClick()
+    await Promise.resolve()
+  })
+  const video = t.root.findAllByType('video')[0]
+  check(
+    'T02 local fallback uses stream',
+    !!video && /\/stream\?vid=a1$/.test(String(video.props.src)),
+    video && video.props.src,
+  )
+  const cacheBtn = findButton(t, /(缓存播放|cached playback)/i)
+  check('T02 cached playback action', !!cacheBtn)
+  await act(async () => {
+    cacheBtn.props.onClick()
+  })
+  const video2 = t.root.findAllByType('video')[0]
+  check(
+    'T02 cached playback uses media',
+    !!video2 && /\/media\?vid=a1$/.test(String(video2.props.src)),
+    video2 && video2.props.src,
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+console.log('\n--- T02 navigation ---')
+
+/* 返回列表：保留搜索筛选并恢复滚动位置 */
+{
+  resetRoute()
+  const t = await freshTree()
+  const input = t.root.findAllByType('input')[0]
+  await act(async () => {
+    input.props.onChange({ target: { value: 'karpathy' } })
+  })
+  const scroller = findClass(t, 'ht-scroll')[0]
+  scroller.instance.scrollTop = 420
+  await openFirstCard(t)
+  const back = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-back')
+  await act(async () => {
+    back.props.onClick()
+  })
+  const body = treeText(t)
+  check('T02 back keeps filter', /1 (个视频|video)/.test(body) && body.includes('Intro to large language models'), body.slice(0, 120))
+  const restored = findClass(t, 'ht-scroll')[0]
+  check('T02 back restores list scroll', !!restored && restored.instance.scrollTop === 420, restored && String(restored.instance.scrollTop))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 打开相关视频：新播放页从顶部开始 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  const watch = findClass(t, 'ht-watch')[0]
+  watch.instance.scrollTop = 300
+  const rel = findClass(t, 'ht-rel')
+  check('T02 related items rendered', rel.length > 0, String(rel.length))
+  await act(async () => {
+    rel[0].props.onClick()
+  })
+  check('T02 related opens new video', treeText(t).includes('A talk about type systems'), treeText(t).slice(0, 120))
+  const watch2 = findClass(t, 'ht-watch')[0]
+  check('T02 related starts at top', !!watch2 && watch2.instance.scrollTop === 0, watch2 && String(watch2.instance.scrollTop))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* Esc 返回；地址状态可深链恢复 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  await act(async () => {
+    global.document.__emit('keydown', { key: 'Escape', metaKey: false, ctrlKey: false, altKey: false })
+  })
+  check('T02 Escape returns to list', /3 (个视频|videos)/.test(treeText(t)), treeText(t).slice(0, 100))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+{
+  resetRoute()
+  win.location.hash = '#ht-watch=c3'
+  const t = await freshTree()
+  check('T02 deep link opens video', treeText(t).includes('Intro to large language models'), treeText(t).slice(0, 140))
+  await act(async () => {
+    global.document.__emit('keydown', { key: 'Escape', metaKey: false, ctrlKey: false, altKey: false })
+  })
+  check('T02 deep link Escape clears state', win.location.hash === '' && /3 (个视频|videos)/.test(treeText(t)), win.location.hash + ' / ' + treeText(t).slice(0, 80))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 浏览器 back：watch 写入地址状态，popstate 回到列表 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  check('T02 watch writes address state', win.location.hash === '#ht-watch=a1', win.location.hash)
+  await act(async () => {
+    win.history.back()
+  })
+  check('T02 browser back returns to list', /3 (个视频|videos)/.test(treeText(t)), treeText(t).slice(0, 100))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 窄布局：相关推荐/AI 的入口在评论之前，且有明确跳转按钮 */
+{
+  resetRoute()
+  const t = await freshTree()
+  await openFirstCard(t)
+  const raw = JSON.stringify(t.toJSON())
+  const railAt = raw.indexOf('"ht-rail"')
+  const commentsAt = raw.indexOf('"ht-comments"')
+  check('T02 rail before comments in DOM', railAt >= 0 && commentsAt >= 0 && railAt < commentsAt, railAt + '/' + commentsAt)
+  const jump = findButton(t, /(相关推荐与 AI|Related & AI)/)
+  check('T02 rail jump entry present', !!jump)
+  const rail = findClass(t, 'ht-rail')[0]
+  if (jump && rail) {
+    await act(async () => {
+      jump.props.onClick()
+    })
+  }
+  check('T02 rail jump scrolls to rail', !!rail && rail.instance.scrolledIntoView === true, rail && String(rail.instance.scrolledIntoView))
+  await act(async () => {
+    t.unmount()
+  })
+}
 
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS'))
 process.exit(failures ? 1 : 0)

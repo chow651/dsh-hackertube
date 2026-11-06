@@ -60,6 +60,118 @@ window.__ModuleLoader__.load({
       titlesP: null,
       playhead: null,
       taxLang: null,
+      /* 播放错误按视频 id 存：中转页的 yt-error / api-error 会先到全局监听，再由观看页订阅 */
+      playback: new Map(),
+      playbackSubs: new Set(),
+      activeWatchVid: null,
+    }
+
+    /* ---------------- 观看地址状态 ----------------
+     * 面板没有独立路由，用 hash 里的 ht-watch 片段保存当前视频。
+     * 打开视频时 pushState，相关视频用 replaceState，浏览器后退走 popstate。
+     */
+    const WATCH_HASH_RE = /(?:[#&])ht-watch=([A-Za-z0-9_-]{1,20})/
+
+    function readWatchVid() {
+      try {
+        const loc = typeof window !== 'undefined' && window.location ? window.location : null
+        if (!loc) return null
+        const m = WATCH_HASH_RE.exec(String(loc.hash || ''))
+        return m ? m[1] : null
+      } catch {
+        return null
+      }
+    }
+
+    function watchHashFor(vid, current) {
+      const rest = String(current || '')
+        .replace(/[#&]?ht-watch=[A-Za-z0-9_-]{1,20}/g, '')
+        .replace(/^#+/, '')
+        .replace(/^&+|&+$/g, '')
+      if (!vid) return rest ? '#' + rest : ''
+      return '#' + (rest ? rest + '&' : '') + 'ht-watch=' + vid
+    }
+
+    /** 写入观看地址；push=true 时新增历史条目，否则原地替换。返回是否成功。 */
+    function setWatchHash(vid, mode) {
+      try {
+        const w = typeof window !== 'undefined' ? window : null
+        const loc = w && w.location ? w.location : null
+        if (!loc) return false
+        const next = watchHashFor(vid, loc.hash)
+        const url = String(loc.pathname || '') + String(loc.search || '') + next
+        const hist = w.history || null
+        if (mode === 'push' && hist && typeof hist.pushState === 'function') {
+          hist.pushState({ htWatch: vid || null }, '', url)
+          return true
+        }
+        if (hist && typeof hist.replaceState === 'function') {
+          hist.replaceState({ htWatch: vid || null }, '', url)
+          return true
+        }
+        if (typeof loc.hash === 'string') {
+          loc.hash = next
+          return true
+        }
+      } catch {
+        /* 自定义协议下 history 可能受限：至少把 hash 改掉，让地址仍可恢复 */
+        try {
+          const w = typeof window !== 'undefined' ? window : null
+          if (w && w.location) w.location.hash = watchHashFor(vid, w.location.hash)
+        } catch {
+          /* 两个通道都不可用就不强求地址状态 */
+        }
+      }
+      return false
+    }
+
+    function setPlaybackError(vid, error) {
+      if (!vid) return
+      if (error) mem.playback.set(vid, error)
+      else mem.playback.delete(vid)
+      for (const fn of mem.playbackSubs) {
+        try {
+          fn(vid, error)
+        } catch {
+          /* 单个订阅失败不影响其它观看页 */
+        }
+      }
+    }
+
+    /** 把 YouTube 的 onError 数字码翻译成用户能判断的下一步。 */
+    function playbackErrorCopy(error, lang) {
+      if (!error || error.kind === 'api-error') {
+        return {
+          title: tx(lang, 'YouTube 播放器脚本加载失败', 'Could not load the YouTube player script'),
+          hint: tx(
+            lang,
+            '通常是网络或浏览器拦截了 youtube.com 的脚本。可以在 YouTube 上直接观看，或尝试本地直连。',
+            'The youtube.com script was blocked by the network or browser. Open it on YouTube, or try a local stream.',
+          ),
+        }
+      }
+      const code = Number(error.code)
+      const hasCode = error.code !== null && error.code !== undefined && Number.isFinite(code)
+      const known = {
+        2: ['视频 ID 无效', 'Invalid video ID'],
+        5: ['浏览器无法播放这个 HTML5 视频', 'This HTML5 video cannot be played in this browser'],
+        100: ['视频不存在或已删除', 'The video is missing or has been removed'],
+        101: ['视频作者不允许内嵌播放', 'The owner does not allow embedded playback'],
+        150: ['视频作者不允许内嵌播放', 'The owner does not allow embedded playback'],
+        153: ['YouTube 无法确认播放来源（错误 153）', 'YouTube could not verify the playback origin (error 153)'],
+      }
+      const label = known[code] || [
+        tx(lang, 'YouTube 拒绝了内嵌播放', 'YouTube refused embedded playback') + (hasCode ? '（' + code + '）' : ''),
+        'YouTube refused embedded playback' + (hasCode ? ' (error ' + code + ')' : ''),
+      ]
+      return {
+        title: lang === 'zh' ? label[0] : label[1],
+        hint: tx(
+          lang,
+          '可以重试播放器、在 YouTube 上直接观看，或尝试用本机 yt-dlp 直连播放。',
+          'Retry the player, open it on YouTube, or try a local stream through yt-dlp on this machine.',
+        ),
+      }
     }
 
     const GRID_STEP = 60
@@ -199,22 +311,20 @@ window.__ModuleLoader__.load({
     function loadMediaOrigin() {
       return new Promise((resolve) => {
         let tries = 0
-        const tick = () => {
+        const attempt = () => {
           if (tries >= 30) return resolve(mem.mediaOrigin || null)
           tries += 1
-          setTimeout(() => {
-            getJSON('/hackertube/api/config')
-              .then((d) => {
-                if (d && d.mediaOrigin) {
-                  mem.mediaOrigin = String(d.mediaOrigin)
-                  return resolve(mem.mediaOrigin)
-                }
-                tick()
-              })
-              .catch(() => tick())
-          }, 150)
+          getJSON('/hackertube/api/config')
+            .then((d) => {
+              if (d && d.mediaOrigin) {
+                mem.mediaOrigin = String(d.mediaOrigin)
+                return resolve(mem.mediaOrigin)
+              }
+              setTimeout(attempt, 150)
+            })
+            .catch(() => setTimeout(attempt, 150))
         }
-        tick()
+        attempt()
       })
     }
 
@@ -363,15 +473,20 @@ window.__ModuleLoader__.load({
 .ht-sentinel{height:1px}
 .ht-watch{flex:1;min-height:0;overflow-y:auto;padding:22px 24px 16px;container-type:inline-size}
 .ht-watch-inner{max-width:1580px;margin:0 auto;display:grid;grid-template-columns:minmax(0,1fr) 388px;
+  grid-template-areas:"main rail" "comments rail";
   align-items:start;gap:28px;padding-top:2px}
 .ht-watch .ht-toolbar{margin:0 auto 12px;max-width:1580px}
-.ht-primary{min-width:0}
-.ht-rail{position:sticky;top:0;align-self:start;display:flex;flex-direction:column;
+.ht-primary{grid-area:main;min-width:0}
+.ht-rail{grid-area:rail;position:sticky;top:0;align-self:start;display:flex;flex-direction:column;
   height:calc(100vh - 70px);min-height:420px}
 /* 面板变窄时右栏落到正文下方：容器查询，跟随面板宽度而不是视口宽度 */
 @container (max-width:1024px){
-  .ht-watch-inner{grid-template-columns:minmax(0,1fr)}
+  .ht-watch-inner{grid-template-columns:minmax(0,1fr);grid-template-areas:"main" "rail" "comments"}
   .ht-rail{position:static;height:min(640px,70vh)}
+}
+.ht-back.ht-rail-jump{display:none}
+@container (max-width:1024px){
+  .ht-back.ht-rail-jump{display:inline-flex}
 }
 .ht-rail-head{position:relative;flex:none;display:flex;align-items:center;gap:4px;padding:4px;border-radius:999px;
   background:var(--dsw-alias-interactive-bg-hover)}
@@ -436,7 +551,7 @@ window.__ModuleLoader__.load({
   background:rgba(255,102,0,.12);color:#b4460a;font-size:12px;font-weight:600}
 .ht-hn-mark i{width:5px;height:5px;border-radius:50%;background:#ff6600;display:inline-block}
 /* 评论区 */
-.ht-comments{margin:30px 0 0;padding:22px 0 8px;border-top:1px solid var(--dsw-alias-border-l1)}
+.ht-comments{grid-area:comments;margin:0;padding:22px 0 8px;border-top:1px solid var(--dsw-alias-border-l1)}
 .ht-comments h2{display:flex;align-items:baseline;gap:8px;margin:0 0 4px;font-size:15px;font-weight:600}
 .ht-comments h2 span{font-size:12.5px;font-weight:500;color:var(--dsw-alias-label-tertiary);
   font-variant-numeric:tabular-nums}
@@ -514,9 +629,25 @@ window.__ModuleLoader__.load({
 .ht-md a{color:var(--dsw-alias-label-primary);text-decoration:underline;text-underline-offset:2px}
 .ht-md strong{font-weight:600}
 .ht-md em{font-style:italic}
-.ht-player{aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#000}
+.ht-player{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#000}
 .ht-player iframe{width:100%;height:100%;border:0;display:block}
 .ht-video{width:100%;height:100%;display:block;background:#000;object-fit:contain}
+/* 播放失败不再留一块黑屏：覆盖层给出原因、下一步和兜底入口 */
+.ht-player-error{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:8px;
+  padding:20px 24px;color:#f4f4f5;
+  background:linear-gradient(180deg,#1b1c1f 0%,#0c0d0f 100%)}
+.ht-player-error b{font-size:15px;font-weight:600}
+.ht-player-error p{margin:0;max-width:64ch;font-size:12.5px;line-height:1.65;color:#c9c9cd}
+.ht-player-error-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.ht-error-btn{display:inline-flex;align-items:center;height:32px;padding:0 14px;border-radius:16px;
+  border:0;cursor:pointer;font:inherit;font-size:12.5px;font-weight:600;text-decoration:none;
+  background:#f4f4f5;color:#111}
+.ht-error-btn:hover{background:#fff}
+.ht-error-btn.ghost{background:transparent;border:1px solid rgba(255,255,255,.35);color:#f4f4f5}
+.ht-error-btn.ghost:hover{background:rgba(255,255,255,.1)}
+.ht-error-dep{margin:2px 0 0;font-size:12px;line-height:1.6;color:#ffb27a}
+.ht-player-note{margin:8px 0 0;display:flex;flex-wrap:wrap;align-items:center;gap:10px;
+  font-size:12.5px;color:var(--dsw-alias-label-secondary)}
 .ht-back{height:32px;padding:0 12px;border-radius:16px;border:0;cursor:pointer;font:inherit;
   background:var(--dsw-alias-bg-layer-1);color:inherit;font-weight:500;display:inline-flex;
   align-items:center;gap:6px;margin-bottom:16px}
@@ -997,7 +1128,7 @@ window.__ModuleLoader__.load({
      * 右栏：相关推荐与 AI 问答共用一栏，分段控件换页，各自独立滚动。
      * 默认停在相关推荐，看视频的人不需要先关掉提问框。
      */
-    function SideRail({ vid, lang = 'zh', related, pane, onPane, onOpen }) {
+    function SideRail({ vid, lang = 'zh', related, pane, onPane, onOpen, anchorRef }) {
       const [messages, setMessages] = useState([])
       const [input, setInput] = useState('')
       const [busy, setBusy] = useState(false)
@@ -1206,7 +1337,7 @@ window.__ModuleLoader__.load({
 
       return h(
         'aside',
-        { className: 'ht-rail', 'data-pane': pane },
+        { className: 'ht-rail', 'data-pane': pane, ref: anchorRef },
         h(
           'div',
           { className: 'ht-rail-head', role: 'tablist' },
@@ -1230,6 +1361,14 @@ window.__ModuleLoader__.load({
       const [ctr, setCtr] = useState({})
       const [ctrOn, setCtrOn] = useState({})
       const [ctrBusy, setCtrBusy] = useState({})
+      const [playErr, setPlayErr] = useState(null)
+      const [playerKey, setPlayerKey] = useState(0)
+      const [localMode, setLocalMode] = useState('idle')
+      const [localBusy, setLocalBusy] = useState(false)
+      const [depHint, setDepHint] = useState([])
+      const [localErr, setLocalErr] = useState('')
+      const watchScrollRef = useRef(null)
+      const railRef = useRef(null)
 
       useEffect(() => {
         let alive = true
@@ -1280,6 +1419,31 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
+      }, [item.v])
+
+      /* 中转页的错误消息先进模块级缓存，再由当前观看页订阅；切视频时旧错误不跟过来 */
+      useEffect(() => {
+        mem.playback.delete(item.v)
+        setPlayErr(null)
+        setLocalMode('idle')
+        setLocalBusy(false)
+        setDepHint([])
+        setLocalErr('')
+        mem.activeWatchVid = item.v
+        const sub = (vid, error) => {
+          if (vid === item.v) setPlayErr(error)
+        }
+        mem.playbackSubs.add(sub)
+        return () => {
+          mem.playbackSubs.delete(sub)
+          if (mem.activeWatchVid === item.v) mem.activeWatchVid = null
+        }
+      }, [item.v])
+
+      /* 相关视频是同一个组件换 item：滚动容器不会自动归零，必须显式回到顶部 */
+      useEffect(() => {
+        const el = watchScrollRef.current
+        if (el) el.scrollTop = 0
       }, [item.v])
 
       const hn = detail && detail.hn ? detail.hn : null
@@ -1339,13 +1503,93 @@ window.__ModuleLoader__.load({
         runCommentTr([key])
       }
 
+      const retryPlayer = () => {
+        mem.playback.delete(item.v)
+        setPlayErr(null)
+        setLocalMode('idle')
+        setLocalErr('')
+        setDepHint([])
+        setPlayerKey((k) => k + 1)
+      }
+
+      const dependencyHints = (d) => {
+        const missing = []
+        if (!d || !d.ytdlp || !d.ytdlp.ok) {
+          missing.push(
+            tx(lang, '缺少 yt-dlp：', 'yt-dlp is missing: ') +
+              ((d && d.ytdlp && d.ytdlp.hint) || 'pip install -U yt-dlp'),
+          )
+        }
+        if (!d || !d.ffmpeg || !d.ffmpeg.ok) {
+          missing.push(
+            tx(lang, '缺少 ffmpeg：', 'ffmpeg is missing: ') +
+              ((d && d.ffmpeg && d.ffmpeg.hint) || 'install ffmpeg and add it to PATH'),
+          )
+        }
+        return missing
+      }
+
+      /* 播放失败时就探测一次依赖：缺什么直接写在错误层里，不用用户再点一次 */
+      useEffect(() => {
+        if (!playErr) return undefined
+        let alive = true
+        getJSON('/hackertube/api/deps')
+          .then((d) => {
+            if (alive) setDepHint(dependencyHints(d))
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [playErr, item.v, lang])
+
+      /* 用户主动点「尝试本地直连」才起流；缺什么就报什么，不自动装环境 */
+      const startLocal = () => {
+        if (localBusy) return
+        setLocalBusy(true)
+        setDepHint([])
+        setLocalErr('')
+        getJSON('/hackertube/api/deps')
+          .then((d) => {
+            const missing = dependencyHints(d)
+            if (missing.length) {
+              setDepHint(missing)
+              return
+            }
+            setLocalMode('stream')
+          })
+          .catch((e) => {
+            setDepHint([tx(lang, '依赖探测失败：', 'Dependency check failed: ') + String((e && e.message) || e)])
+          })
+          .then(() => setLocalBusy(false))
+      }
+
+      const jumpToRail = () => {
+        const el = railRef.current
+        if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+      }
+
+      const errCopy = playbackErrorCopy(playErr, lang)
+      const localBase = origin || ''
+      const localSrc =
+        (localBase || '/hackertube/api') +
+        '/' +
+        (localMode === 'media' ? 'media' : 'stream') +
+        '?vid=' +
+        encodeURIComponent(item.v)
+
       return h(
         'div',
-        { className: 'ht-watch' },
+        { className: 'ht-watch', ref: watchScrollRef },
         h(
           'div',
           { className: 'ht-toolbar' },
           h('button', { type: 'button', className: 'ht-back', onClick: onBack }, tx(lang, '← 返回列表', '← Back to list')),
+          h(
+            'button',
+            { type: 'button', className: 'ht-back ht-rail-jump', onClick: jumpToRail },
+            tx(lang, '相关推荐与 AI ↓', 'Related & AI ↓'),
+          ),
         ),
         h(
           'div',
@@ -1356,19 +1600,89 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'ht-player' },
-              /* 中转页地址是异步拿到的；未就绪前不渲染 iframe，避免先请求一个必然 404 的相对路径 */
-              origin
-                ? h('iframe', {
+              localMode !== 'idle'
+                ? h('video', {
+                    key: 'local-' + localMode,
                     className: 'ht-video',
-                    title: item.t,
-                    src: origin + '/embed?vid=' + encodeURIComponent(item.v) + '&lang=' + (lang === 'zh' ? 'zh' : 'en'),
-                    allow:
-                      'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
-                    allowFullScreen: true,
-                    onLoad: () => beacon('iframe-loaded', { vid: item.v }),
+                    src: localSrc,
+                    controls: true,
+                    autoPlay: true,
+                    poster: item.th || undefined,
+                    onError: () =>
+                      setLocalErr(
+                        tx(
+                          lang,
+                          '本地直连播放失败，可以在 YouTube 上打开。',
+                          'Local playback failed; open it on YouTube instead.',
+                        ),
+                      ),
                   })
-                : h('div', { className: 'ht-video ht-video-wait' }, tx(lang, '正在准备播放器…', 'Preparing player…')),
+                : playErr
+                  ? h(
+                      'div',
+                      { className: 'ht-player-error', role: 'alert' },
+                      h('b', null, errCopy.title),
+                      h('p', null, errCopy.hint),
+                      depHint.map((line, i) => h('p', { key: 'dep' + i, className: 'ht-error-dep' }, line)),
+                      localErr ? h('p', { className: 'ht-error-dep' }, localErr) : null,
+                      h(
+                        'div',
+                        { className: 'ht-player-error-actions' },
+                        h('button', { type: 'button', className: 'ht-error-btn', onClick: retryPlayer }, tx(lang, '重试播放器', 'Retry player')),
+                        h(
+                          'a',
+                          {
+                            className: 'ht-error-btn',
+                            href: 'https://www.youtube.com/watch?v=' + item.v,
+                            target: '_blank',
+                            rel: 'noreferrer noopener',
+                          },
+                          tx(lang, '在 YouTube 打开', 'Open on YouTube'),
+                        ),
+                        h(
+                          'button',
+                          { type: 'button', className: 'ht-error-btn ghost', onClick: startLocal, disabled: localBusy },
+                          localBusy
+                            ? tx(lang, '正在检查依赖…', 'Checking dependencies…')
+                            : tx(lang, '尝试本地直连', 'Try local playback'),
+                        ),
+                      ),
+                    )
+                  : origin
+                    ? h('iframe', {
+                        key: 'embed-' + playerKey,
+                        className: 'ht-video',
+                        title: item.t,
+                        src: origin + '/embed?vid=' + encodeURIComponent(item.v) + '&lang=' + (lang === 'zh' ? 'zh' : 'en'),
+                        allow:
+                          'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
+                        allowFullScreen: true,
+                        onLoad: () => beacon('iframe-loaded', { vid: item.v }),
+                      })
+                    : h('div', { className: 'ht-video ht-video-wait' }, tx(lang, '正在准备播放器…', 'Preparing player…')),
             ),
+            localMode !== 'idle'
+              ? h(
+                  'p',
+                  { className: 'ht-player-note' },
+                  localMode === 'stream'
+                    ? tx(lang, '本地直连为流式播放，暂不支持拖动。', 'Local stream playback does not support seeking yet.')
+                    : tx(lang, '正在播放本地缓存，可拖动进度。', 'Playing the local cache; seeking is supported.'),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-link',
+                      onClick: () => setLocalMode((m) => (m === 'stream' ? 'media' : 'stream')),
+                    },
+                    localMode === 'stream'
+                      ? tx(lang, '改用缓存播放（可拖动）', 'Use cached playback (seekable)')
+                      : tx(lang, '改用流式播放', 'Use stream playback'),
+                  ),
+                  h('button', { type: 'button', className: 'ht-link', onClick: retryPlayer }, tx(lang, '返回内嵌播放器', 'Back to embedded player')),
+                  localErr ? h('span', { className: 'ht-error-dep' }, localErr) : null,
+                )
+              : null,
             h('h1', { className: 'ht-h1' }, titleOf(item, lang)),
             item.c ? h('p', { className: 'ht-channel' }, item.c) : null,
             h(
@@ -1497,8 +1811,19 @@ window.__ModuleLoader__.load({
                     : null,
                 )
               : null,
-            detail
-              ? h(
+          ),
+          h(SideRail, {
+            key: 'rail',
+            vid: item.v,
+            lang,
+            related,
+            pane: railPane,
+            onPane: setRailPane,
+            onOpen: onOpenItem,
+            anchorRef: railRef,
+          }),
+          detail
+            ? h(
                   'section',
                   { className: 'ht-comments' },
                   h(
@@ -1601,16 +1926,6 @@ window.__ModuleLoader__.load({
                       ),
                 )
               : null,
-          ),
-          h(SideRail, {
-            key: 'rail',
-            vid: item.v,
-            lang,
-            related,
-            pane: railPane,
-            onPane: setRailPane,
-            onOpen: onOpenItem,
-          }),
         ),
       )
     }
@@ -1986,6 +2301,10 @@ window.__ModuleLoader__.load({
       const [authUrl, setAuthUrl] = useState(null)
       const sentinelRef = useRef(null)
       const rootRef = useRef(null)
+      /* 列表滚动位置保存在 HtRoot：进观看页时列表卸载，回来时要原位恢复 */
+      const listScrollRef = useRef(null)
+      const listScrollTop = useRef(0)
+      const watchPushedRef = useRef(false)
 
       /* 桌面端拿一个带 launch token 的 HTTP 地址，用于在新窗口获得安全上下文 */
       useEffect(() => {
@@ -2071,11 +2390,49 @@ window.__ModuleLoader__.load({
         }
       }, [reloadKey])
 
+      /* 深链恢复：地址里带 ht-watch 的视频在列表就绪后直接打开 */
+      useEffect(() => {
+        if (phase !== 'ready' || watching) return
+        const vid = readWatchVid()
+        if (!vid) return
+        const hit = items.find((it) => it.v === vid)
+        if (hit) setWatching(hit)
+      }, [items, phase, watching])
+
+      /* 浏览器前进/后退与 hash 变化保持同一份观看状态 */
+      useEffect(() => {
+        const w = typeof window !== 'undefined' ? window : null
+        if (!w || typeof w.addEventListener !== 'function') return undefined
+        const sync = () => {
+          const vid = readWatchVid()
+          if (!vid) {
+            watchPushedRef.current = false
+            setWatching(null)
+            return
+          }
+          const hit = (mem.list || items || []).find((it) => it.v === vid)
+          if (hit) setWatching(hit)
+        }
+        w.addEventListener('popstate', sync)
+        w.addEventListener('hashchange', sync)
+        return () => {
+          w.removeEventListener('popstate', sync)
+          w.removeEventListener('hashchange', sync)
+        }
+      }, [items])
+
       const retry = () => {
         setErr('')
         setPhase('loading')
         setReloadKey((k) => k + 1)
       }
+
+      /* 从观看页回来：列表重新挂载后把滚动位置放回原处 */
+      useEffect(() => {
+        if (watching || view !== 'home') return
+        const el = listScrollRef.current
+        if (el && listScrollTop.current) el.scrollTop = listScrollTop.current
+      }, [watching, view])
 
       const areas = useMemo(() => {
         const list = tax && Array.isArray(tax.areas) ? tax.areas : []
@@ -2256,7 +2613,33 @@ window.__ModuleLoader__.load({
       const openItem = (it) => {
         if (!it) return
         markSeen(it.v)
+        if (!watching) {
+          const el = listScrollRef.current
+          if (el) listScrollTop.current = el.scrollTop || 0
+          watchPushedRef.current = setWatchHash(it.v, 'push')
+        } else if (watching.v !== it.v) {
+          /* 相关视频是在同一次观看里换片：替换当前历史条目，Esc 一次仍回列表 */
+          setWatchHash(it.v, 'replace')
+        }
         setWatching(it)
+      }
+
+      const closeWatch = () => {
+        if (watchPushedRef.current) {
+          watchPushedRef.current = false
+          try {
+            const w = typeof window !== 'undefined' ? window : null
+            if (w && w.history && typeof w.history.back === 'function') {
+              w.history.back()
+              setWatching(null)
+              return
+            }
+          } catch {
+            /* history 不可用时退回替换地址 */
+          }
+        }
+        setWatchHash(null, 'replace')
+        setWatching(null)
       }
 
       /* 键盘快捷键：与站点一致的那一套 */
@@ -2267,8 +2650,18 @@ window.__ModuleLoader__.load({
           const el = document.activeElement
           const typing = el && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable)
           if (e.key === 'Escape') {
-            if (typing) el.blur()
-            setHelpOpen(false)
+            if (typing) {
+              el.blur()
+              return
+            }
+            if (helpOpen) {
+              setHelpOpen(false)
+              return
+            }
+            if (watching) {
+              closeWatch()
+              return
+            }
             return
           }
           if (typing) return
@@ -2285,7 +2678,8 @@ window.__ModuleLoader__.load({
           }
           if (e.key === 'h' || e.key === 'H') {
             setView('home')
-            setWatching(null)
+            if (watching) closeWatch()
+            else setWatching(null)
             return
           }
           if (e.key === 'j' || e.key === 'k' || e.key === 'Enter') {
@@ -2316,20 +2710,17 @@ window.__ModuleLoader__.load({
         }
         document.addEventListener('keydown', onKey)
         return () => document.removeEventListener('keydown', onKey)
-      }, [watching, toggle])
+      }, [watching, toggle, helpOpen])
 
       if (watching) {
         return h(WatchView, {
           item: watching,
           lang,
-          onBack: () => setWatching(null),
+          onBack: closeWatch,
           liked: saved.likes.indexOf(watching.v) >= 0,
           savedLater: saved.later.indexOf(watching.v) >= 0,
           onToggle: toggle,
-          onOpenItem: (r) => {
-            markSeen(r.v)
-            setWatching({ v: r.v, t: r.t, c: r.c, d: r.d, w: r.w, th: r.th, p: r.p })
-          },
+          onOpenItem: openItem,
         })
       }
 
@@ -2520,12 +2911,15 @@ window.__ModuleLoader__.load({
         view === 'home' && phase === 'loading' ? h(Skeleton, { label: loadingLabel }) : null,
         view === 'home' ? (h(
           'div',
-          { className: 'ht-scroll' },
+          {
+            className: 'ht-scroll',
+            ref: listScrollRef,
+            onScroll: (e) => {
+              listScrollTop.current = e.currentTarget.scrollTop || 0
+            },
+          },
           phase === 'ready' && staleText ? h('div', { className: 'ht-stale', role: 'status' }, staleText) : null,
           phase === 'ready' && stageText ? h('div', { className: 'ht-stagebar', role: 'status' }, stageText) : null,
-          phase === 'loading'
-            ? null
-            : null,
           phase === 'error'
             ? h(
                 'div',
@@ -2656,6 +3050,18 @@ window.__ModuleLoader__.load({
             if (data.__ht === 'time') {
               mem.playhead = { t: Number(data.t) || 0, d: Number(data.d) || 0, at: Date.now() }
               return
+            }
+            if (data.__ht === 'yt-error' || data.__ht === 'api-error') {
+              setPlaybackError(String(data.vid || mem.activeWatchVid || ''), {
+                kind: data.__ht,
+                code: data.code == null ? null : Number(data.code),
+              })
+              beacon('playback-error', data)
+              return
+            }
+            if (data.__ht === 'relay-loaded') {
+              /* 重试后播放器真正就绪，清掉旧的错误覆盖层 */
+              setPlaybackError(String(data.vid || mem.activeWatchVid || ''), null)
             }
             beacon('relay-msg', data)
           }
