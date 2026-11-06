@@ -56,12 +56,23 @@ window.__ModuleLoader__.load({
       mediaOrigin: null,
       titles: {},
       titlesP: null,
-      playhead: null,
       taxLang: null,
+      /* 观看会话按视频 id 存：播放位置不能被下一条视频继承，暂停后也要保留 */
+      sessions: new Map(),
+      playheadSubs: new Set(),
       /* 播放错误按视频 id 存：中转页的 yt-error / api-error 会先到全局监听，再由观看页订阅 */
       playback: new Map(),
       playbackSubs: new Set(),
       activeWatchVid: null,
+    }
+
+    function watchSession(vid) {
+      let session = mem.sessions.get(vid)
+      if (!session) {
+        session = { playhead: null }
+        mem.sessions.set(vid, session)
+      }
+      return session
     }
 
     /* ---------------- 观看地址状态 ----------------
@@ -540,6 +551,16 @@ window.__ModuleLoader__.load({
 .ht-rail-ai{display:flex;flex-direction:column;overflow:hidden}
 .ht-rail-log{flex:1;min-height:0;overflow-y:auto;padding-right:4px}
 .ht-rail-hint{margin:0 0 10px;font-size:12.5px;line-height:1.65;color:var(--dsw-alias-label-secondary)}
+.ht-rail-pos{margin:0 0 8px;font-size:11.5px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.ht-sub-stage{margin:0 0 10px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);
+  display:flex;align-items:center;gap:6px}
+.ht-sub-stage::before{content:"";width:6px;height:6px;border-radius:50%;background:#ff6600;
+  animation:ht-sub-pulse 1.1s ease-in-out infinite}
+@keyframes ht-sub-pulse{0%,100%{opacity:.35}50%{opacity:1}}
+.ht-sub-note{margin:0 0 10px;padding:7px 10px;border-radius:8px;font-size:12px;line-height:1.55;
+  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
+.ht-sub-note.ht-sub-ok{color:var(--dsw-alias-label-secondary)}
+.ht-sub-note.ht-sub-no-captions,.ht-sub-note.ht-sub-needs-cookies,.ht-sub-note.ht-sub-timeout{border-left:2px solid #ff6600}
 .ht-rail-suggest{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
 .ht-rail-suggest button{font:inherit;font-size:12.5px;padding:7px 12px;border-radius:999px;cursor:pointer;
   border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base);
@@ -1157,18 +1178,34 @@ window.__ModuleLoader__.load({
      * 右栏：相关推荐与 AI 问答共用一栏，分段控件换页，各自独立滚动。
      * 默认停在相关推荐，看视频的人不需要先关掉提问框。
      */
-    function SideRail({ vid, lang = 'zh', related, pane, onPane, onOpen, anchorRef }) {
+    function SideRail({ vid, lang = 'zh', related, pane, onPane, onOpen, anchorRef, playhead }) {
       const [messages, setMessages] = useState([])
       const [input, setInput] = useState('')
       const [busy, setBusy] = useState(false)
+      const [subtitle, setSubtitle] = useState(null)
+      const [stage, setStage] = useState(null)
+
+      /* 切换视频就是新的观看会话：旧消息、旧字幕状态和旧输入都不跟过去 */
+      useEffect(() => {
+        setMessages([])
+        setInput('')
+        setSubtitle(null)
+        setStage(null)
+      }, [vid])
 
       const send = () => {
         const q = input.trim()
         if (!q || busy) return
         setInput('')
+        const session = watchSession(vid)
+        const at = Number(playhead && playhead.t)
+        const lastPlayhead = Number.isFinite(at) && at > 0 ? at : Number(session.playhead && session.playhead.t) || 0
+        const history = messages
+          .filter((m) => m && m.text && !m.pending)
+          .map((m) => ({ role: m.role === 'ai' ? 'assistant' : 'user', text: String(m.text).slice(0, 4000) }))
         setMessages((m) => m.concat([{ role: 'user', text: q }, { role: 'ai', text: '', pending: true }]))
         setBusy(true)
-        const at = mem.playhead && Date.now() - mem.playhead.at < 15000 ? mem.playhead.t : 0
+        setStage('subtitles')
 
         const append = (piece) =>
           setMessages((m) => {
@@ -1199,7 +1236,7 @@ window.__ModuleLoader__.load({
             res = await fetch('/hackertube/api/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ vid, question: q, at, stream: true, lang }),
+              body: JSON.stringify({ vid, question: q, at: lastPlayhead, stream: true, lang, history }),
             })
           } catch (e) {
             settle(tx(lang, '请求失败：', 'Request failed: ') + String((e && e.message) || e))
@@ -1208,6 +1245,7 @@ window.__ModuleLoader__.load({
           const type = res.headers.get('content-type') || ''
           if (!res.ok || !res.body || type.indexOf('text/event-stream') < 0) {
             const d = await res.json().catch(() => null)
+            if (d && d.subtitle) setSubtitle(d.subtitle)
             settle(
               d && d.answer
                 ? d.answer
@@ -1232,13 +1270,19 @@ window.__ModuleLoader__.load({
                 if (payload === '[DONE]') continue
                 try {
                   const evt = JSON.parse(payload)
-                  if (evt.delta) {
+                  if (evt.stage === 'subtitles') {
+                    setStage('subtitles')
+                  } else if (evt.stage === 'answer') {
+                    setStage('answer')
+                    if (evt.subtitle) setSubtitle(evt.subtitle)
+                  } else if (evt.delta) {
                     acc += evt.delta
                     append(evt.delta)
                   } else if (evt.error) {
                     acc = tx(lang, '请求失败：', 'Request failed: ') + evt.error
                   } else if (evt.done && typeof evt.answer === 'string') {
                     acc = evt.answer
+                    if (evt.subtitle) setSubtitle(evt.subtitle)
                   }
                 } catch {
                   /* 半截 JSON，忽略 */
@@ -1252,8 +1296,47 @@ window.__ModuleLoader__.load({
 
         run()
           .catch((e) => settle(tx(lang, '请求失败：', 'Request failed: ') + String((e && e.message) || e)))
-          .finally(() => setBusy(false))
+          .finally(() => {
+            setBusy(false)
+            setStage(null)
+          })
       }
+
+      const subtitleNotice = (() => {
+        if (!subtitle) return null
+        const win = subtitle.window || {}
+        if (subtitle.status === 'ok') {
+          const range = fmtDur(win.start) + '–' + fmtDur(win.end)
+          return {
+            tone: 'ok',
+            text: tx(
+              lang,
+              '已读取 ' + (win.count || 0) + ' 条字幕（' + range + '）',
+              'Read ' + (win.count || 0) + ' subtitle lines (' + range + ')',
+            ),
+          }
+        }
+        const hint = subtitle.hint ? String(subtitle.hint) : ''
+        if (subtitle.status === 'needs-cookies') {
+          return { tone: 'needs-cookies', text: hint || tx(lang, '字幕需要 YouTube cookies。', 'Subtitles need YouTube cookies.') }
+        }
+        if (subtitle.status === 'missing-dependency') {
+          return { tone: 'missing-dependency', text: hint || tx(lang, '字幕管线缺少依赖。', 'Subtitle pipeline dependency is missing.') }
+        }
+        if (subtitle.status === 'timeout') {
+          return {
+            tone: 'timeout',
+            text: tx(lang, '字幕获取超时，本轮回答仅基于视频简介。', 'Subtitle lookup timed out; this answer uses the description only.'),
+          }
+        }
+        if (subtitle.status === 'no-captions') {
+          return {
+            tone: 'no-captions',
+            text: tx(lang, '本条视频没有可用字幕，回答仅基于视频简介。', 'No subtitles for this video; answers use the description only.'),
+          }
+        }
+        return { tone: 'error', text: hint || tx(lang, '字幕不可用，回答仅基于视频简介。', 'Subtitles unavailable; answers use the description only.') }
+      })()
 
       const tabBtn = (id, label, count) =>
         h(
@@ -1312,6 +1395,29 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'ht-rail-log' },
+          playhead && Number.isFinite(Number(playhead.t))
+            ? h(
+                'p',
+                { className: 'ht-rail-pos' },
+                tx(lang, '当前播放位置：', 'Playhead: ') + fmtDur(playhead.t),
+              )
+            : null,
+          stage
+            ? h(
+                'p',
+                { className: 'ht-sub-stage' },
+                stage === 'subtitles'
+                  ? tx(lang, '正在取当前播放位置附近的字幕…', 'Loading subtitles around your playhead…')
+                  : tx(lang, '正在生成回答…', 'Generating answer…'),
+              )
+            : null,
+          subtitleNotice
+            ? h(
+                'div',
+                { className: 'ht-sub-note ht-sub-' + subtitleNotice.tone, 'data-status': subtitle.status },
+                subtitleNotice.text,
+              )
+            : null,
           messages.length === 0
             ? h(
                 'div',
@@ -1398,6 +1504,19 @@ window.__ModuleLoader__.load({
       const [localErr, setLocalErr] = useState('')
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
+      const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
+
+      /* 播放位置按视频隔离：暂停后 relay 不再发事件，这里仍保留最后一次的值 */
+      useEffect(() => {
+        setPlayhead(watchSession(item.v).playhead || null)
+        const sub = (vid, position) => {
+          if (vid === item.v) setPlayhead(position)
+        }
+        mem.playheadSubs.add(sub)
+        return () => {
+          mem.playheadSubs.delete(sub)
+        }
+      }, [item.v])
 
       useEffect(() => {
         let alive = true
@@ -1850,6 +1969,7 @@ window.__ModuleLoader__.load({
             onPane: setRailPane,
             onOpen: onOpenItem,
             anchorRef: railRef,
+            playhead,
           }),
           detail
             ? h(
@@ -3112,7 +3232,17 @@ window.__ModuleLoader__.load({
             if (!data || typeof data !== 'object' || !data.__ht) return
             /* 播放位置每秒回传一次，问答时作为上下文，不写进 beacon 免得刷屏 */
             if (data.__ht === 'time') {
-              mem.playhead = { t: Number(data.t) || 0, d: Number(data.d) || 0, at: Date.now() }
+              const vid = String(data.vid || mem.activeWatchVid || '')
+              if (!vid) return
+              const position = { t: Number(data.t) || 0, d: Number(data.d) || 0, at: Date.now() }
+              watchSession(vid).playhead = position
+              for (const fn of mem.playheadSubs) {
+                try {
+                  fn(vid, position)
+                } catch {
+                  /* 订阅者卸载中 */
+                }
+              }
               return
             }
             if (data.__ht === 'yt-error' || data.__ht === 'api-error') {
