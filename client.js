@@ -195,6 +195,8 @@ window.__ModuleLoader__.load({
     /* ---------------- 语言偏好 ---------------- */
 
     const LANG_STORAGE_KEY = 'ht.lang'
+    /* 详情译文的等待上限：模型慢就放弃本轮，原文照旧可读 */
+    const TR_BUDGET_MS = 25000
 
     function normalizeLang(value) {
       return String(value || '').toLowerCase().startsWith('zh') ? 'zh' : 'en'
@@ -1698,7 +1700,10 @@ window.__ModuleLoader__.load({
         }
         let alive = true
         setTrBusy(true)
-        fetch('/hackertube/api/video/translate?vid=' + encodeURIComponent(item.v))
+        /* 模型慢或卡住时不能让「正在翻译…」一直挂着：超时只是不再等，原文照旧可读 */
+        const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), TR_BUDGET_MS) : null
+        fetch('/hackertube/api/video/translate?vid=' + encodeURIComponent(item.v), ctrl ? { signal: ctrl.signal } : undefined)
           .then((r) => {
             if (!r.ok) throw new Error('HTTP ' + r.status)
             return r.json()
@@ -1714,10 +1719,12 @@ window.__ModuleLoader__.load({
           })
           .catch(() => {})
           .then(() => {
+            if (timer) clearTimeout(timer)
             if (alive) setTrBusy(false)
           })
         return () => {
           alive = false
+          if (timer) clearTimeout(timer)
         }
       }, [lang, detail, item.v, trText])
 
