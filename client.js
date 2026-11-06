@@ -1088,92 +1088,6 @@ window.__ModuleLoader__.load({
 
     /* ---------------- 分享卡片 ---------------- */
 
-    function wrapLines(g, text, maxWidth) {
-      const lines = []
-      let cur = ''
-      for (const ch of String(text)) {
-        const next = cur + ch
-        if (g.measureText(next).width > maxWidth && cur) {
-          lines.push(cur)
-          cur = ch
-        } else {
-          cur = next
-        }
-      }
-      if (cur) lines.push(cur)
-      return lines
-    }
-
-    async function makeShareCard(item, detail, quoteText) {
-      const W = 1200
-      const H = 675
-      const c = document.createElement('canvas')
-      c.width = W
-      c.height = H
-      const g = c.getContext('2d')
-      if (!g) return
-
-      g.fillStyle = '#0d1117'
-      g.fillRect(0, 0, W, H)
-
-      const img = new Image()
-      img.src = '/hackertube/api/thumb?vid=' + encodeURIComponent(item.v)
-      await new Promise((res) => {
-        img.onload = res
-        img.onerror = res
-      })
-      if (img.naturalWidth) {
-        const ih = Math.round((img.naturalHeight / img.naturalWidth) * W)
-        g.drawImage(img, 0, 0, W, ih)
-      }
-
-      const grad = g.createLinearGradient(0, 180, 0, 540)
-      grad.addColorStop(0, 'rgba(13,17,23,0)')
-      grad.addColorStop(0.65, 'rgba(13,17,23,0.94)')
-      grad.addColorStop(1, '#0d1117')
-      g.fillStyle = grad
-      g.fillRect(0, 180, W, 360)
-
-      const family = 'system-ui, -apple-system, "Segoe UI", sans-serif'
-
-      g.fillStyle = '#e6edf3'
-      g.font = 'bold 40px ' + family
-      const titleLines = wrapLines(g, item.t || '(untitled)', W - 128).slice(0, 2)
-      titleLines.forEach((line, i) => g.fillText(line, 64, 470 + i * 50))
-
-      const quoteY = 470 + titleLines.length * 50 + 24
-      if (quoteText) {
-        g.fillStyle = '#8b949e'
-        g.font = '24px ' + family
-        const qLines = wrapLines(g, '\u201c' + quoteText + '\u201d', W - 128).slice(0, 2)
-        qLines.forEach((line, i) => g.fillText(line, 64, quoteY + i * 34))
-      }
-
-      g.fillStyle = '#ff6600'
-      g.font = 'bold 24px ' + family
-      g.fillText('HackerTube', 64, H - 40)
-      g.fillStyle = '#8b949e'
-      g.font = '20px ' + family
-      const meta = [item.c, item.d ? Math.round(item.d / 60) + ' min' : null]
-        .filter(Boolean)
-        .join(' · ')
-      /* 右对齐到底部同一基线，避免依赖品牌文字的实测宽度 */
-      if (meta) {
-        const w = g.measureText(meta).width
-        g.fillText(meta, W - 64 - w, H - 40)
-      }
-
-      const blob = await new Promise((res) => c.toBlob(res, 'image/png'))
-      if (!blob) return
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = 'hackertube-' + item.v + '.png'
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      setTimeout(() => URL.revokeObjectURL(a.href), 4000)
-    }
-
     /* ---------------- 播放页 ---------------- */
 
     /* ---------------- Markdown ---------------- */
@@ -1350,15 +1264,26 @@ window.__ModuleLoader__.load({
      * 默认停在相关推荐，看视频的人不需要先关掉提问框。
      */
     function SideRail({ vid, lang = 'zh', related, pane, onPane, onOpen, anchorRef, playhead }) {
-      const [messages, setMessages] = useState([])
+      /* 观看会话按视频存，切回同一视频时接着上次的对话；换视频自然是一份新的 */
+      const session = watchSession(vid)
+      const [messages, setMessagesState] = useState(() => (session.messages || []).slice())
       const [input, setInput] = useState('')
       const [busy, setBusy] = useState(false)
       const [subtitle, setSubtitle] = useState(null)
       const [stage, setStage] = useState(null)
 
-      /* 切换视频就是新的观看会话：旧消息、旧字幕状态和旧输入都不跟过去 */
+      const setMessages = (updater) => {
+        setMessagesState((prev) => {
+          const next = typeof updater === 'function' ? updater(prev) : updater
+          session.messages = next
+          return next
+        })
+      }
+
+      /* 切到另一条视频：换上那条会话的消息，字幕与输入不跟过去 */
       useEffect(() => {
-        setMessages([])
+        const now = watchSession(vid)
+        setMessagesState((now.messages || []).slice())
         setInput('')
         setSubtitle(null)
         setStage(null)
@@ -1676,6 +1601,8 @@ window.__ModuleLoader__.load({
       const [trText, setTrText] = useState(null)
       const [trSource, setTrSource] = useState({})
       const [trBusy, setTrBusy] = useState(false)
+      /* 自动补译每个「视频 + 语言」只跑一次，避免字段永远补不全导致的循环请求 */
+      const trTriedRef = useRef(null)
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
       const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
@@ -1717,6 +1644,7 @@ window.__ModuleLoader__.load({
         setCtrOn({})
         setCtrBusy({})
         setTrText(null)
+        trTriedRef.current = null
         setTrSource({})
         setTrBusy(false)
         /* 语言只影响这一次请求带不带 lang=zh；切语言后由下面的异步翻译补齐，不重拉详情 */
@@ -1823,7 +1751,7 @@ window.__ModuleLoader__.load({
         /* 详情带的缓存译文和已经补到的译文都算数，任缺一项才补 */
         const cached = detail.i18n || {}
         const have = (field) => !!cached[field] || !!(trText && trText[field])
-        if (fields.every(have)) {
+        if (fields.every(have) || trTriedRef.current === lang + ':' + item.v) {
           setTrBusy(false)
           return undefined
         }
@@ -1832,6 +1760,8 @@ window.__ModuleLoader__.load({
         /* 模型慢或卡住时不能让「正在翻译…」一直挂着：超时只是不再等，原文照旧可读 */
         const ctrl = typeof AbortController === 'function' ? new AbortController() : null
         const timer = ctrl ? setTimeout(() => ctrl.abort(), TR_BUDGET_MS) : null
+        /* 每条视频每种语言只自动补一次：模型对过短的字段会跳过，反复补就是死循环 */
+        trTriedRef.current = lang + ':' + item.v
         fetch('/hackertube/api/video/translate?vid=' + encodeURIComponent(item.v), ctrl ? { signal: ctrl.signal } : undefined)
           .then((r) => {
             if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -1855,7 +1785,7 @@ window.__ModuleLoader__.load({
           alive = false
           if (timer) clearTimeout(timer)
         }
-      }, [lang, detail, item.v, trText])
+      }, [lang, detail, item.v])
 
       useEffect(() => {
         if (descOpen) return
@@ -2929,6 +2859,7 @@ window.__ModuleLoader__.load({
                 total: d && typeof d.total === 'number' ? d.total : list.length,
                 loading: false,
                 error: '',
+                areaFiltered: d ? d.areaFiltered !== false : true,
               })
               setLimit(GRID_STEP)
             })
@@ -3425,7 +3356,18 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'ht-state' }, tx(lang, '检索失败：', 'Search failed: ') + searchError)
             : null,
           phase === 'ready' && !searchLoading && !searchError && !filtered.length
-            ? h('div', { className: 'ht-state' }, tx(lang, '没有匹配的视频', 'No matching videos'))
+            ? h(
+                'div',
+                { className: 'ht-state' },
+                /* 分类树不可用时领域筛选没有生效，不能把「筛选失灵」说成「没有结果」 */
+                area && searchState.areaFiltered === false
+                  ? tx(
+                      lang,
+                      '分类数据暂不可用，领域筛选没有生效。换个关键词，或稍后重试。',
+                      'Category data is unavailable, so the area filter was not applied. Try another keyword or retry later.',
+                    )
+                  : tx(lang, '没有匹配的视频', 'No matching videos'),
+              )
             : null,
           phase === 'ready' && filtered.length
             ? h(

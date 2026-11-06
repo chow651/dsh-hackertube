@@ -852,7 +852,8 @@ function buildSearchIndex(items, detailMap, zhTitles, browse, zhTax) {
 }
 
 function searchRecordPasses(rec, filters) {
-  if (filters.area && rec.areaIds.indexOf(filters.area) < 0) return false
+  /* 分类树拿不到时 areaIds 为空，硬过滤会把整库筛空；此时退回不过滤，由调用方标注降级 */
+  if (filters.area && rec.areaIds.length && rec.areaIds.indexOf(filters.area) < 0) return false
   if (filters.year != null && Number(rec.year) !== Number(filters.year)) return false
   if (filters.type && String(rec.type) !== filters.type) return false
   if (filters.level && String(rec.level) !== filters.level) return false
@@ -970,7 +971,7 @@ async function searchLibrary(params = {}) {
     /* 分类树不可用时仍有列表里的分类 id，筛选会退化为不命中 */
   }
   const zhTax = await loadI18n('zh-taxonomy').catch(() => ({}))
-  /* 译文表是原地增长的：用条目数当版本号，否者后到的译文不会进索引 */
+  /* 译文表是原地增长的：用条目数当版本号，否则后到的译文不会进索引 */
   const zhTitlesSize = Object.keys(zhTitles).length
   const zhTaxSize = Object.keys(zhTax).length
 
@@ -1020,6 +1021,8 @@ async function searchLibrary(params = {}) {
     limit,
     offset,
     sort,
+    /* 分类树不可用时领域筛选没有真正生效，界面要说明，而不是显示成「没有结果」 */
+    areaFiltered: filters.area ? !!browse : false,
     items: picked.slice(offset, offset + limit).map(({ rec, match }) => {
       const item = Object.assign({}, rec.item)
       if (match) {
@@ -3220,13 +3223,13 @@ async function handler(req, res) {
       if (!likes.length) {
         /* 冷启动才有播放列表依赖；超时就用 HN 分数兜底，首页不能等上游 */
         try {
-          playlists = await Promise.race([
+          playlists = (await Promise.race([
             loadPlaylists(),
             new Promise((resolve) => {
               const timer = setTimeout(() => resolve([]), 2500)
               if (timer && typeof timer.unref === 'function') timer.unref()
             }),
-          ])
+          ])).map(withChinese)
         } catch {
           playlists = []
         }

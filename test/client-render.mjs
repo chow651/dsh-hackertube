@@ -1432,6 +1432,26 @@ console.log('\n--- T05 language & translation ---')
   })
 }
 
+/* 模型跳过的字段不能把自动补译变成循环请求 */
+{
+  resetLangState()
+  /* 服务端对过短的字段直接跳过，返回里就只剩空值 */
+  translateReply = { i18n: { summary: null, why_hn: null, quote: null }, i18nSource: {} }
+  const t = await mountModule(loadClientModule(makeWin('zh-CN')))
+  await openWatch(t)
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 120))
+  })
+  const firstRound = translateRequests
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 400))
+  })
+  check('T05 empty translation reply does not loop', translateRequests === 1 && firstRound <= 1, 'requests=' + translateRequests)
+  await act(async () => {
+    t.unmount()
+  })
+}
+
 console.log('\n--- T06 taste profile ---')
 
 function instanceText(inst) {
