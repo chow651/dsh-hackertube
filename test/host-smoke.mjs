@@ -2,7 +2,7 @@
  * Host 半冒烟测试：不经过 DSH 插件系统，直接驱动 apply() 注册进来的路由。
  * 验证路由注册、上游拉取、瘦身、磁盘缓存、错误路径。
  */
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -13,6 +13,11 @@ const SELF = fileURLToPath(import.meta.url)
 /* 子进程模式：用固定 fixture 驱动首屏缓存/导出场景，不打真实上游 */
 if (process.env.HT_FIRST_PAINT_FIXTURE === '1') {
   process.exit(await runFirstPaintFixture())
+}
+
+/* 子进程模式：用固定 fixture 驱动统一检索，不打真实上游与真实翻译接口 */
+if (process.env.HT_SEARCH_FIXTURE === '1') {
+  process.exit(await runSearchFixture())
 }
 
 const tmp = mkdtempSync(join(tmpdir(), 'ht-smoke-'))
@@ -608,6 +613,468 @@ async function runFirstPaintFixture() {
   return failures ? 1 : 0
 }
 
+/* ---------- 固定 fixture：统一检索（面板与 Agent 共用一条 Host 检索） ---------- */
+
+async function runSearchFixture() {
+  const tmp = mkdtempSync(join(tmpdir(), 'ht-search-'))
+  process.env.DSH_PROFILE_DIR = tmp
+  const root = join(tmp, '.dsh-hackertube')
+
+  const videos = [
+    {
+      vid: 'raft000001',
+      title: 'Raft consensus in depth',
+      channel: 'Distributed Systems Lab',
+      categories: [{ id: 'distributed-systems', name: 'Distributed systems', area: 'systems-security', area_name: 'Systems & Security' }],
+      tags: ['raft', 'paxos', 'consensus', 'leader election'],
+      summary: 'A deep dive into the Raft leader election and log replication protocol.',
+      why_hn: 'The clearest explanation of Raft available anywhere.',
+      content_type: 'talk',
+      level: 'intermediate',
+      published: '2020-03-01T00:00:00Z',
+      duration_s: 2400,
+      views: 250000,
+      score: 9,
+      hn: { recommenders: 12, mentions: 20 },
+    },
+    {
+      vid: 'raft000002',
+      title: 'Paxos lecture (Raft user study)',
+      channel: 'Stanford Online',
+      categories: [{ id: 'distributed-systems', name: 'Distributed systems', area: 'systems-security', area_name: 'Systems & Security' }],
+      tags: ['paxos', 'raft', 'distributed consensus'],
+      summary: 'Paxos explained for the Raft user study comparing how students learn both algorithms.',
+      why_hn: 'Recommended as a lucid companion to the Raft lecture.',
+      content_type: 'talk',
+      level: 'advanced',
+      published: '2014-09-01T00:00:00Z',
+      duration_s: 3600,
+      views: 120000,
+      score: 7,
+      hn: { recommenders: 8, mentions: 11 },
+    },
+    {
+      vid: 'raft000003',
+      title: 'Raft lecture (Raft user study)',
+      channel: 'Stanford Online',
+      categories: [{ id: 'distributed-systems', name: 'Distributed systems', area: 'systems-security', area_name: 'Systems & Security' }],
+      tags: ['raft', 'paxos', 'leader election'],
+      summary: 'John Ousterhout explains Raft leader election and log repair in the Raft user study.',
+      why_hn: 'A clearer introduction to Raft than the original paper.',
+      content_type: 'lecture',
+      level: 'intermediate',
+      published: '2015-02-01T00:00:00Z',
+      duration_s: 3000,
+      views: 90000,
+      score: 4.5,
+      hn: { recommenders: 5, mentions: 9 },
+    },
+    {
+      vid: 'craft00001',
+      title: 'Craft of code review',
+      channel: 'CraftChannel',
+      categories: [{ id: 'software-architecture-design', name: 'Software architecture & design', area: 'software', area_name: 'Software Engineering & Languages' }],
+      tags: ['craft', 'code review'],
+      summary: 'A craft talk about reviewing code with care.',
+      why_hn: 'Useful for teams that review a lot of code.',
+      content_type: 'talk',
+      level: 'intro',
+      published: '2021-06-01T00:00:00Z',
+      duration_s: 1800,
+      views: 50000,
+      score: 10,
+      hn: { recommenders: 9, mentions: 12 },
+    },
+    {
+      vid: 'minecr0001',
+      title: 'Minecraft redstone computing',
+      channel: 'MC Lab',
+      categories: [{ id: 'software-architecture-design', name: 'Software architecture & design', area: 'software', area_name: 'Software Engineering & Languages' }],
+      tags: ['minecraft', 'redstone'],
+      summary: 'Building logic circuits inside Minecraft.',
+      why_hn: 'Fun demonstration of redstone logic.',
+      content_type: 'demo',
+      level: 'general',
+      published: '2019-04-01T00:00:00Z',
+      duration_s: 900,
+      views: 400000,
+      score: 8,
+      hn: { recommenders: 3, mentions: 4 },
+    },
+    {
+      vid: 'kraftw0001',
+      title: 'Kraftwerk and the birth of electronic music',
+      channel: 'Music Docs',
+      categories: [{ id: 'music', name: 'Music', area: 'arts-entertainment', area_name: 'Arts & Entertainment' }],
+      tags: ['kraftwerk', 'electronic music'],
+      summary: 'A documentary about Kraftwerk and electronic music.',
+      why_hn: 'A great music documentary.',
+      content_type: 'documentary',
+      level: 'general',
+      published: '2016-10-01T00:00:00Z',
+      duration_s: 5400,
+      views: 210000,
+      score: 6,
+      hn: { recommenders: 4, mentions: 5 },
+    },
+    {
+      vid: 'compil0001',
+      title: 'CppCon 2020: Compiler optimization in practice',
+      channel: 'CppCon',
+      categories: [{ id: 'compilers-interpreters', name: 'Compilers, interpreters & program analysis', area: 'software', area_name: 'Software Engineering & Languages' }],
+      tags: ['compiler optimization', 'c++', 'inlining'],
+      summary: 'How compilers optimize C++ code, and why inlining and devirtualization matter.',
+      why_hn: 'A practical compiler optimization walkthrough from a veteran optimizer engineer.',
+      content_type: 'talk',
+      level: 'advanced',
+      published: '2020-11-01T00:00:00Z',
+      duration_s: 3300,
+      views: 180000,
+      score: 8,
+      hn: { recommenders: 7, mentions: 10 },
+    },
+    {
+      vid: 'compil0002',
+      title: 'Inside the C++ compiler',
+      channel: 'CppCon',
+      categories: [{ id: 'compilers-interpreters', name: 'Compilers, interpreters & program analysis', area: 'software', area_name: 'Software Engineering & Languages' }],
+      tags: ['compilers', 'c++'],
+      summary: 'A tour of compiler internals from lexing to code generation.',
+      why_hn: 'Useful overview of compiler architecture.',
+      content_type: 'talk',
+      level: 'intermediate',
+      published: '2018-08-01T00:00:00Z',
+      duration_s: 2700,
+      views: 70000,
+      score: 5,
+      hn: { recommenders: 4, mentions: 6 },
+    },
+  ]
+
+  const slim = (o) => ({
+    v: o.vid,
+    t: o.title,
+    c: o.channel,
+    d: o.duration_s,
+    th: 'https://i.ytimg.com/vi/' + o.vid + '/hqdefault.jpg',
+    p: o.published,
+    w: o.views,
+    ct: o.content_type,
+    lv: o.level,
+    y: o.published ? Number(String(o.published).slice(0, 4)) : null,
+    cats: (o.categories || []).map((c) => c.id),
+    tags: o.tags || [],
+    s: o.score,
+    r: o.hn.recommenders,
+  })
+
+  mkdirSync(join(root, 'export'), { recursive: true })
+  writeFileSync(join(root, 'export', 'videos.jsonl'), videos.map((o) => JSON.stringify(o)).join('\n'))
+  writeFileSync(join(root, 'export', 'related.jsonl'), JSON.stringify({ vid: videos[0].vid, related: [] }) + '\n')
+  writeFileSync(join(root, 'export', 'mentions.jsonl'), '{}\n')
+  writeFileSync(join(root, 'export', 'embeddings.npy'), 'x')
+  writeFileSync(join(root, 'export', 'embedding_ids.json'), '[]')
+  writeFileSync(join(root, 'export', 'manifest.json'), JSON.stringify({ v: 1, at: Date.now(), bytes: 1234 }))
+  writeFileSync(join(root, 'list.json'), JSON.stringify({ v: 2, at: Date.now(), items: videos.map(slim) }))
+  writeFileSync(
+    join(root, 'browse.json'),
+    JSON.stringify({
+      at: Date.now(),
+      taxonomy: {
+        version: 'fixture',
+        areas: [
+          {
+            id: 'software',
+            name: 'Software Engineering & Languages',
+            categories: [
+              { id: 'compilers-interpreters', name: 'Compilers, interpreters & program analysis' },
+              { id: 'software-architecture-design', name: 'Software architecture & design' },
+            ],
+          },
+          {
+            id: 'systems-security',
+            name: 'Systems & Security',
+            categories: [{ id: 'distributed-systems', name: 'Distributed systems' }],
+          },
+          {
+            id: 'arts-entertainment',
+            name: 'Arts & Entertainment',
+            categories: [{ id: 'music', name: 'Music' }],
+          },
+        ],
+      },
+    }),
+  )
+
+  global.fetch = async (url, init) => {
+    const raw = String(url)
+    if (raw.indexOf('translate-pa.googleapis.com') >= 0) {
+      return { ok: true, status: 200, json: async () => [['compiler optimization']] }
+    }
+    if (raw.indexOf('/download/taxonomy.json') >= 0) {
+      return { ok: true, status: 200, json: async () => JSON.parse(readFileSync(join(root, 'browse.json'), 'utf8')).taxonomy }
+    }
+    if (raw.indexOf('/api/list?offset=') >= 0) {
+      const u = new URL(raw)
+      const offset = Number(u.searchParams.get('offset') || 0)
+      const n = Number(u.searchParams.get('n') || 100)
+      return { ok: true, status: 200, json: async () => videos.slice(offset, offset + n).map(slim) }
+    }
+    if (raw.indexOf('/api/stats') >= 0) {
+      return { ok: true, status: 200, json: async () => ({ videos: videos.length }) }
+    }
+    throw new Error('search fixture blocked: ' + raw + ' ' + (init && init.method ? init.method : ''))
+  }
+
+  let handler = null
+  const registered = []
+  const tools = {}
+  const { apply } = await import('../index.js')
+  const ctx = {
+    get(name) {
+      if (name === 'webServer') {
+        return {
+          register: (route) => {
+            registered.push(route)
+            handler = route.handler
+            return () => {}
+          },
+        }
+      }
+      return undefined
+    },
+    effect(fn) {
+      return fn()
+    },
+    inject(names, cb) {
+      if (names.indexOf('tools') >= 0) cb({ tools: { register: (def) => { tools[def.name] = def } } })
+    },
+  }
+  apply(ctx)
+
+  const failures = []
+  const check = (name, ok, extra = '') => {
+    console.log((ok ? 'ok   ' : 'FAIL ') + name + (extra ? ' — ' + extra : ''))
+    if (!ok) failures.push(name)
+  }
+  const fakeRes = () => ({
+    statusCode: 0,
+    headers: {},
+    body: '',
+    writeHead(code, headers) {
+      this.statusCode = code
+      this.headers = headers
+    },
+    end(chunk) {
+      this.body = chunk === undefined ? '' : String(chunk)
+    },
+  })
+  const call = async (path) => {
+    const res = fakeRes()
+    await handler(
+      { method: 'GET', url: path, headers: { host: '127.0.0.1:54321' } },
+      res,
+    )
+    return res
+  }
+  const search = async (qs) => {
+    const res = await call('/hackertube/api/search?' + qs)
+    let body = null
+    try {
+      body = JSON.parse(res.body)
+    } catch {
+      body = null
+    }
+    return { status: res.statusCode, body }
+  }
+
+  if (!handler) {
+    console.error('FAIL: route handler was not registered in search fixture')
+    return 1
+  }
+
+  console.log('\n--- T03 unified search ---')
+
+  /* raft：词边界命中 Raft/Paxos，不混入 craft / Minecraft / Kraftwerk */
+  {
+    const r = await search('q=raft&limit=10')
+    check('search raft 200', r.status === 200, 'got ' + r.status)
+    const d = r.body || {}
+    const items = Array.isArray(d.items) ? d.items : []
+    check('search raft has results', items.length >= 3, String(items.length))
+    const top3 = items.slice(0, 3)
+    check(
+      'search raft top3 are raft/paxos content',
+      top3.every((it) => /raft|paxos/i.test(String(it.t || '') + ' ' + (it.tags || []).join(' '))),
+      top3.map((it) => it.t).join(' | '),
+    )
+    check(
+      'search raft excludes craft-like titles',
+      items.every((it) => !/craft|minecraft|kraftwerk/i.test(String(it.t || '') + ' ' + (it.tags || []).join(' '))),
+      items.map((it) => it.t).join(' | '),
+    )
+    check('search result total', typeof d.total === 'number' && d.total >= items.length, String(d.total))
+    const first = items[0] || {}
+    check(
+      'search result matched fields',
+      first.match && Array.isArray(first.match.fields) && first.match.fields.length > 0,
+      JSON.stringify(first.match && first.match.fields),
+    )
+    check(
+      'search result snippet',
+      first.match && typeof first.match.snippet === 'string' && first.match.snippet.length > 0,
+      String(first.match && first.match.snippet).slice(0, 80),
+    )
+    check(
+      'search snippet quotes the query',
+      first.match && /raft/i.test(String(first.match.snippet)),
+      String(first.match && first.match.snippet).slice(0, 80),
+    )
+    /* 面板请求不需要中文标题与推荐理由：那两串由工具侧显式开启，避免两千条结果被撑大 */
+    check(
+      'search payload stays lean',
+      first.match && first.match.titleZh === undefined && first.match.why === undefined,
+      JSON.stringify(Object.keys((first.match || {}))),
+    )
+    check(
+      'search raft matches only raft/paxos videos',
+      items.length === 3,
+      items.map((it) => it.v).join(','),
+    )
+  }
+
+  /* 多词查询是 AND：每个词都要在某个字段里命中 */
+  {
+    const r = await search('q=' + encodeURIComponent('raft paxos') + '&limit=10')
+    const items = (r.body && r.body.items) || []
+    check(
+      'search multi-term is AND',
+      items.length === 3 && items.every((it) => it.v.indexOf('raft0') === 0),
+      items.map((it) => it.v).join(','),
+    )
+  }
+
+  /* 没有查询时列表按原始顺序返回，筛选不该打乱浏览顺序 */
+  {
+    const r = await search('limit=10')
+    const items = (r.body && r.body.items) || []
+    const want = ['raft000001', 'raft000002', 'raft000003', 'craft00001', 'minecr0001', 'kraftw0001', 'compil0001', 'compil0002']
+    check(
+      'search without query keeps list order',
+      items.map((it) => it.v).join(',') === want.join(','),
+      items.map((it) => it.v).join(','),
+    )
+  }
+
+  /* 中文查询走现有机器翻译扩展，命中英文标签与摘要 */
+  {
+    const r = await search('q=' + encodeURIComponent('编译器优化') + '&limit=10')
+    check('search chinese 200', r.status === 200, 'got ' + r.status)
+    const items = (r.body && r.body.items) || []
+    check('search chinese expands to english', items.length >= 1 && items[0].v === 'compil0001', items.map((it) => it.v).join(','))
+    const fields = (items[0] && items[0].match && items[0].match.fields) || []
+    check(
+      'search chinese matches tags or summary',
+      fields.indexOf('tags') >= 0 || fields.indexOf('summary') >= 0,
+      JSON.stringify(fields),
+    )
+    check(
+      'search chinese result carries snippet',
+      !!(items[0] && items[0].match && items[0].match.snippet),
+      String(items[0] && items[0].match && items[0].match.snippet).slice(0, 80),
+    )
+  }
+
+  /* 面板 HTTP 检索与 Agent 工具共享同一排序 */
+  {
+    const r = await search('q=raft&limit=3')
+    const panelItems = (r.body && r.body.items) || []
+    const tool = tools['hackertube_search']
+    check('search tool registered', !!tool)
+    if (tool && panelItems.length) {
+      const text = await tool.execute({ query: 'raft', limit: 3 })
+      check('search tool uses same order', text.indexOf('1. ' + panelItems[0].t) >= 0, text.slice(0, 120))
+      const positions = panelItems.map((it) => text.indexOf(it.t))
+      check(
+        'search tool keeps full top-3 order',
+        positions.every((p, i) => p >= 0 && (i === 0 || p > positions[i - 1])),
+        JSON.stringify(positions),
+      )
+      check('search tool reports matched fields', /匹配：/.test(text), text.slice(0, 200))
+      check('search tool reports snippet', /—\s/.test(text), text.slice(0, 200))
+      check('search tool reports hn reason', /HN：/.test(text), text.slice(0, 300))
+
+      /* 工具也接受同一组筛选与排序参数，不需要面板再实现一遍 */
+      const filtered = await tool.execute({ query: 'raft', area: 'software', limit: 3 })
+      check('search tool honours filters', /没有找到匹配的视频/.test(filtered), filtered.slice(0, 80))
+      const byYear = await tool.execute({ query: 'raft', sort: 'year', limit: 3 })
+      const order = ['Raft consensus in depth', 'Raft lecture (Raft user study)', 'Paxos lecture (Raft user study)'].map(
+        (t) => byYear.indexOf(t),
+      )
+      check(
+        'search tool honours sort',
+        order.every((p) => p >= 0) && order[0] < order[1] && order[1] < order[2],
+        JSON.stringify(order),
+      )
+    }
+  }
+
+  /* 筛选与排序是同一检索操作的参数 */
+  {
+    const r = await search('area=systems-security&year=2020&type=talk&level=intermediate&sort=score')
+    const items = (r.body && r.body.items) || []
+    check(
+      'search filters area/year/type/level',
+      items.length === 1 && items[0].v === 'raft000001',
+      items.map((it) => it.v).join(','),
+    )
+    check('search filters total', r.body && r.body.total === 1, String(r.body && r.body.total))
+
+    const byYear = await search('q=raft&sort=year&limit=10')
+    const ys = ((byYear.body && byYear.body.items) || []).map((it) => it.y)
+    check(
+      'search sort year desc',
+      ys.length >= 3 && ys.every((y, i) => i === 0 || (Number(y) || 0) <= (Number(ys[i - 1]) || 0)),
+      JSON.stringify(ys),
+    )
+
+    const page = await search('q=raft&limit=2&offset=1')
+    const full = await search('q=raft&limit=10')
+    const pageItems = (page.body && page.body.items) || []
+    const fullItems = (full.body && full.body.items) || []
+    check(
+      'search limit/offset paginate in rank order',
+      pageItems.length === 2 && fullItems[1] && pageItems[0].v === fullItems[1].v,
+      pageItems.map((it) => it.v).join(','),
+    )
+
+    const byScore = (await search('sort=score&limit=10')).body.items.map((it) => it.s)
+    check(
+      'search sort score desc',
+      byScore.length === 8 && byScore.every((s, i) => i === 0 || Number(s) <= Number(byScore[i - 1])),
+      JSON.stringify(byScore),
+    )
+
+    const byViews = (await search('sort=views&limit=10')).body.items.map((it) => it.w)
+    check(
+      'search sort views desc',
+      byViews.length === 8 && byViews.every((w, i) => i === 0 || Number(w) <= Number(byViews[i - 1])),
+      JSON.stringify(byViews),
+    )
+
+    /* 筛选参数单独用也成立：类型 + 难度不需要查询词 */
+    const typed = await search('type=lecture&level=intermediate')
+    check(
+      'search filters without query',
+      typed.body && typed.body.total === 1 && typed.body.items[0].v === 'raft000003',
+      JSON.stringify((typed.body && typed.body.items || []).map((it) => it.v)),
+    )
+  }
+
+  console.log('\n' + (failures.length ? failures.length + ' FAILURE(S)' : 'ALL PASS') + ' | fixture: search')
+  return failures.length ? 1 : 0
+}
+
 /* 固定 fixture 场景在独立子进程跑，避免真实上游与模块级状态互相污染 */
 for (const scenario of ['export-first', 'stale-offline']) {
   const r = spawnSync(process.execPath, [SELF], {
@@ -618,6 +1085,17 @@ for (const scenario of ['export-first', 'stale-offline']) {
   if (r.stdout) process.stdout.write(r.stdout)
   if (r.stderr) process.stderr.write(r.stderr)
   check('first-paint fixture: ' + scenario, r.status === 0, 'exit ' + r.status)
+}
+
+{
+  const r = spawnSync(process.execPath, [SELF], {
+    env: { ...process.env, HT_SEARCH_FIXTURE: '1' },
+    encoding: 'utf8',
+    timeout: 30000,
+  })
+  if (r.stdout) process.stdout.write(r.stdout)
+  if (r.stderr) process.stderr.write(r.stderr)
+  check('search fixture', r.status === 0, 'exit ' + r.status)
 }
 
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | cache dir: ' + tmp)

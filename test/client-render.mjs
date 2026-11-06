@@ -105,9 +105,31 @@ let depsBody = {
 
 let fetchCalls = 0
 const fetchLog = []
+const searchCalls = []
 let statusStage = 'export'
 let statusExtra = {}
 let listGate = null
+
+/* 面板只渲染 Host 检索返回的结果：这里按请求参数返回一个可控替身，
+   测试可以替换 searchResponder 来断言“面板确实相信 Host 的排序”。 */
+function defaultSearchResponse(params) {
+  let out = LIST.slice()
+  if (params.area) {
+    const area = TAX.areas.find((a) => a.id === params.area)
+    const cats = new Set(((area && area.categories) || []).map((c) => c.id))
+    out = out.filter((it) => (it.cats || []).some((c) => cats.has(c)))
+  }
+  if (params.year) out = out.filter((it) => String(it.y) === String(params.year))
+  if (params.type) out = out.filter((it) => it.ct === params.type)
+  if (params.level) out = out.filter((it) => it.lv === params.level)
+  const q = String(params.q || '').trim().toLowerCase()
+  if (q) out = out.filter((it) => [it.t, it.c, (it.tags || []).join(' ')].join(' ').toLowerCase().includes(q))
+  if (params.sort === 'score') out = out.slice().sort((a, b) => (b.s || 0) - (a.s || 0))
+  if (params.sort === 'year') out = out.slice().sort((a, b) => (b.y || 0) - (a.y || 0))
+  if (params.sort === 'views') out = out.slice().sort((a, b) => (b.w || 0) - (a.w || 0))
+  return { query: q, total: out.length, limit: Number(params.limit) || 200, offset: 0, items: out }
+}
+let searchResponder = defaultSearchResponse
 
 const statusBody = () => ({
   stage: statusStage,
@@ -124,6 +146,14 @@ global.fetch = async (url) => {
   fetchCalls += 1
   fetchLog.push(String(url))
   const u = String(url)
+  if (u.includes('/hackertube/api/search')) {
+    const qs = new URL(u, 'http://fixture.local').searchParams
+    const params = {}
+    qs.forEach((v, k) => { params[k] = v })
+    searchCalls.push(params)
+    const result = searchResponder(params)
+    return { ok: true, status: 200, json: async () => result }
+  }
   if (u.includes('/list/status')) {
     return { ok: true, status: 200, json: async () => statusBody() }
   }
@@ -321,6 +351,7 @@ const aiChip = chips.find((c) => text().includes('AI & Data') && String(c.props.
 const targetChip = chips[chips.length - 1]
 await act(async () => {
   targetChip.props.onClick()
+  await new Promise((r) => setTimeout(r, 300))
 })
 const afterFilter = text()
 check('area filter keeps only karpathy', afterFilter.includes('Intro to large language models') && !afterFilter.includes('Vectors, the first chapter'), afterFilter.slice(0, 100))
@@ -337,12 +368,14 @@ const input = tree.root.findAllByType('input')[0]
 check('search input exists', !!input, '')
 await act(async () => {
   input.props.onChange({ target: { value: 'karpathy' } })
+  await new Promise((r) => setTimeout(r, 300))
 })
 const afterSearch = text()
 check('search narrows by channel', /1 (个视频|video)/.test(afterSearch) && afterSearch.includes('Intro to large language models'), afterSearch.slice(0, 100))
 
 await act(async () => {
   input.props.onChange({ target: { value: 'zzzznomatch' } })
+  await new Promise((r) => setTimeout(r, 300))
 })
 check('empty state', /没有匹配的视频|No matching videos/.test(text()), '')
 
@@ -556,6 +589,7 @@ console.log('\n--- T02 navigation ---')
   const input = t.root.findAllByType('input')[0]
   await act(async () => {
     input.props.onChange({ target: { value: 'karpathy' } })
+    await new Promise((r) => setTimeout(r, 300))
   })
   const scroller = findClass(t, 'ht-scroll')[0]
   scroller.instance.scrollTop = 420
@@ -654,6 +688,164 @@ console.log('\n--- T02 navigation ---')
     })
   }
   check('T02 rail jump scrolls to rail', !!rail && rail.instance.scrolledIntoView === true, rail && String(rail.instance.scrolledIntoView))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* ---------- T03：面板与 Agent 共用 Host 检索 ---------- */
+
+console.log('\n--- T03 unified search ---')
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+const selectByFilter = (t, name) =>
+  t.root.findAllByType('select').find((s) => String((s.props && s.props['data-filter']) || '') === name)
+
+/* 面板不再自己评分/排序/过滤：Host 返回什么顺序与集合，就渲染什么 */
+{
+  resetRoute()
+  searchCalls.length = 0
+  searchResponder = () => ({
+    query: 'vectors',
+    total: 2,
+    limit: 2000,
+    offset: 0,
+    items: [
+      { ...LIST[2], match: { fields: ['title', 'tags'], snippet: 'host says this row goes first' } },
+      { ...LIST[0], match: { fields: ['title'], snippet: 'and this one goes second' } },
+    ],
+  })
+  const t = await freshTree()
+  const input = t.root.findAllByType('input')[0]
+  await act(async () => {
+    input.props.onChange({ target: { value: 'vectors' } })
+  })
+  /* 请求还在路上时要显示加载态，不能先闪一下“没有匹配的视频” */
+  const pending = treeText(t)
+  check(
+    'T03 pending search shows loading, not empty state',
+    /检索中|Searching/.test(pending) && !/没有匹配的视频|No matching videos/.test(pending),
+    pending.slice(0, 140),
+  )
+  await act(async () => {
+    await wait(300)
+  })
+  const body = treeText(t)
+  check(
+    'T03 panel calls host search',
+    searchCalls.some((c) => c.q === 'vectors' && c.limit === '2000'),
+    JSON.stringify(searchCalls.slice(-1)),
+  )
+  check(
+    'T03 panel follows host order instead of local scoring',
+    body.indexOf('Intro to large language models') >= 0 &&
+      body.indexOf('Intro to large language models') < body.indexOf('Vectors, the first chapter'),
+    body.slice(0, 200),
+  )
+  check(
+    'T03 panel shows matched field and snippet',
+    /匹配：标题|Match: title/.test(body) && body.includes('host says this row goes first'),
+    body.slice(0, 240),
+  )
+  check('T03 result count comes from host total', /2 (个视频|videos)/.test(body), body.slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* Host 说命中就显示：查询词不在标题里也不该被面板二次过滤 */
+{
+  resetRoute()
+  searchCalls.length = 0
+  searchResponder = () => ({
+    query: 'zzz-no-local-filter',
+    total: 1,
+    limit: 2000,
+    offset: 0,
+    items: [{ ...LIST[2], match: { fields: ['summary'], snippet: 'the host matched the summary, not the title' } }],
+  })
+  const t = await freshTree()
+  const input = t.root.findAllByType('input')[0]
+  await act(async () => {
+    input.props.onChange({ target: { value: 'zzz-no-local-filter' } })
+    await wait(300)
+  })
+  const body = treeText(t)
+  check(
+    'T03 panel does not re-filter host results',
+    body.includes('Intro to large language models') && /1 (个视频|video)/.test(body),
+    body.slice(0, 200),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 筛选与排序参数原样交给同一个 Host 检索操作 */
+{
+  resetRoute()
+  searchCalls.length = 0
+  searchResponder = defaultSearchResponse
+  const t = await freshTree()
+  const year = selectByFilter(t, 'year')
+  const type = selectByFilter(t, 'type')
+  const level = selectByFilter(t, 'level')
+  const sort = selectByFilter(t, 'sort')
+  check('T03 filter selects rendered', !!year && !!type && !!level && !!sort, [!!year, !!type, !!level, !!sort] + '')
+  if (year && type && level && sort) {
+    await act(async () => {
+      year.props.onChange({ target: { value: '2019' } })
+      await wait(300)
+    })
+    check('T03 year filter sent to host', searchCalls.length > 0 && searchCalls[searchCalls.length - 1].year === '2019', JSON.stringify(searchCalls.slice(-1)))
+    await act(async () => {
+      type.props.onChange({ target: { value: 'talk' } })
+      await wait(300)
+    })
+    check('T03 type filter sent to host', searchCalls[searchCalls.length - 1].type === 'talk', JSON.stringify(searchCalls.slice(-1)))
+    await act(async () => {
+      level.props.onChange({ target: { value: 'advanced' } })
+      await wait(300)
+    })
+    check('T03 level filter sent to host', searchCalls[searchCalls.length - 1].level === 'advanced', JSON.stringify(searchCalls.slice(-1)))
+    await act(async () => {
+      sort.props.onChange({ target: { value: 'score' } })
+      await wait(300)
+    })
+    check('T03 sort sent to host', searchCalls[searchCalls.length - 1].sort === 'score', JSON.stringify(searchCalls.slice(-1)))
+    check('T03 filters reuse one host operation', searchCalls.every((c) => c.limit === '2000'), JSON.stringify(searchCalls.slice(-1)))
+    const body = treeText(t)
+    check('T03 filtered count follows host', /1 (个视频|video)/.test(body), body.slice(0, 160))
+  }
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 中文查询原样提交给 Host，由 Host 走现有机器翻译扩展 */
+{
+  resetRoute()
+  searchCalls.length = 0
+  searchResponder = () => ({
+    query: '编译器优化',
+    total: 1,
+    items: [
+      {
+        ...LIST[2],
+        match: { fields: ['tags', 'summary'], snippet: 'compiler optimization in practice' },
+      },
+    ],
+  })
+  const t = await freshTree()
+  const input = t.root.findAllByType('input')[0]
+  await act(async () => {
+    input.props.onChange({ target: { value: '编译器优化' } })
+    await wait(300)
+  })
+  const body = treeText(t)
+  check('T03 chinese query sent to host unchanged', searchCalls.some((c) => c.q === '编译器优化'), JSON.stringify(searchCalls.slice(-1)))
+  check('T03 chinese result snippet visible', body.includes('compiler optimization in practice'), body.slice(0, 200))
+  check('T03 chinese matched fields visible', /匹配：标签、摘要|Match: tags, summary/.test(body), body.slice(0, 200))
   await act(async () => {
     t.unmount()
   })
