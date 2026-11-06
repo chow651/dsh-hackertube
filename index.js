@@ -2954,17 +2954,21 @@ export function apply(ctx) {
         name: 'hackertube_search',
         description:
           '在 Hacker News 二十年推荐的 6454 个技术视频里检索。' +
-          '当用户在讨论某个技术概念、想找深入讲解，或问有没有相关演讲、课程、论文讲解时使用。' +
-          '返回标题、频道、时长、播放量、HN 推荐理由和链接。',
+          '当用户讨论某个技术概念、想找深入讲解，或问有没有相关的演讲、课程、访谈时使用。' +
+          '支持中英文检索词，返回标题、频道、时长、观看量、HN 推荐人数、推荐理由与链接。',
         parameters: {
           query: {
             type: 'string',
             required: true,
-            description: '检索词，可以是技术概念、语言、框架名或自然语言描述',
+            description: '检索词，可以是技术概念、语言、框架名或自然语言描述，中英文均可',
           },
           limit: {
             type: 'number',
             description: '返回条数，默认 5，最多 15',
+          },
+          lang: {
+            type: 'string',
+            description: '返回文案的语言，zh 或 en，默认 zh',
           },
         },
         output: {
@@ -2972,35 +2976,104 @@ export function apply(ctx) {
           render: (_args, value) => [{ type: 'text', text: String(value) }],
         },
         async execute(args) {
-          const items = await loadList()
+          const lang = args.lang === 'en' ? 'en' : 'zh'
+          const tz = (zh, en) => (lang === 'zh' ? zh : en)
           const terms = String(args.query || '')
             .toLowerCase()
             .split(/\s+/)
             .filter(Boolean)
-          if (!terms.length) return '请提供检索词。'
-          const scored = items
-            .map((it) => {
-              const hay = [it.t, it.c, (it.tags || []).join(' '), (it.cats || []).join(' ')]
-                .join(' ')
-                .toLowerCase()
-              let score = 0
-              for (const t of terms) if (hay.includes(t)) score += 1
-              return { it, score }
-            })
-            .filter((x) => x.score > 0)
-            .sort((a, b) => b.score - a.score || (b.it.w || 0) - (a.it.w || 0))
-            .slice(0, Math.min(Number(args.limit) || 5, 15))
-          if (!scored.length) return '没有找到匹配的视频。'
-          return scored
+          if (!terms.length) return tz('请提供检索词。', 'Provide a search query.')
+
+          const items = await loadList()
+          const zhTitles = await loadI18n('zh-titles').catch(() => ({}))
+          let detailMap = null
+          try {
+            detailMap = (await loadDataset()).detail
+          } catch {
+            /* 导出不可用时退回只按列表字段检索 */
+          }
+
+          /* 拉丁词按词边界匹配，否则 raft 会命中 craft、Minecraft；中文按子串 */
+          const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          const matchers = terms.map((term) => {
+            if (/[\u4e00-\u9fff]/.test(term)) return (hay) => hay.indexOf(term) >= 0
+            const re = new RegExp('(^|[^a-z0-9])' + escapeRe(term) + '([^a-z0-9]|$)', 'i')
+            return (hay) => re.test(hay)
+          })
+
+          const scored = []
+          for (const it of items) {
+            const d = detailMap ? detailMap.get(it.v) : null
+            const titleBoth = it.t + ' ' + (zhTitles[it.v] || '')
+            const hay = [
+              titleBoth,
+              it.c || '',
+              (it.tags || []).join(' '),
+              (it.cats || []).join(' '),
+              (d && d.summary) || '',
+              (d && d.why_hn) || '',
+              (d && d.primary_topic) || '',
+            ]
+              .join(' ')
+              .toLowerCase()
+            let hits = 0
+            for (const m of matchers) if (m(hay)) hits += 1
+            if (!hits) continue
+            const titleLower = titleBoth.toLowerCase()
+            const titleHit = matchers.some((m) => m(titleLower))
+            scored.push({ it, d, hits, titleHit })
+          }
+          if (!scored.length) {
+            return tz(
+              '没有找到匹配的视频。可以换更宽泛的关键词，中英文都试试。',
+              'No matching videos. Try broader keywords, in English or Chinese.',
+            )
+          }
+
+          /* 先看命中词数，再看是否命中标题，最后用 HN 推荐强度排序 */
+          scored.sort(
+            (a, b) =>
+              b.hits - a.hits ||
+              (b.titleHit ? 1 : 0) - (a.titleHit ? 1 : 0) ||
+              (b.it.s || 0) - (a.it.s || 0),
+          )
+          const pick = scored.slice(0, Math.min(Number(args.limit) || 5, 15))
+
+          const nf = (n) => {
+            const v = Number(n) || 0
+            if (lang === 'zh') {
+              if (v >= 1e8) return (v / 1e8).toFixed(1).replace(/\.0$/, '') + ' 亿'
+              if (v >= 1e4) return (v / 1e4).toFixed(1).replace(/\.0$/, '') + ' 万'
+              return String(v)
+            }
+            if (v >= 1e9) return (v / 1e9).toFixed(1).replace(/\.0$/, '') + 'B'
+            if (v >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
+            if (v >= 1e3) return (v / 1e3).toFixed(1).replace(/\.0$/, '') + 'K'
+            return String(v)
+          }
+
+          return pick
             .map((x, i) => {
               const it = x.it
-              const mins = Math.round((it.d || 0) / 60)
-              return (
-                `${i + 1}. ${it.t} — ${it.c} · ${mins} 分钟 · ${it.w || 0} 次观看\n` +
-                `   https://www.youtube.com/watch?v=${it.v}`
-              )
+              const zh = zhTitles[it.v] || ''
+              const title = lang === 'zh' && zh ? zh : it.t
+              const alt = lang === 'zh' && zh && zh !== it.t ? '（' + it.t + '）' : ''
+              const mins = Math.max(1, Math.round((it.d || 0) / 60))
+              const bits = [
+                it.c || '',
+                tz(mins + ' 分钟', mins + ' min'),
+                tz(nf(it.w) + '次观看', nf(it.w) + ' views'),
+              ]
+              if (it.r) bits.push(tz(it.r + ' 人推荐', it.r + ' recommenders'))
+              let line = (i + 1) + '. ' + title + alt + ' — ' + bits.filter(Boolean).join(' · ')
+              const why = (x.d && (x.d.why_hn || x.d.summary)) || ''
+              if (why) {
+                line += '\n   ' + tz('HN：', 'HN: ') + (why.length > 110 ? why.slice(0, 110) + '…' : why)
+              }
+              line += '\n   https://www.youtube.com/watch?v=' + it.v
+              return line
             })
-            .join('\n')
+            .join('\n\n')
         },
       })
       void writeCache('tool-registered.json', { ok: true, at: Date.now() })

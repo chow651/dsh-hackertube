@@ -13,6 +13,7 @@ const { apply } = await import('../index.js')
 
 let handler = null
 const registered = []
+const tools = {}
 const ctx = {
   get(name) {
     if (name === 'webServer') return { register: (route) => { registered.push(route); handler = route.handler; return () => {} } }
@@ -20,6 +21,11 @@ const ctx = {
   },
   effect(fn) {
     return fn()
+  },
+  inject(names, cb) {
+    if (names.indexOf('tools') >= 0) {
+      cb({ tools: { register: (def) => { tools[def.name] = def } } })
+    }
   },
 }
 
@@ -186,6 +192,27 @@ function check(name, ok, extra = '') {
 {
   check('export manifest written', existsSync(join(tmp, '.dsh-hackertube', 'export', 'manifest.json')))
   check('export videos on disk', existsSync(join(tmp, '.dsh-hackertube', 'export', 'videos.jsonl')))
+}
+
+/* 12. 给 agent 用的 hackertube_search */
+{
+  const tool = tools['hackertube_search']
+  check('tool registered', !!tool)
+
+  const zh = await tool.execute({ query: '线性代数', limit: 3 })
+  check('tool answers chinese query', zh.indexOf('youtube.com/watch') >= 0, zh.slice(0, 60))
+  check('tool shows chinese title', /[\u4e00-\u9fff]/.test(zh), zh.slice(0, 40))
+  check('tool shows hn reason', zh.indexOf('HN') >= 0, '')
+
+  const en = await tool.execute({ query: 'backpropagation', limit: 2, lang: 'en' })
+  check('tool honours lang=en', en.indexOf(' views') >= 0 && en.indexOf('次观看') < 0, en.slice(0, 60))
+
+  /* raft 不该命中 craft / Minecraft */
+  const raft = await tool.execute({ query: 'Raft', limit: 5 })
+  check('tool word-boundary match', !/craft|Minecraft/i.test(raft), raft.slice(0, 80))
+
+  const none = await tool.execute({ query: 'zzzznotfound' })
+  check('tool empty result is explained', none.indexOf('没有找到') >= 0, none.slice(0, 30))
 }
 
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS') + ' | cache dir: ' + tmp)

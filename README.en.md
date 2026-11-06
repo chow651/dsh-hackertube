@@ -108,6 +108,24 @@ Likes, watch later, and history live on the host side, so clearing browser data 
 | `?` | Show all shortcuts |
 | `Esc` | Close overlay |
 
+## A tool for your agent
+
+The plugin registers a tool named `hackertube_search`. Once installed, your agent can search this video library from any conversation, without opening the panel.
+
+Good requests for it:
+
+- Any talk explaining Raft consensus
+- A few lectures on compiler optimization
+- Which Karpathy video covers backpropagation
+
+It searches titles, channels, tags and categories in English and Chinese, plus each video's summary and Hacker News recommendation note. Results carry title, channel, duration, view count, recommender count, the recommendation note and a link, ordered by how strongly Hacker News recommends them. Chinese queries work, and titles come back in Chinese when a translation exists.
+
+| Parameter | Meaning |
+|---|---|
+| `query` | Search terms, English or Chinese |
+| `limit` | Result count, default 5, max 15 |
+| `lang` | Language for the returned text, `zh` or `en`, default `zh` |
+
 ## First launch
 
 The plugin starts downloading the official export as soon as it loads, 17.8 MB in one request, and at the same time requests upstream pages to fill in YouTube duration, view count, and publish date. The list is only complete once both finish. A skeleton screen covers the panel in the meantime.

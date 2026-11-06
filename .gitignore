@@ -13,3 +13,6 @@ AGENTS.md
 HANDOFF.md
 ROADMAP.md
 prototype/
+
+# 临时补丁文件
+.patch-*
