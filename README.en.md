@@ -57,7 +57,7 @@ Then confirm dsh-hackertube is enabled in the plugin list and remind me to refre
 
 ### Install with the plugin manager
 
-The package is published on npm as version 0.1.1:
+The package is published on npm:
 
 ```
 plugin_manager install_bundle target=dsh-hackertube

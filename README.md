@@ -57,7 +57,7 @@ npm 上取不到就改用 target=github:chow651/dsh-hackertube。
 
 ### 用插件管理器安装
 
-包已发布到 npm，版本 0.1.1：
+包已发布到 npm：
 
 ```
 plugin_manager install_bundle target=dsh-hackertube
