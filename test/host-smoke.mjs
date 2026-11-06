@@ -791,6 +791,19 @@ async function runLanguageFixture() {
     await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'fr' }) })
     const invalid = read(await call('/hackertube/api/prefs'))
     lcheck('lang prefs ignores invalid language', invalid.lang === 'zh', String(invalid.lang))
+
+    /* 语言偏好和喜欢列表是两次独立提交，同时到达时不能互相覆盖 */
+    await Promise.all([
+      call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'en' }) }),
+      call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ likes: ['abcdef', 'ghijkl'] }) }),
+    ])
+    const merged = read(await call('/hackertube/api/prefs'))
+    lcheck(
+      'lang prefs merge concurrent writes',
+      merged.lang === 'en' && Array.isArray(merged.likes) && merged.likes.length === 2,
+      JSON.stringify(merged),
+    )
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'zh' }) })
   }
 
   /* 详情先返回原文：即使模型要等 1.2 秒，这一请求也不能等它 */

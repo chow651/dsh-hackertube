@@ -2591,6 +2591,32 @@ function json(res, code, body) {
   send(res, code, body)
 }
 
+/**
+ * prefs 是读-改-写：喜欢列表走 400ms 防抖，语言偏好单独提交，
+ * 两个请求同时到达会互相覆盖。串行化写入，后写的读得到前一次的结果。
+ */
+let prefsWriteChain = Promise.resolve()
+function mergePrefsWrite(body) {
+  const run = prefsWriteChain.then(async () => {
+    const prev = await readCache('prefs.json')
+    const old = prev && typeof prev === 'object' ? prev : {}
+    const clean = {}
+    /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
+    for (const key of ['likes', 'later', 'seen']) {
+      const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
+      clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
+    }
+    const nextLang = body && (body.lang === 'zh' || body.lang === 'en') ? body.lang : null
+    if (nextLang) clean.lang = nextLang
+    else if (old.lang === 'zh' || old.lang === 'en') clean.lang = old.lang
+    clean.at = Date.now()
+    await writeCache('prefs.json', clean)
+    return clean
+  })
+  prefsWriteChain = run.catch(() => null)
+  return run
+}
+
 async function handler(req, res) {
   const url = new URL(req.url ?? '/', 'http://local')
   const route = url.pathname.slice(PREFIX.length)
@@ -2777,19 +2803,7 @@ async function handler(req, res) {
           } catch {
             return json(res, 400, { error: 'bad json' })
           }
-          const prev = await readCache('prefs.json')
-          const old = prev && typeof prev === 'object' ? prev : {}
-          const clean = {}
-          /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
-          for (const key of ['likes', 'later', 'seen']) {
-            const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
-            clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
-          }
-          const nextLang = body && (body.lang === 'zh' || body.lang === 'en') ? body.lang : null
-          if (nextLang) clean.lang = nextLang
-          else if (old.lang === 'zh' || old.lang === 'en') clean.lang = old.lang
-          clean.at = Date.now()
-          await writeCache('prefs.json', clean)
+          const clean = await mergePrefsWrite(body)
           return json(res, 200, {
             ok: true,
             lang: clean.lang || null,

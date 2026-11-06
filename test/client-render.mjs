@@ -173,6 +173,11 @@ let translateReply = {
   },
   i18nSource: { summary: 'model', why_hn: 'machine', quote: 'model' },
 }
+/* 详情接口自带的缓存译文：有值时详情首屏就该直接显示译文 */
+let detailI18n = null
+let detailI18nSource = null
+const detailBody = () =>
+  detailI18n ? { ...DETAIL, i18n: detailI18n, i18nSource: detailI18nSource || {} } : DETAIL
 
 const statusBody = () => ({
   stage: statusStage,
@@ -231,7 +236,7 @@ global.fetch = async (url, options = {}) => {
   }
   let body = LIST
   if (u.includes('/browse') || u.includes('/taxonomy')) body = TAX
-  else if (u.includes('/video')) body = DETAIL
+  else if (u.includes('/video')) body = detailBody()
   else if (u.includes('/related')) body = RELATED
   else if (u.includes('/deps')) body = depsBody
   else if (u.includes('/config')) body = { origin: 'http://127.0.0.1:54321', authUrl: null, mediaOrigin: 'http://127.0.0.1:18090' }
@@ -1031,6 +1036,8 @@ function resetLangState() {
   prefsPosts.length = 0
   translateRequests = 0
   translateGate = null
+  detailI18n = null
+  detailI18nSource = null
   translateReply = {
     i18n: {
       summary: '向量动画入门。',
@@ -1070,6 +1077,35 @@ console.log('\n--- T05 language & translation ---')
   const t = await mountModule(loadClientModule(makeWin('en-US')))
   const body = treeText(t)
   check('T05 stored preference wins over browser', /首页/.test(body) && !/Home \| Categories/.test(body), body.slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 本机选择与宿主偏好冲突时以本机为准，刷新后语言不被顶回去 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  prefsLang = 'en'
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 10))
+  })
+  check('T05 local choice outranks host preference', /首页/.test(treeText(t)), treeText(t).slice(0, 120))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 没有本地记录时跟随宿主偏好 */
+{
+  resetLangState()
+  prefsLang = 'zh'
+  const t = await mountModule(loadClientModule(makeWin('en-US')))
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 10))
+  })
+  check('T05 host preference applies without local storage', /首页/.test(treeText(t)), treeText(t).slice(0, 120))
   await act(async () => {
     t.unmount()
   })
@@ -1122,7 +1158,13 @@ console.log('\n--- T05 language & translation ---')
   const initial = treeText(t)
   check('T05 detail shows original immediately', initial.includes('An animated introduction to vectors.'), initial.slice(0, 220))
   check('T05 translation pending state visible', /正在翻译|Translating/.test(initial), initial.slice(0, 220))
-  check('T05 detail request does not wait for translation', !fetchLog.some((line) => /\/video\?vid=a1/.test(line) && /lang=zh/.test(line)), '')
+  const detailCall = fetchLog.findIndex((line) => /\/video\?vid=a1/.test(line))
+  const translateCall = fetchLog.findIndex((line) => /\/video\/translate\?vid=a1/.test(line))
+  check(
+    'T05 translate runs after the detail request',
+    detailCall >= 0 && translateCall > detailCall,
+    'detail=' + detailCall + ' translate=' + translateCall,
+  )
   check('T05 translation not applied before it arrives', !initial.includes('向量动画入门。'), '')
   check('T05 share card action removed from watch page', !findButton(t, /(分享卡片|Share card)/), '')
 
@@ -1135,6 +1177,32 @@ console.log('\n--- T05 language & translation ---')
   check('T05 model provenance label visible', after.includes('模型译'), after.slice(0, 260))
   check('T05 machine provenance label visible', after.includes('机翻'), after.slice(0, 260))
   check('T05 async translation request fired', translateRequests > 0, String(translateRequests))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 宿主已有译文：详情一次到位，不再发翻译请求 */
+{
+  resetLangState()
+  langStorage.set('ht.lang', 'zh')
+  detailI18n = { summary: '缓存摘要', why_hn: '缓存推荐理由', quote: '缓存引用' }
+  detailI18nSource = { summary: 'model', why_hn: 'machine', quote: 'model' }
+  const t = await mountModule(loadClientModule(makeWin('zh-CN')))
+  await openWatch(t)
+  const body = treeText(t)
+  check(
+    'T05 cached translation shows without waiting',
+    body.includes('缓存摘要') && !body.includes('An animated introduction to vectors.'),
+    body.slice(0, 220),
+  )
+  check('T05 cached translation keeps provenance', body.includes('模型译') && body.includes('机翻'), body.slice(0, 220))
+  check('T05 cached translation skips async request', translateRequests === 0, String(translateRequests))
+  check(
+    'T05 cached detail is requested in chinese',
+    fetchLog.some((line) => /\/video\?vid=a1/.test(line) && /lang=zh/.test(line)),
+    '',
+  )
   await act(async () => {
     t.unmount()
   })

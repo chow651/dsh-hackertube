@@ -341,13 +341,23 @@ window.__ModuleLoader__.load({
       return item.t || tx(lang, '(无标题)', '(untitled)')
     }
 
-    function loadDetail(vid) {
-      const hit = mem.detail.get(vid)
+    /** 中文详情比原文多带一份缓存译文，缓存键必须带语言，两种结果不能互相顶掉。 */
+    function detailCacheKey(vid, lang) {
+      return lang === 'zh' ? vid + ':zh' : vid
+    }
+
+    /**
+     * 详情只回原文和已有的译文缓存，Host 不会在这里等模型或机翻，
+     * 所以带上 lang=zh 不会拖慢首屏，只是让已翻过的视频直接显示译文。
+     */
+    function loadDetail(vid, lang) {
+      const key = detailCacheKey(vid, lang)
+      const hit = mem.detail.get(key)
       if (hit) return Promise.resolve(hit)
-      const q = '/hackertube/api/video?vid=' + encodeURIComponent(vid)
+      const q = '/hackertube/api/video?vid=' + encodeURIComponent(vid) + (lang === 'zh' ? '&lang=zh' : '')
       return getJSON(q).then((d) => {
         if (mem.detail.size > 40) mem.detail.delete(mem.detail.keys().next().value)
-        mem.detail.set(vid, d)
+        mem.detail.set(key, d)
         return d
       })
     }
@@ -1578,7 +1588,8 @@ window.__ModuleLoader__.load({
         setTrText(null)
         setTrSource({})
         setTrBusy(false)
-        loadDetail(item.v)
+        /* 语言只影响这一次请求带不带 lang=zh；切语言后由下面的异步翻译补齐，不重拉详情 */
+        loadDetail(item.v, lang)
           .then((d) => {
             if (alive) setDetail(d)
           })
@@ -1678,8 +1689,10 @@ window.__ModuleLoader__.load({
           setTrBusy(false)
           return undefined
         }
+        /* 详情带的缓存译文和已经补到的译文都算数，任缺一项才补 */
         const cached = detail.i18n || {}
-        if (fields.every((field) => cached[field])) {
+        const have = (field) => !!cached[field] || !!(trText && trText[field])
+        if (fields.every(have)) {
           setTrBusy(false)
           return undefined
         }
@@ -1694,7 +1707,10 @@ window.__ModuleLoader__.load({
             if (!alive || !d || !d.i18n) return
             setTrText(d.i18n)
             setTrSource(d.i18nSource || {})
-            mem.detail.set(item.v, Object.assign({}, detail, { i18n: d.i18n, i18nSource: d.i18nSource || {} }))
+            mem.detail.set(
+              detailCacheKey(item.v, 'zh'),
+              Object.assign({}, detail, { i18n: d.i18n, i18nSource: d.i18nSource || {} }),
+            )
           })
           .catch(() => {})
           .then(() => {
@@ -1703,7 +1719,7 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
-      }, [lang, detail, item.v])
+      }, [lang, detail, item.v, trText])
 
       useEffect(() => {
         if (descOpen) return
@@ -2517,9 +2533,11 @@ window.__ModuleLoader__.load({
         ensureTitles()
       }, [])
 
-      /* 宿主端保存过语言偏好就跟随；用户已经手动切换时不再覆盖 */
+      /* 宿主端保存过语言偏好就跟随；本机有明确选择或用户刚手动切换时不被覆盖 */
       useEffect(() => {
         let alive = true
+        /* localStorage 写不进去的宿主（dsh-app://）才需要宿主兜底 */
+        if (readStoredLang()) return undefined
         getJSON('/hackertube/api/prefs')
           .then((d) => {
             if (!alive || !d || langTouchedRef.current) return
