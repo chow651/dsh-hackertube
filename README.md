@@ -112,13 +112,38 @@ DSH 从 profile 目录加载插件，在普通项目里安装不会生效。需�
 
 插件注册了一个工具 `hackertube_search`。装了插件之后，不用打开面板，agent 在对话里就能检索这个视频库。
 
-适合这类请求：
+### 一次完整的对话
+
+你问：
+
+> 有没有讲 Raft 共识算法的视频？最好是作者本人讲的。
+
+agent 调用 `hackertube_search({ query: "Raft 共识算法", limit: 5 })`，工具返回（节选）：
+
+```
+1. Paxos 讲座（Raft 用户研究） — Diego Ongaro · 67 分钟 · 11.4 万次观看 · 6 人推荐
+   HN：Recommended as a clear, lucid way to learn Paxos and Multi-Paxos…
+   https://www.youtube.com/watch?v=JEpsBg0AO6o
+
+2. Raft 讲座（Raft 用户研究） — Diego Ongaro · 58 分钟 · 8.7 万次观看 · 4 人推荐
+   HN：HN commenters recommend it as a clearer introduction to Raft than the paper…
+   https://www.youtube.com/watch?v=YbZ3zDzDnrw
+```
+
+agent 据此回答：
+
+> 有，而且就是 Raft 作者 Diego Ongaro 本人讲的。先看第二个《Raft 讲座》，58 分钟，HN 上的评论说它比读论文好懂；它和第一个《Paxos 讲座》是同一套课程，通常一起看。
+> https://www.youtube.com/watch?v=YbZ3zDzDnrw
+
+### 适合这类请求
 
 - 有没有讲 Raft 共识算法的视频
 - 找几个讲编译器优化的演讲
 - Karpathy 讲反向传播的是哪一个
 
-它按中英文检索标题、频道、标签、分类，以及每个视频的简介和 HN 推荐理由，返回标题、频道、时长、观看量、HN 推荐人数、推荐理由与链接，并按 HN 推荐强度排序。中文查询也能命中，结果里的标题会显示中文译文。
+### 它做什么
+
+按中英文检索标题、频道、标签、分类，以及每个视频的简介和 HN 推荐理由，返回标题、频道、时长、观看量、HN 推荐人数、推荐理由与链接，并按 HN 推荐强度排序。中文查询也能命中，结果里的标题会显示中文译文。
 
 | 参数 | 说明 |
 |---|---|

@@ -112,13 +112,38 @@ Likes, watch later, and history live on the host side, so clearing browser data 
 
 The plugin registers a tool named `hackertube_search`. Once installed, your agent can search this video library from any conversation, without opening the panel.
 
-Good requests for it:
+### One full exchange
+
+You ask:
+
+> Which video should I actually watch to understand backpropagation?
+
+The agent calls `hackertube_search({ query: "backpropagation", limit: 5, lang: "en" })`, and the tool returns (excerpt):
+
+```
+1. The spelled-out intro to neural networks and backpropagation: building micrograd — Andrej Karpathy · 146 min · 4.4M views · 17 recommenders
+   HN: HN treats it as the best starting point for really understanding backprop and neural nets…
+   https://www.youtube.com/watch?v=VMj-3S1tku0
+
+2. Backpropagation, intuitively | Deep Learning Chapter 3 — 3Blue1Brown · 13 min · 6.4M views · 4 recommenders
+   HN: Recommended as the most accessible introduction to backprop for people who struggle with the pure math.
+   https://www.youtube.com/watch?v=Ilg3gGewQ5U
+```
+
+The agent answers:
+
+> Start with Karpathy's "building micrograd", 146 min. It has 17 recommenders, the strongest signal HN gives, and it builds backpropagation from scratch in code instead of explaining it on paper. If you want the intuition first, watch the 3Blue1Brown chapter (13 min) before it.
+> https://www.youtube.com/watch?v=VMj-3S1tku0
+
+### Good requests for it
 
 - Any talk explaining Raft consensus
 - A few lectures on compiler optimization
 - Which Karpathy video covers backpropagation
 
-It searches titles, channels, tags and categories in English and Chinese, plus each video's summary and Hacker News recommendation note. Results carry title, channel, duration, view count, recommender count, the recommendation note and a link, ordered by how strongly Hacker News recommends them. Chinese queries work, and titles come back in Chinese when a translation exists.
+### What it does
+
+Searches titles, channels, tags and categories in English and Chinese, plus each video's summary and Hacker News recommendation note. Results carry title, channel, duration, view count, recommender count, the recommendation note and a link, ordered by how strongly Hacker News recommends them. Chinese queries work, and titles come back in Chinese when a translation exists.
 
 | Parameter | Meaning |
 |---|---|
