@@ -1567,7 +1567,7 @@ async function runRecommendFixture() {
     const before = read(await call('/hackertube/api/recommend'))
     const beforeItems = Array.isArray(before.items) ? before.items : []
     fxcheck('T06 feedback starts with a like feed', before.mode === 'likes' && beforeItems.length > 1, String(before.mode))
-    fxcheck('T06 feedback first item known', beforeItems[0] && beforeItems[0].v === 'simvec01', beforeItems[0] && beforeItems[0].v)
+    fxcheck('T06 feedback starts with the related pick nearby', beforeItems.slice(0, 4).some((x) => x.v === 'simvec01'), JSON.stringify(beforeItems.slice(0, 4).map((x) => x.v)))
 
     const posted = await callPost('/hackertube/api/prefs', {
       likes: ['likevid1'],
@@ -1593,12 +1593,13 @@ async function runRecommendFixture() {
     fxcheck('T06 cold mode', data.mode === 'cold', String(data.mode))
     const items = Array.isArray(data.items) ? data.items : []
     fxcheck('T06 cold has recommendations', items.length >= 4, String(items.length))
+    const playlistPick = items.slice(0, 4).find((x) => x.reason && x.reason.kind === 'playlist')
+    fxcheck('T06 cold mixes in a playlist pick', !!playlistPick, JSON.stringify(items.slice(0, 4).map((x) => x.v + ':' + (x.reason && x.reason.kind))))
     fxcheck(
-      'T06 cold uses playlist first',
-      items[0] && items[0].v === 'playpick1' && items[0].reason && items[0].reason.kind === 'playlist',
-      JSON.stringify(items[0] && { v: items[0].v, reason: items[0].reason }),
+      'T06 cold playlist reason names playlist',
+      !!playlistPick && playlistPick.reason.title === 'Start here',
+      playlistPick && playlistPick.reason.title,
     )
-    fxcheck('T06 cold playlist reason names playlist', items[0] && items[0].reason && items[0].reason.title === 'Start here', items[0] && items[0].reason && items[0].reason.title)
     fxcheck('T06 cold fills with HN score', items.some((x) => x.reason && x.reason.kind === 'hn'))
     fxcheck('T06 cold every item has a reason', items.every((x) => x.reason && x.reason.kind))
   }
@@ -1610,11 +1611,17 @@ async function runRecommendFixture() {
     fxcheck('T06 like mode', data.mode === 'likes', String(data.mode))
     const items = Array.isArray(data.items) ? data.items : []
     fxcheck('T06 has recommendations', items.length >= 4, String(items.length))
-    fxcheck('T06 top item follows embeddings', items[0] && items[0].v === 'simvec01', items[0] && items[0].v)
+    const front = items.slice(0, 4).map((x) => x.v)
+    fxcheck('T06 related pick reaches the front', front.indexOf('simvec01') >= 0, JSON.stringify(front))
     fxcheck(
       'T06 explanation because you liked',
-      items[0] && items[0].reason && items[0].reason.kind === 'like' && items[0].reason.vid === 'likevid1',
+      items.some((x) => x.reason && x.reason.kind === 'like' && x.reason.vid === 'likevid1'),
       JSON.stringify(items[0] && items[0].reason),
+    )
+    fxcheck(
+      'T06 front mixes tiers',
+      new Set(items.slice(0, 6).map((x) => x.reason && x.reason.tier).filter(Boolean)).size >= 2,
+      JSON.stringify(items.slice(0, 6).map((x) => x.reason && x.reason.tier)),
     )
     fxcheck('T06 reason carries source title', items[0] && items[0].reason && items[0].reason.title === 'Liked video about graphs', items[0] && items[0].reason && items[0].reason.title)
     fxcheck('T06 related graph candidate included', items.some((x) => x.v === 'relpick1'))
