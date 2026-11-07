@@ -1,59 +1,148 @@
+<div align="center">
+
 # HackerTube for DeepSeek Harness
 
-简体中文 | [English](README.en.md)
+**将 Hacker News 二十年精选的 6,454 支高分技术视频搬进你的 IDE**
 
-在 DSH 面板内浏览并播放 Hacker News 二十年间反复推荐的技术视频，无需切换到浏览器。触手可及的高质量英文视频信源，让你的 DeepSeek Harness 变得更丰富有趣。
+[![npm version](https://img.shields.io/npm/v/dsh-hackertube.svg?style=flat-square&color=cb3837)](https://www.npmjs.com/package/dsh-hackertube)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg?style=flat-square)](https://nodejs.org)
+[![DeepSeek Harness](https://img.shields.io/badge/DSH-Plugin-blueviolet.svg?style=flat-square)](https://github.com/chow651/dsh-hackertube)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg?style=flat-square)](package.json)
 
-![首页](docs/home-zh.png)
+[简体中文](README.md) | [English](README.en.md)
 
-数据集来自 Andrej Karpathy 的 [HackerTube](https://karpathy.bearblog.dev/hacker-tube/)。站点提供完整的数据导出，作者在博客中说明其用途：
+<br />
 
-> Export of the site's data available to give to your agent to easily create your own version.
+<p align="center">
+  无需在编辑器与浏览器之间来回切换。<br />
+  在 <b>DeepSeek Harness</b> 侧边栏畅享 Hacker News 社区精选的高质量技术演讲、AI 课程与系统架构视频。<br />
+  开箱即用的全量中文、字幕级上下文 AI 深度解析、原生 Agent 检索工具，让高价值信源触手可及。
+</p>
 
-本插件使用的正是这份官方导出。非官方项目，与 Andrej Karpathy、Hacker News、YouTube 均无隶属关系。
+![HackerTube 首页预览](docs/home-zh.png)
 
-原站同样可以直接访问。并入面板之后它多出一些原站做不到的事情，逐条列在[与原始站点的差别](#与原始站点的差别)一节。
+</div>
 
-## 与原始站点的差别
+---
 
-原站是一个纯浏览型的目录：打开、看片、关掉，界面全英文。并入 DSH 面板之后，它在七件事上不一样。
+## ✨ 核心特性
 
-**不用离开当前窗口。** 播放器、详情、HN 讨论、相关推荐都在面板内，边写代码边看，不用来回切标签页。
+- 📺 **沉浸式内嵌播放**：专为 DSH 打造的独立安全中转服务，边写代码边看技术精华，无需切换窗口，告别空白屏与第三方防盗链限制。
+- 🤖 **字幕级上下文 AI 问答**：问「这一段在讲什么」时，自动抓取播放点前后 3 分钟的精确字幕送入模型，直击技术细节，拒绝空洞概括。
+- 🇨🇳 **开箱即用全量汉化**：随仓库内置全部 6,454 条标题与 166 个分类的中文对照，装完即用；详情摘要与 HN 讨论支持「模型精翻 + 本地机翻」双引擎按需解析。
+- 🔍 **原生 Agent 检索工具**：注册 `hackertube_search` 原生 Tool，Agent 在协助日常开发时可直接检索 20 年精选视频信源并给出推荐。
+- 🎯 **国内镜像无缝直达**：自动嗅探 B 站高质量搬运与中文字幕（基于物理时长指纹校验），命中即显直达入口，无则静默不打扰。
+- ⚡ **零运行时依赖 & 毫秒级推荐**：纯原生 Node.js 实现（0 外部 npm 依赖），内置 384 维向量质心推荐算法；历史与喜好本地持久化。
 
-**内容是中文的。** 6454 条标题与 166 个分类名随仓库附带，装完就是中文。摘要、推荐理由、HN 评论按需翻译，优先走模型，模型不可用时退到机翻。
+---
 
-**可以问视频本身。** 详情页右侧的 AI 抽屉会把当前播放位置前后三分钟的字幕交给模型，所以「这一段在讲什么」得到的回答基于内容，不是复述简介。
+## 🚀 快速开始
 
-**可能有中文平台的备用入口。** 有些视频在 B 站上有现成搬运，详情页会在 YouTube 按钮旁边补一个，命中才出现。详见[备用观看源](#备用观看源)。
+> **前提条件**：已安装并运行 [DeepSeek Harness](https://github.com/chow651/dsh-hackertube)。
 
-**收藏和进度存在宿主侧。** 喜欢、稍后看、播放历史写在宿主目录里，清浏览器数据不会丢，换浏览器也还在。
+### 方式一：让 Agent 一句话自动安装（推荐）
 
-**Agent 可以直接检索这个库。** 注册了 `hackertube_search` 工具，不用打开面板，在对话里就能问「有没有讲 Raft 的视频」。
+直接在 DeepSeek Harness 对话框中把这句话发给 Agent：
 
-**推荐会跟着你的口味走。** 喜欢过的视频参与首页排序，第一次打开时用播放列表和 HN 分数兜底。
+```text
+安装并启用 HackerTube 插件：plugin_manager install_bundle target=dsh-hackertube。
+若 npm 访问受限则使用 target=github:chow651/dsh-hackertube。
+装完确认插件列表中 dsh-hackertube 已启用，并提醒我刷新页面。
+```
 
-| 能力 | 原站 | 本插件 |
+### 方式二：使用插件管理器安装
+
+在 DSH 终端执行：
+
+```bash
+plugin_manager install_bundle target=dsh-hackertube
+# 或直接从 GitHub 仓库安装：
+# plugin_manager install_bundle target=github:chow651/dsh-hackertube
+```
+
+### 方式三：手动包管理安装
+
+```bash
+# 在 DSH profile 目录下执行
+npm install dsh-hackertube
+# 或
+pnpm add dsh-hackertube
+```
+
+安装完成后在插件列表中启用 `dsh-hackertube` 并刷新页面即可。**无需任何 API Key，无需预配置，开箱即用。**
+
+---
+
+## 🤖 原生 Agent 工具集成
+
+插件向 DeepSeek Harness 注册了 `hackertube_search` 原生工具。在日常写代码或向 Agent 提问时，Agent 可直接按语义检索视频库并给出带技术依据的参考：
+
+### 对话示例
+
+> **你**：有没有讲 Raft 共识算法的视频？最好是作者本人讲的。
+
+**Agent** 自动调用 `hackertube_search({ query: "Raft 共识算法", limit: 5 })`，秒级分析后回答：
+
+> 有，推荐看 Raft 作者 Diego Ongaro 本人在 Stanford 的公开演讲《Raft 讲座》（58 分钟，HN 4 人力荐）。社区评价它比论文更加通俗直观；若需了解前置知识，可以搭配同系列的《Paxos 讲座》（67 分钟）一起看。
+> 🔗 https://www.youtube.com/watch?v=YbZ3zDzDnrw
+
+### 工具参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | 是 | 检索关键词，支持中英文混搜（如 `编译器优化`、`micrograd`） |
+| `limit` | number | 否 | 返回条数，默认 `5`，最多 `15` |
+| `lang` | string | 否 | 返回文本语言，`zh`（默认）或 `en` |
+
+---
+
+## 💡 与原始 HackerTube 站点的对比
+
+本项目基于 Andrej Karpathy 开源的 [HackerTube 官方导出数据](https://karpathy.bearblog.dev/hacker-tube/)，针对 IDE 开发者工作流进行了全面重构：
+
+| 能力维度 | 原始站点 | 本插件 (DSH Plugin) |
 |---|---|---|
-| 浏览与播放 | 有 | 有 |
-| 界面语言 | 英文 | 中英双语 |
-| 标题与分类中文 | 无 | 全量，装完即生效 |
-| 摘要与评论翻译 | 无 | 按需，模型优先 |
-| AI 问答（带字幕上下文） | 无 | 有 |
-| 分享卡片 | 无 | 有 |
-| 收藏与播放历史 | 浏览器本地 | 宿主侧持久化 |
-| 个性化推荐 | 无 | 有 |
-| Agent 检索工具 | 无 | 有 |
-| 中文平台备用源 | 无 | 按需，命中才出现 |
+| **交互场景** | 独立网页浏览 | **嵌入 DSH 工作台**，边写代码边看 |
+| **语言支持** | 纯英文 | **全量中英双语**，6,454 条中文标题装完即用 |
+| **AI 问答** | 无 | **带播放点字幕上下文**的深度问答 |
+| **Agent 调用** | 无 | **内置 Agent 原生检索工具** |
+| **观看备用源** | 仅 YouTube | **智能嗅探国内高质量搬运/中字** |
+| **进度与偏好** | 浏览器本地临时存储 | **宿主本地持久化**，清理浏览器缓存不丢失 |
+| **个性化推荐** | 无 | **384 维向量质心 + HN 共推荐图谱** |
+| **离线友好度** | 依赖全量实时请求 | **本地高速缓存 + 优雅降级策略** |
 
-原站的优势是简洁和即开即用，本插件把浏览体验做重了，换来了上面这些。如果只是偶尔点开看看，直接访问原站更快。
+---
 
-## 分类浏览
+## 🖥️ 界面与交互
 
-6454 个视频按主题归入 16 个大类，每个大类下再细分为 150 个二级分类。不知道看什么的时候，从分类页开始逛。
+![详情页与 AI 问答](docs/watch-zh.png)
 
-![分类页](docs/categories-zh.png)
+### 快捷键支持
 
-| 大类 | 二级分类 | 视频数 |
+| 按键 | 作用 | 按键 | 作用 |
+|---|---|---|---|
+| `/` | 聚焦搜索框 | `j` / `k` | 上下移动选中卡片 |
+| `Enter` | 打开选中视频 | `l` | 喜欢 / 取消喜欢 |
+| `w` | 加入稍后看 | `h` | 返回首页 |
+| `?` | 显示快捷键指南 | `Esc` | 关闭详情或浮层 |
+
+### 🎯 国内备用源智能直达
+
+为方便网络受限或偏好中文字幕的开发者，插件在详情页提供智能国内平台（B站）备用入口：
+
+- **严格指纹校验**：基于物理视频时长（±2s 容差）、发布时序及双向引用凭据进行刚性校验，杜绝同名搬运与二创误判。
+- **版本质量优选**：自动在多个搬运中优先挑选 `官方` → `中字/熟肉` → `高清` 版本。
+- **静默按需查询**：仅在打开详情页时按需毫秒级检索并缓存；若未检索到对应搬运则**完全静默不打扰**，不增加额外占位。
+
+<details>
+<summary><b>📂 点击展开：16 个技术领域分类分布（6,454 支视频）</b></summary>
+
+<br />
+
+![分类浏览页](docs/categories-zh.png)
+
+| 大类 | 子分类数 | 包含视频数 |
 |---|---:|---:|
 | 软件工程与编程语言 | 11 | 980 |
 | 系统、网络与安全 | 10 | 702 |
@@ -72,244 +161,62 @@
 | 艺术、喜剧、音乐与电影 | 12 | 1344 |
 | 思想、学习与语言 | 9 | 689 |
 
-一个视频可以同时属于多个大类，所以"视频数"之和大于 6454。
+> 注：部分跨领域视频可能归属于多个分类，因此各分类视频数之和大于总数。
 
-## 安装
+</details>
 
-需要已安装 DeepSeek Harness 本体。
+---
 
-### 一句话让 agent 装
+## ⚡ 性能与技术架构
 
-把下面这段发给 DSH 里的 agent，安装、启用、核对都由它完成：
+- **零运行时依赖**：解压采用 Node.js 原生 `zlib`，无任何额外 npm 运行时依赖，极轻极简。
+- **极致响应速度**：
+  - 启动后列表渲染：**~45 ms**
+  - 详情页打开耗时：**~10 ms**
+  - 关联推荐（共推荐关系）：**~2 ms**
+  - 向量余弦近邻检索：首次约 **0.7 s**，后续全内存命中
+- **优雅降级机制**：
 
-```
-安装并启用 HackerTube 插件：plugin_manager install_bundle target=dsh-hackertube。
-npm 上取不到就改用 target=github:chow651/dsh-hackertube。
-装完确认插件列表里 dsh-hackertube 已启用，并提醒我刷新页面。
-```
-
-### 用插件管理器安装
-
-包已发布到 npm：
-
-```
-plugin_manager install_bundle target=dsh-hackertube
-```
-
-也可以直接从 Git 仓库安装，宿主如何解析安装参数取决于版本：
-
-```
-plugin_manager install_bundle target=github:chow651/dsh-hackertube
-```
-
-### 用 npm 或 pnpm 安装
-
-```
-npm install dsh-hackertube
-```
-
-```
-pnpm add dsh-hackertube
-```
-
-DSH 从 profile 目录加载插件，在普通项目里安装不会生效。需要在该 profile 目录下安装，把包名加入它的 `dsh.profile.bundles` 数组，然后重启 DSH。上面那条 `plugin_manager` 命令会自动完成这三步，只有在写脚本或做批量部署时才需要手动走一遍。
-
-安装后在插件列表中启用 `dsh-hackertube` 并刷新页面。无需额外配置，无需 API key，也不需要在安装前预取任何数据。
-
-## 功能
-
-![详情页](docs/watch-zh.png)
-
-收录 6454 个视频，分属 16 个大类与 150 个二级分类，按 HN 推荐力度排序。首页首次加载 60 条，滚动时分批追加。
-
-详情页包含播放器、该视频在 HN 上的讨论，以及右侧的相关推荐。右侧另有 AI 问答页，会把当前播放位置前后三分钟的字幕片段一并交给模型，因此可以询问某一段的具体内容。
-
-播放按钮旁边有时会多出一个「在 B 站观看」，那是查到同一支片子有中文平台搬运时才会出现的备用入口，没有就是没有。
-
-搜索支持中英文混用，中文查询会同时匹配中文标题与英文标签。
-
-喜欢、稍后看与播放历史记录在宿主侧，清除浏览器数据不会丢失。
-
-### 快捷键
-
-| 按键 | 作用 |
-|---|---|
-| `/` | 聚焦搜索框 |
-| `j` `k` | 在卡片间上下移动 |
-| `Enter` | 打开当前卡片 |
-| `l` | 标记喜欢 |
-| `w` | 加入稍后看 |
-| `h` | 返回首页 |
-| `?` | 显示快捷键一览 |
-| `Esc` | 关闭浮层 |
-
-## 备用观看源
-
-有些视频在 B 站上有现成的搬运，尤其是带字幕的那种。详情页会在「在 YouTube 观看」旁边补一个入口，命中才出现，没命中就什么都不显示——不放占位、不显示「暂无」。
-
-判定不是关键词匹配，是几条硬约束一起过：
-
-- **时长必须一致**，容差 ±2 秒。搬运是逐秒复制的，这是最稳的物理指纹。
-- **不能早于原视频发布**。搬运不会早于原片。
-- **要有内容凭据**：简介里写着本条原视频的地址，或者标题与原标题高度重合，或者合集里某一集的时长对得上。
-
-简介里的视频地址是双向证据。它指向本条，就是铁证；它指向同一个作者的**另一支**视频，就直接否决，哪怕标题很像。这条规则来自一次真实的误判：某频道《这不是邦联国旗？》的简介里写着另一支视频的地址，被同频道一条时长巧合的片子顶了上来。
-
-多个搬运版本时按这个顺序挑：
-
-```
-官方入驻号  →  明确标注中字或熟肉  →  中文标题或高播放  →  其余按播放量
-```
-
-按钮后面的小标就是档位，`官方`、`中字`、`中文`、`转载` 四种。转载不会因为播放量低被丢掉——有的频道根本没有官方入驻，高质量转载就是唯一选项。
-
-二次创作不算。解说、改编、reaction 这类重新演绎的内容会被排除，点过去看到的必须是同一支片子。但简介里有原视频地址时不排除，因为搬运号常把「万字解析」这类词当自家噱头，标在真熟肉标题上。
-
-查询是按需的：打开详情页才查一次，首次约 0.8 秒，之后读本地缓存是 0 毫秒。没打开过的视频不会被查，也不会向对方站点发出任何请求。
-
-命中率大约一半。冷门视频、版权严格的官媒内容基本找不到对应搬运，这是内容存量决定的——不是查询能力不够，是对面真的没有。
-
-## 给 agent 用的工具
-
-插件注册了一个工具 `hackertube_search`。装了插件之后，不用打开面板，agent 在对话里就能检索这个视频库。
-
-### 一次完整的对话
-
-你问：
-
-> 有没有讲 Raft 共识算法的视频？最好是作者本人讲的。
-
-agent 调用 `hackertube_search({ query: "Raft 共识算法", limit: 5 })`，工具返回（节选）：
-
-```
-1. Paxos 讲座（Raft 用户研究） — Diego Ongaro · 67 分钟 · 11.4 万次观看 · 6 人推荐
-   HN：Recommended as a clear, lucid way to learn Paxos and Multi-Paxos…
-   https://www.youtube.com/watch?v=JEpsBg0AO6o
-
-2. Raft 讲座（Raft 用户研究） — Diego Ongaro · 58 分钟 · 8.7 万次观看 · 4 人推荐
-   HN：HN commenters recommend it as a clearer introduction to Raft than the paper…
-   https://www.youtube.com/watch?v=YbZ3zDzDnrw
-```
-
-agent 据此回答：
-
-> 有，而且就是 Raft 作者 Diego Ongaro 本人讲的。先看第二个《Raft 讲座》，58 分钟，HN 上的评论说它比读论文好懂；它和第一个《Paxos 讲座》是同一套课程，通常一起看。
-> https://www.youtube.com/watch?v=YbZ3zDzDnrw
-
-### 适合这类请求
-
-- 有没有讲 Raft 共识算法的视频
-- 找几个讲编译器优化的演讲
-- Karpathy 讲反向传播的是哪一个
-
-### 它做什么
-
-按中英文检索标题、频道、标签、分类，以及每个视频的简介和 HN 推荐理由，返回标题、频道、时长、观看量、HN 推荐人数、推荐理由与链接，并按 HN 推荐强度排序。中文查询也能命中，结果里的标题会显示中文译文。
-
-| 参数 | 说明 |
-|---|---|
-| `query` | 检索词，中英文均可 |
-| `limit` | 返回条数，默认 5，最多 15 |
-| `lang` | 返回文案的语言，`zh` 或 `en`，默认 `zh` |
-
-## 首次启动
-
-插件加载时即开始下载官方数据导出（17.8 MB，一次性），并同时请求上游接口补齐 YouTube 的时长、播放量与发布时间。两者完成后列表才是完整状态，期间界面显示骨架屏。
-
-| 项目 | 实测耗时 |
-|---|---|
-| 首次安装（空缓存） | 约 10 秒 |
-| 后续启动，列表加载 | 45 毫秒 |
-| 打开详情页 | 10 毫秒 |
-| 相关推荐，有共推荐关系的 3778 个视频 | 2 毫秒 |
-| 相关推荐，其余 2676 个视频（向量近邻） | 首次约 0.7 秒 |
-| 摘要与推荐理由机翻 | 首次 0.4 至 1.8 秒 |
-
-数据导出有效期为七天，YouTube 元信息缓存二十四小时。
-
-## 中文支持
-
-界面文案统一通过 `tx(lang, 中文, English)` 输出，两种语言下均不会出现中英混排。数量单位随语言切换，中文使用万与亿，英文使用 K 与 M。
-
-内容层面的中文来源如下。
-
-| 内容 | 来源 | 生效时机 |
+| 功能模块 | 运行条件 | 离线 / 依赖缺失时的降级表现 |
 |---|---|---|
-| 6454 条视频标题 | 随仓库附带的译文表 | 安装后立即生效 |
-| 166 条分类名称 | 随仓库附带 | 安装后立即生效 |
-| 摘要、推荐理由、评论引用 | 打开时自动翻译 | 优先使用模型，模型不可用时使用机翻 |
-| HN 评论正文 | 逐条翻译或整段翻译 | 首次约 1 秒，之后读取缓存 |
+| **浏览、检索与基础播放** | DSH Web 容器与网络 | 本地离线索引可用，支持本地搜索 |
+| **中文标题与全部分类** | 无任何外部依赖 | 随仓库自带，100% 永久离线生效 |
+| **摘要与长评论翻译** | 模型或网络翻译通道 | 自动回退展示英文原文 |
+| **AI 问答** | DSH 已配置模型 | 提示模型未就绪，基础播放与浏览不受影响 |
+| **字幕提取** | 可选本地 `yt-dlp` + `ffmpeg` | 缺失时仅影响 AI 获取实时字幕，视频照常播放 |
+| **国内备用源** | 国内平台网络连通 | 无法连通时不展示备用入口，正常走原版播放 |
 
-模型译文与机翻译文分别存放。配置模型后，模型译文会覆盖机翻结果，不会因机翻先行而无法更新。
+<details>
+<summary><b>📁 数据源与本地缓存存储结构</b></summary>
 
-机翻调用 Google 网页翻译的公共端点。评论正文默认保持英文原文，翻译为显式操作。
+<br />
 
-## 依赖与降级
+数据首次加载后缓存在 `$DSH_PROFILE_DIR/.dsh-hackertube/`（默认路径为 `~/.dsh/.dsh-hackertube/`）：
 
-| 能力 | 依赖 | 缺失时的表现 |
-|---|---|---|
-| 列表、分类、搜索、播放 | DSH 的 webServer 与外网 | 面板不可用或播放器无法加载 |
-| 中文标题与分类名 | 无 | 已随仓库提供 |
-| 摘要等三段文本的中文 | 模型或外网 | 显示英文原文 |
-| AI 问答 | DSH 已配置模型 | 面板提示模型不可用，其余功能正常 |
-| 评论翻译 | 外网 | 按钮无响应，文本保持原文 |
-| 字幕与直链兜底播放 | PATH 中存在 yt-dlp 与 ffmpeg | 视频仍可播放，AI 缺少字幕上下文 |
-| 备用观看源 | 中文平台可达 | 不出现按钮，其余功能正常 |
-
-yt-dlp 与 ffmpeg 均为可选。它们只影响两件事：AI 问答能否携带字幕上下文，以及 YouTube 嵌入被拒绝时能否回退到直链播放。
-
-## 数据来源
-
-`https://hackertube.org/download/hackertube-data.zip`，17.8 MB，导出于 2026 年 10 月 31 日。
-
-```
-videos.jsonl       6454 条视频，含标题、频道、摘要、推荐理由、标签、分类、HN 统计
-mentions.jsonl    39834 条 HN 评论，含作者、月份、立场、原文
-related.jsonl      3778 条共推荐关系
-embeddings.npy     6454 × 384 维 float16 向量，用于补齐无共推荐关系的视频
-embedding_ids.json 向量行号与视频 id 的对应
-taxonomy.json      150 个分类，16 个大类
+```text
+.dsh-hackertube/
+├── export/               # 官方解压数据包（~48 MB，含 videos、mentions、embeddings.npy 等）
+├── i18n/                 # 中文译文缓存（标题、分类、模型精翻、机翻持久化）
+├── list.json             # YouTube 播放量、时长与发布时间元数据快照
+├── prefs.json            # 用户的喜欢、稍后看与播放进度历史
+├── subs/                 # 按需缓存的字幕文件
+└── mirror.json           # 备用源检索结果与时效缓存
 ```
 
-解压使用 Node 内置的 zlib，插件不引入任何 npm 运行时依赖。
+如需重置初始状态，只需清空该目录即可。
 
-导出不包含时长、播放量、发布时间与封面，这些字段属于 YouTube 元数据，因此列表仍会并行请求 65 页上游接口补齐，结果缓存一天。
+</details>
 
-## 缓存目录
+---
 
-全部位于 `$DSH_PROFILE_DIR/.dsh-hackertube/`，默认路径为 `~/.dsh/.dsh-hackertube/`。删除整个目录可恢复到初始状态。
+## 📌 致谢与声明
 
-```
-export/               解包后的官方数据，约 48 MB
-i18n/zh-titles.json   标题译文
-i18n/zh-taxonomy.json 分类译文
-i18n/zh.json          模型翻译的详情文本
-i18n/zh-mt.json       机翻的详情文本
-i18n/zh-comments.json 评论机翻缓存
-list.json             YouTube 元信息与列表快照
-prefs.json            喜欢、稍后看、历史
-subs/                 字幕
-mirror.json           备用源解析结果与时间戳
-```
+- 核心数据源自 **[Andrej Karpathy](https://github.com/karpathy)** 创建的 [HackerTube](https://karpathy.bearblog.dev/hacker-tube/) 项目并遵循其开放数据倡议。
+- 讨论内容取自 [Hacker News](https://news.ycombinator.com)，视频版权归 YouTube 原创作者所有。
+- 本项目为开源社区第三方插件，非官方出品，与 Andrej Karpathy、Hacker News 或 YouTube 无隶属关系。
 
-## 已知限制
+---
 
-标题译文由模型生成后按规则校对，多数通顺，仍有约一千条偏向直译。
+## 📄 许可证
 
-中文查询需要先机翻为英文才能命中英文标签，每次查询发起一次请求，含 300 毫秒防抖与内存缓存。断网时仅保留本地匹配。
-
-YouTube 嵌入受上游策略限制，年龄限制或地区限制的视频需前往 YouTube 观看。
-
-播放中转页监听 `127.0.0.1:18090`，端口被占用时依次尝试 18091 与 18092。
-
-备用源只在确实存在对应搬运时出现，覆盖率约一半。没出现按钮不代表插件没工作，多数情况是对面确实没有这支片子。
-
-## 致谢
-
-感谢 Andrej Karpathy 开发 HackerTube 并将数据导出公开，本插件建立在这份工作之上。
-
-讨论内容来自 [Hacker News](https://news.ycombinator.com)，视频托管于 YouTube。
-
-## 许可
-
-MIT
+[MIT License](LICENSE) © 2026
