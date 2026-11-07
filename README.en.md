@@ -2,7 +2,7 @@
 
 # HackerTube for DeepSeek Harness
 
-**Two Decades of Hacker News Top Technical Videos — Right Inside Your IDE**
+**Two Decades of Hacker News Top Technical Videos — Right Inside DeepSeek Harness**
 
 [![npm version](https://img.shields.io/npm/v/dsh-hackertube.svg?style=flat-square&color=cb3837)](https://www.npmjs.com/package/dsh-hackertube)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -15,9 +15,9 @@
 <br />
 
 <p align="center">
-  No need to switch back and forth between editor tabs and a browser.<br />
+  No need to switch away from DeepSeek Harness to an external browser.<br />
   Browse and watch 6,454 high-impact engineering talks, lectures, and documentaries<br />
-  recommended over twenty years on Hacker News, directly in your <b>DeepSeek Harness</b> workspace.<br />
+  recommended over twenty years on Hacker News, directly in your <b>DeepSeek Harness</b> panel.<br />
   Featuring full bilingual support, subtitle-aware AI answers, and a native Agent search tool.
 </p>
 
@@ -29,7 +29,7 @@
 
 ## ✨ Key Features
 
-- 📺 **Seamless In-Editor Player**: Dedicated local relay avoids third-party embed and referrer restrictions. Watch high-value engineering talks side-by-side with your code without tab-switching.
+- 📺 **Seamless In-Panel Player**: Dedicated local relay avoids third-party embed and referrer restrictions. Watch high-value engineering talks directly inside DeepSeek Harness.
 - 🤖 **Subtitle-Aware AI Q&A**: Asking "what is this part about?" extracts the exact subtitle window around your current playhead (±3 mins) for grounded, precise technical explanations.
 - 🇨🇳 **Built-in Bilingual Localization**: Ships with 6,454 Chinese titles and 166 taxonomy categories ready on install. Summaries and discussions support both on-demand model translation and machine translation fallback.
 - 🔍 **Native Agent Tool**: Registers `hackertube_search` so your AI agent can query 20 years of HN technical recommendations directly inside coding conversations.
@@ -77,7 +77,7 @@ Enable `dsh-hackertube` in your plugin list and refresh the workspace. **No API 
 
 ## 🤖 Native Agent Tool Integration
 
-The plugin registers `hackertube_search` with DeepSeek Harness. Your agent can search the library semantically during development workflows:
+The plugin registers `hackertube_search` with DeepSeek Harness. Your agent can search the library semantically during conversation workflows:
 
 ### Example Exchange
 
@@ -100,11 +100,11 @@ The plugin registers `hackertube_search` with DeepSeek Harness. Your agent can s
 
 ## 💡 Comparison with the Original Site
 
-Built upon Andrej Karpathy's open [HackerTube data export](https://karpathy.bearblog.dev/hacker-tube/), tailored specifically for developer environments:
+Built upon Andrej Karpathy's open [HackerTube data export](https://karpathy.bearblog.dev/hacker-tube/), tailored specifically for the DeepSeek Harness panel environment:
 
 | Capability | Original Site | HackerTube DSH Plugin |
 |---|---|---|
-| **Context** | Standalone web browser | **Embedded inside DSH workspace** |
+| **Context** | Standalone web browser | **Embedded inside DeepSeek Harness panel** |
 | **Localization** | English only | **Full EN/ZH bilingual**, 6,454 translated titles ready |
 | **AI Q&A** | None | **Subtitle-aware temporal Q&A** |
 | **Agent Tool** | None | **Native `hackertube_search` tool** |

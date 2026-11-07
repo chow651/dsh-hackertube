@@ -2,7 +2,7 @@
 
 # HackerTube for DeepSeek Harness
 
-**将 Hacker News 二十年精选的 6,454 支高分技术视频搬进你的 IDE**
+**将 Hacker News 二十年精选的 6,454 支高分技术视频搬进 DeepSeek Harness**
 
 [![npm version](https://img.shields.io/npm/v/dsh-hackertube.svg?style=flat-square&color=cb3837)](https://www.npmjs.com/package/dsh-hackertube)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -15,8 +15,8 @@
 <br />
 
 <p align="center">
-  无需在编辑器与浏览器之间来回切换。<br />
-  在 <b>DeepSeek Harness</b> 侧边栏畅享 Hacker News 社区精选的高质量技术演讲、AI 课程与系统架构视频。<br />
+  无需离开 DeepSeek Harness 切换到浏览器。<br />
+  在 <b>DeepSeek Harness</b> 面板内畅享 Hacker News 社区精选的高质量技术演讲、AI 课程与系统架构视频。<br />
   开箱即用的全量中文、字幕级上下文 AI 深度解析、原生 Agent 检索工具，让高价值信源触手可及。
 </p>
 
@@ -28,10 +28,10 @@
 
 ## ✨ 核心特性
 
-- 📺 **沉浸式内嵌播放**：专为 DSH 打造的独立安全中转服务，边写代码边看技术精华，无需切换窗口，告别空白屏与第三方防盗链限制。
+- 📺 **沉浸式内嵌播放**：专为 DSH 面板打造的独立安全中转服务，直接在 DeepSeek Harness 内流畅播放，告别空白屏与第三方防盗链限制。
 - 🤖 **字幕级上下文 AI 问答**：问「这一段在讲什么」时，自动抓取播放点前后 3 分钟的精确字幕送入模型，直击技术细节，拒绝空洞概括。
 - 🇨🇳 **开箱即用全量汉化**：随仓库内置全部 6,454 条标题与 166 个分类的中文对照，装完即用；详情摘要与 HN 讨论支持「模型精翻 + 本地机翻」双引擎按需解析。
-- 🔍 **原生 Agent 检索工具**：注册 `hackertube_search` 原生 Tool，Agent 在协助日常开发时可直接检索 20 年精选视频信源并给出推荐。
+- 🔍 **原生 Agent 检索工具**：注册 `hackertube_search` 原生 Tool，Agent 在对话交流中可直接检索 20 年精选视频信源并给出推荐。
 - 🎯 **国内镜像无缝直达**：自动嗅探 B 站高质量搬运与中文字幕（基于物理时长指纹校验），命中即显直达入口，无则静默不打扰。
 - ⚡ **零运行时依赖 & 毫秒级推荐**：纯原生 Node.js 实现（0 外部 npm 依赖），内置 384 维向量质心推荐算法；历史与喜好本地持久化。
 
@@ -76,7 +76,7 @@ pnpm add dsh-hackertube
 
 ## 🤖 原生 Agent 工具集成
 
-插件向 DeepSeek Harness 注册了 `hackertube_search` 原生工具。在日常写代码或向 Agent 提问时，Agent 可直接按语义检索视频库并给出带技术依据的参考：
+插件向 DeepSeek Harness 注册了 `hackertube_search` 原生工具。在日常与 Agent 对话时，Agent 可直接按语义检索视频库并给出带技术依据的参考：
 
 ### 对话示例
 
@@ -99,11 +99,11 @@ pnpm add dsh-hackertube
 
 ## 💡 与原始 HackerTube 站点的对比
 
-本项目基于 Andrej Karpathy 开源的 [HackerTube 官方导出数据](https://karpathy.bearblog.dev/hacker-tube/)，针对 IDE 开发者工作流进行了全面重构：
+本项目基于 Andrej Karpathy 开源的 [HackerTube 官方导出数据](https://karpathy.bearblog.dev/hacker-tube/)，针对 DeepSeek Harness 面板环境进行了全面重构：
 
 | 能力维度 | 原始站点 | 本插件 (DSH Plugin) |
 |---|---|---|
-| **交互场景** | 独立网页浏览 | **嵌入 DSH 工作台**，边写代码边看 |
+| **交互场景** | 独立网页浏览 | **嵌入 DeepSeek Harness 面板**，即开即看 |
 | **语言支持** | 纯英文 | **全量中英双语**，6,454 条中文标题装完即用 |
 | **AI 问答** | 无 | **带播放点字幕上下文**的深度问答 |
 | **Agent 调用** | 无 | **内置 Agent 原生检索工具** |
@@ -129,7 +129,7 @@ pnpm add dsh-hackertube
 
 ### 🎯 国内备用源智能直达
 
-为方便网络受限或偏好中文字幕的开发者，插件在详情页提供智能国内平台（B站）备用入口：
+为方便网络受限或偏好中文字幕的用户，插件在详情页提供智能国内平台（B站）备用入口：
 
 - **严格指纹校验**：基于物理视频时长（±2s 容差）、发布时序及双向引用凭据进行刚性校验，杜绝同名搬运与二创误判。
 - **版本质量优选**：自动在多个搬运中优先挑选 `官方` → `中字/熟肉` → `高清` 版本。
