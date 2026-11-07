@@ -27,6 +27,18 @@ DSH 插件分两半，这是硬性架构，不是选择：
 
 Client 半通过 `window.__ModuleLoader__.load()` 加载，返回 `{ inject, apply(ctx) }`。Host 半是标准的 `export function apply(ctx)`。
 
+### 三处 UI 落点
+
+Client 半注册三个位置，彼此独立：
+
+| 落点 | slot / 服务 | 行为 |
+|---|---|---|
+| 左栏活动栏图标 | `sidebar.panellist`（id `hackertube`） | 点击切到主区面板 |
+| 主区面板 | `main`（key `hackertube`） | 完整页面，`#ht-watch=<vid>` 深链 |
+| 会话右侧栏 | `sidebarRightTabs` + `sidebar.right.pane.tab`（id `dsh-hackertube:right`） | 栏内同样页面，rail 模式不碰页面 hash |
+
+右栏只使用原生 `ctx.sidebarRightTabs` / `ctx.slots`，不接 `dsh-better-sidebar` 的 `ctx.betterSidebar`。两者同时安装时各占自己的 tab，互不抢座位。服务不存在时整段注册跳过，不影响主区面板。
+
 两半通过 HTTP 通信，路由前缀 `/hackertube/api`。
 
 ### 三套服务器
@@ -238,6 +250,7 @@ dsh-app:// 页面
 - 备用片源：按需解析中文平台的搬运，命中才在「在 YouTube 观看」旁补一个入口
 - 播放进度：按视频落盘，重开时续播，页面显示上次位置并提供「从头开始」
 - 工具：`hackertube_search` 已注册，与面板共用同一检索
+- 会话右栏：原生 `sidebarRightTabs` 注册 tab 与引导页入口，栏内浏览与播放；rail 模式不读写页面 hash，窄容器下按容器宽度单列
 
 ### 不能用 / 没实现
 
@@ -269,7 +282,7 @@ plugin_manager set_bundle enabled=false target=dsh-hackertube
 plugin_manager set_bundle enabled=true  target=dsh-hackertube
 ```
 
-Host 半重载即生效。Client 半要刷新浏览器页面（DSH 有 client bundle 缓存）。
+Host 半重载即生效。Client 半要刷新浏览器页面（DSH 有 client bundle 缓存）。右栏 tab 的注册在 Client 半，改完同样要刷新；刷新后看 beacon 的 `right-pane-registered` 确认座位已注册。
 
 ### 验证方式
 
