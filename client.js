@@ -2,7 +2,9 @@
  * HackerTube Client 半 —— 经典脚本，经 __ModuleLoader__ 注入。
  *
  * 落点：左栏面板图标（sidebar.panellist，id=hackertube）与主区面板
- * （main，key=hackertube）成对绑定，点图标即切到面板。
+ * （main，key=hackertube）成对绑定，点图标即切到面板；会话页原生右侧栏
+ * 另投一个 tab（sidebar.right.pane.tab，id=dsh-hackertube:right），
+ * 不依赖 dsh-better-sidebar 的服务。
  * 数据全部来自 Host 的 /hackertube/api/*，浏览器不直接碰上游。
  */
 window.__ModuleLoader__.load({
@@ -973,7 +975,34 @@ window.__ModuleLoader__.load({
 .ht-row .ht-thumb{width:220px;flex:none;aspect-ratio:16/9}
 .ht-row .ht-title{font-size:15px;line-height:21px;height:42px}
 .ht-hgrid{display:grid;grid-template-columns:1fr 1fr;gap:0 28px;padding:0 24px}
-.ht-hgrid .ht-row .ht-thumb{width:180px}`
+.ht-hgrid .ht-row .ht-thumb{width:180px}
+/* 会话右栏：宿主给的是 320–480px 的窄容器，跟随容器宽度而不是视口 */
+.ht-rail-shell{height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;
+  container-type:inline-size;background:var(--dsw-alias-bg-base)}
+.ht-rail-shell .ht-root{height:100%;min-height:0}
+@container (max-width:560px){
+  .ht-head{padding:10px 12px;gap:8px;flex-wrap:wrap}
+  .ht-brand{font-size:15px}
+  .ht-scroll{padding:0 12px 32px}
+  .ht-chips{padding:10px 12px 0}
+  .ht-filters{padding:8px 12px 0}
+  .ht-grid,.ht-skel{grid-template-columns:1fr;gap:20px}
+  .ht-watch{padding:14px 12px 12px}
+  .ht-watch .ht-toolbar{margin-bottom:8px}
+  .ht-hgrid{padding:0 12px;grid-template-columns:1fr}
+  .ht-hgrid .ht-row .ht-thumb{width:140px}
+  .ht-sechead{padding:14px 12px 4px}
+  .ht-stagebar,.ht-stale{margin-left:12px;margin-right:12px}
+  .ht-empty,.ht-err{padding-left:12px;padding-right:12px;margin-left:0;margin-right:0}
+  .ht-keys .k{min-width:0;width:calc(100vw - 48px)}
+}
+@container (max-width:440px){
+  .ht-brand{font-size:14px}
+  .ht-lang{min-width:44px;padding:0 8px}
+  .ht-search{order:9;flex-basis:100%;max-width:none}
+  .ht-row .ht-thumb{width:120px}
+  .ht-row{gap:12px}
+}`
 
     /* ---------------- 图标 ---------------- */
 
@@ -2632,6 +2661,8 @@ window.__ModuleLoader__.load({
     }
 
     function HtRoot(props) {
+      /* 右栏模式：不读写页面 hash，观看状态只留在栏内，避免影响主会话地址 */
+      const embedded = !!(props && props.embedded)
       const [items, setItems] = useState(mem.list || [])
       const [tax, setTax] = useState(mem.tax || null)
       const [phase, setPhase] = useState(mem.list ? 'ready' : 'loading')
@@ -2813,6 +2844,7 @@ window.__ModuleLoader__.load({
 
       /* 深链恢复：地址里带 ht-watch 的视频在列表就绪后直接打开 */
       useEffect(() => {
+        if (embedded) return undefined
         if (phase !== 'ready' || watching) return
         const vid = readWatchVid()
         if (!vid) return
@@ -2822,6 +2854,7 @@ window.__ModuleLoader__.load({
 
       /* 浏览器前进/后退与 hash 变化保持同一份观看状态 */
       useEffect(() => {
+        if (embedded) return undefined
         const w = typeof window !== 'undefined' ? window : null
         if (!w || typeof w.addEventListener !== 'function') return undefined
         const sync = () => {
@@ -3040,32 +3073,36 @@ window.__ModuleLoader__.load({
       const openItem = (it) => {
         if (!it) return
         markSeen(it.v)
-        if (!watching) {
-          const el = listScrollRef.current
-          if (el) listScrollTop.current = el.scrollTop || 0
-          watchPushedRef.current = setWatchHash(it.v, 'push')
-        } else if (watching.v !== it.v) {
-          /* 相关视频是在同一次观看里换片：替换当前历史条目，Esc 一次仍回列表 */
-          setWatchHash(it.v, 'replace')
+        if (!embedded) {
+          if (!watching) {
+            const el = listScrollRef.current
+            if (el) listScrollTop.current = el.scrollTop || 0
+            watchPushedRef.current = setWatchHash(it.v, 'push')
+          } else if (watching.v !== it.v) {
+            /* 相关视频是在同一次观看里换片：替换当前历史条目，Esc 一次仍回列表 */
+            setWatchHash(it.v, 'replace')
+          }
         }
         setWatching(it)
       }
 
       const closeWatch = () => {
-        if (watchPushedRef.current) {
-          watchPushedRef.current = false
-          try {
-            const w = typeof window !== 'undefined' ? window : null
-            if (w && w.history && typeof w.history.back === 'function') {
-              w.history.back()
-              setWatching(null)
-              return
+        if (!embedded) {
+          if (watchPushedRef.current) {
+            watchPushedRef.current = false
+            try {
+              const w = typeof window !== 'undefined' ? window : null
+              if (w && w.history && typeof w.history.back === 'function') {
+                w.history.back()
+                setWatching(null)
+                return
+              }
+            } catch {
+              /* history 不可用时退回替换地址 */
             }
-          } catch {
-            /* history 不可用时退回替换地址 */
           }
+          setWatchHash(null, 'replace')
         }
-        setWatchHash(null, 'replace')
         setWatching(null)
       }
 
@@ -3502,6 +3539,11 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* 会话右栏的页面主体：窄容器里复用同一份 HtRoot，但不碰页面 hash */
+    function HtRail() {
+      return h('div', { className: 'ht-rail-shell' }, h(HtRoot, { embedded: true }))
+    }
+
     /* ---------------- 注册 ---------------- */
 
     return {
@@ -3555,6 +3597,55 @@ window.__ModuleLoader__.load({
             }
           }
         }, 'dsh-hackertube: native panel')
+
+        /* 会话页原生右栏：只投 tab 类型与主体。id 用插件自有命名空间，
+           kind 独占 hackertube；不接 dsh-better-sidebar 的 ctx.betterSidebar，
+           两者同时安装时各占自己的 tab，不抢座位。 */
+        if (typeof ctx.inject === 'function') {
+          try {
+            ctx.inject(['sidebarRightTabs'], (scope) => {
+              const tabs = scope && scope.sidebarRightTabs
+              if (!tabs || typeof tabs.register !== 'function') return
+              ctx.effect(
+                () =>
+                  tabs.register({
+                    id: 'dsh-hackertube:right',
+                    kind: 'hackertube',
+                    priority: 'extension',
+                    keepMounted: true,
+                    title: () => 'HackerTube',
+                    guide: [
+                      {
+                        id: 'hackertube',
+                        order: 60,
+                        title: () => 'HackerTube',
+                        description: () =>
+                          initialLang() === 'zh'
+                            ? '在会话右栏浏览与播放技术视频'
+                            : 'Browse and play technical videos in the sidebar',
+                        icon: (iconProps) => PlayGlyph((iconProps && iconProps.size) || 16),
+                      },
+                    ],
+                  }),
+                'dsh-hackertube: right pane type',
+              )
+              ctx.effect(
+                () =>
+                  ctx.slots.inject('sidebar.right.pane.tab', () =>
+                    ctx.slots.register(
+                      { name: 'sidebar.right.pane.tab', key: 'dsh-hackertube:right' },
+                      HtRail,
+                    ),
+                  ),
+                'dsh-hackertube: right pane body',
+              )
+              beacon('right-pane-registered', { id: 'dsh-hackertube:right' })
+            })
+          } catch (err) {
+            console.warn('[dsh-hackertube] 右栏注册失败：', err)
+            beacon('right-pane-error', { message: String((err && err.message) || err) })
+          }
+        }
 
         /* 刷新后可在控制台输入 __dshHackertube 直接看注册结果 */
         if (typeof window !== 'undefined') {

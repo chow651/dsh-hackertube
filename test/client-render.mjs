@@ -1575,5 +1575,76 @@ function instanceText(inst) {
   })
 }
 
+/* ---------- T07：会话右栏注册 ---------- */
+
+/* 右栏走原生 sidebarRightTabs；ctx.inject 是可选的，没有该服务的宿主不应报错 */
+{
+  resetRoute()
+  const w = makeWin('zh-CN')
+  const mod = loadClientModule(w)
+  const slots = []
+  const types = []
+  const ctx = {
+    slots: {
+      inject(name, cb) {
+        cb()
+        return () => {}
+      },
+      register(opts, comp) {
+        slots.push({ opts, comp })
+        return () => {}
+      },
+    },
+    effect(fn) {
+      return fn()
+    },
+    inject(services, cb) {
+      cb({
+        sidebarRightTabs: {
+          register(def) {
+            types.push(def)
+            return () => {}
+          },
+        },
+      })
+      return () => {}
+    },
+  }
+  mod.apply(ctx)
+  const type = types[0]
+  check(
+    'T07 right pane type registered',
+    !!type && type.id === 'dsh-hackertube:right' && type.kind === 'hackertube',
+    JSON.stringify(type && { id: type.id, kind: type.kind }),
+  )
+  check(
+    'T07 right pane guide entry',
+    !!type && Array.isArray(type.guide) && type.guide.length === 1 && type.guide[0].id === 'hackertube',
+    JSON.stringify(type && type.guide),
+  )
+  const body = slots.find((s) => s.opts.name === 'sidebar.right.pane.tab')
+  check('T07 right pane body registered', !!body && body.opts.key === 'dsh-hackertube:right', JSON.stringify(body && body.opts))
+
+  let t = null
+  await act(async () => {
+    t = create(React.createElement(body.comp, {}), { createNodeMock: makeNodeMock })
+  })
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 80))
+  })
+  check('T07 right pane renders shell', t.root.findAllByProps({ className: 'ht-rail-shell' }).length > 0)
+  const hashBefore = w.location.hash
+  const card = t.root
+    .findAllByType('button')
+    .find((b) => String(b.props.className || '') === 'ht-card' && b.props['data-vid'] === 'a1')
+  await act(async () => {
+    if (card) card.props.onClick()
+  })
+  check('T07 right pane keeps page hash', w.location.hash === hashBefore, `${hashBefore} -> ${w.location.hash}`)
+  await act(async () => {
+    t.unmount()
+  })
+}
+
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS'))
 process.exit(failures ? 1 : 0)
