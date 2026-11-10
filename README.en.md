@@ -30,7 +30,7 @@
 ## ✨ Key Features
 
 - 📺 **Seamless In-Panel Player**: Dedicated local relay avoids third-party embed and referrer restrictions. Watch high-value engineering talks directly inside DeepSeek Harness.
-- 📡 **HackerTube TV**: Press `T` for a full-bleed TV mode that tunes through all 6,454 videos the way TristanTube does — pick a channel by weight, then the most-watched video inside it, never repeating within a session, auto-advancing when one ends. `↑` `↓` change channels, `←` `→` seek, space pauses; title, summary and outside links stay in a drawer on the right, out of the picture.
+- 📡 **HackerTube TV**: Press `T` for a full-bleed TV mode that tunes randomly through all 6,454 videos — a channel is picked by weight, then the most-watched video inside it; nothing repeats within a session and it auto-advances when one ends. `↑` `↓` change channels, `←` `→` seek, space pauses; title, summary and outside links stay in a drawer on the right, out of the picture.
 - 🤖 **Subtitle-Aware AI Q&A**: Asking "what is this part about?" extracts the exact subtitle window around your current playhead (±3 mins) for grounded, precise technical explanations.
 - 🇨🇳 **Built-in Bilingual Localization**: Ships with 6,454 Chinese titles and 166 taxonomy categories ready on install. Summaries and discussions support both on-demand model translation and machine translation fallback.
 - 🔍 **Native Agent Tool**: Registers `hackertube_search` so your AI agent can query 20 years of HN technical recommendations directly inside coding conversations.
