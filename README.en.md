@@ -129,6 +129,16 @@ Built upon Andrej Karpathy's open [HackerTube data export](https://karpathy.bear
 | `w` | Add to Watch Later | `h` | Return to Home |
 | `?` | Show shortcut cheatsheet | `Esc` | Close details or overlay |
 
+### 📡 TV Mode
+
+Press `T` on whatever you are watching to turn it into a channel: the picture fills the panel, with no grid and no sidebar, and the title, summary and outbound links wait in the drawer on the right edge.
+
+- `↑` `↓` change channel — a weighted random pick that never repeats within a session
+- `←` `→` seek, `Space` pause / resume, `Esc` exit
+- The next channel starts by itself when a video ends; videos whose owners disabled embedding are skipped instead of landing on an error page
+
+![TV mode: full-bleed playback with the programme drawer](docs/tv-en.png)
+
 ### 🎯 Smart Alternative Mirrors
 
 For users facing network restrictions or seeking localized subtitles, the watch view dynamically checks for verified Chinese platform (Bilibili) mirrors:
