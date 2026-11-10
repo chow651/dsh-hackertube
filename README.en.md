@@ -30,6 +30,7 @@
 ## ✨ Key Features
 
 - 📺 **Seamless In-Panel Player**: Dedicated local relay avoids third-party embed and referrer restrictions. Watch high-value engineering talks directly inside DeepSeek Harness.
+- 📡 **HackerTube TV**: Press `T` for a full-bleed TV mode that tunes through all 6,454 videos the way TristanTube does — pick a channel by weight, then the most-watched video inside it, never repeating within a session, auto-advancing when one ends. `↑` `↓` change channels, `←` `→` seek, space pauses; title, summary and outside links stay in a drawer on the right, out of the picture.
 - 🤖 **Subtitle-Aware AI Q&A**: Asking "what is this part about?" extracts the exact subtitle window around your current playhead (±3 mins) for grounded, precise technical explanations.
 - 🇨🇳 **Built-in Bilingual Localization**: Ships with 6,454 Chinese titles and 166 taxonomy categories ready on install. Summaries and discussions support both on-demand model translation and machine translation fallback.
 - 🔍 **Native Agent Tool**: Registers `hackertube_search` so your AI agent can query 20 years of HN technical recommendations directly inside coding conversations.
@@ -207,6 +208,12 @@ Cached under `$DSH_PROFILE_DIR/.dsh-hackertube/` (default: `~/.dsh/.dsh-hackertu
 Delete this directory at any time to reset to a pristine state.
 
 </details>
+
+---
+
+## ⚠️ Known Limitations
+
+- **Some videos cannot play inside the panel**: a number of YouTube creators have disabled embedding for their own videos, so the player only shows "Video unavailable". That is a setting on the creator's side, not a plugin failure, and the plugin cannot work around it. How often it happens varies by video; when it does, use **Watch on YouTube** on the detail page. TV mode skips these videos, moves to the next channel, and stops sampling them afterwards.
 
 ---
 
