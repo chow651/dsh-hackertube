@@ -1724,5 +1724,91 @@ console.log('\n--- T08 TV mode ---')
   })
 }
 
+/* ---------- T09：电视模式的会话右栏窄版 ---------- */
+
+console.log('\n--- T09 TV in session pane ---')
+{
+  resetRoute()
+  async function freshPane() {
+    let t = null
+    await act(async () => {
+      t = create(React.createElement(main.comp, { embedded: true }), { createNodeMock: makeNodeMock })
+    })
+    return t
+  }
+  const pickView = (t, v) =>
+    t.root.findAllByType('button').find((b) => String((b.props && b.props['data-view']) || '') === v)
+
+  const t = await freshPane()
+  await act(async () => {
+    pickView(t, 'liked').props.onClick()
+  })
+  await act(async () => {
+    pickView(t, 'tv').props.onClick()
+    await wait(40)
+  })
+  const hasClass = (cls) =>
+    t.root.findAll((n) => n.props && String(n.props.className || '').split(/\s+/).indexOf(cls) >= 0)
+  const body = treeText(t)
+  check(
+    'T09 pane TV keeps chrome and renders the stacked body',
+    findClass(t, 'ht-head').length === 1 &&
+      findClass(t, 'ht-nav').length === 1 &&
+      hasClass('ht-tv-compact').length === 1 &&
+      /ON AIR/.test(body) &&
+      /接下来|Up next/.test(body),
+    body.slice(0, 200),
+  )
+
+  const strip = findClass(t, 'ht-tv-qrow')[0]
+  check(
+    'T09 pane TV has a horizontal up-next strip',
+    !!strip &&
+      strip.findAllByType('img').length > 0 &&
+      findClass(t, 'ht-tv-qitem').length >= 2,
+    strip ? strip.findAllByType('img').length + ' thumbs' : 'missing',
+  )
+  check('T09 pane TV leaves player controls clickable', findClass(t, 'ht-tv-sense').length === 0, '')
+
+  const exit = t.root
+    .findAllByType('button')
+    .find((b) => String((b.props && b.props['data-tv-action']) || '') === 'exit')
+  await act(async () => {
+    exit.props.onClick()
+  })
+  const after = treeText(t)
+  check(
+    'T09 exit returns to the previous view with chrome',
+    /还没有喜欢过任何视频|No liked videos yet/.test(after) &&
+      findClass(t, 'ht-nav').length === 1 &&
+      findClass(t, 'ht-head').length === 1,
+    after.slice(0, 160),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 主面板的电视仍只有沉浸画面，任何窗口宽度都不会捡到队列 */
+{
+  resetRoute()
+  const t = await freshTree()
+  const tvTab = t.root
+    .findAllByType('button')
+    .find((b) => String((b.props && b.props['data-view']) || '') === 'tv')
+  await act(async () => {
+    tvTab.props.onClick()
+    await wait(40)
+  })
+  check(
+    'T09 main-panel TV never shows the up-next strip',
+    findClass(t, 'ht-tv-qrow').length === 0 && !/接下来|Up next/.test(treeText(t)),
+    treeText(t).slice(0, 160),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS'))
 process.exit(failures ? 1 : 0)
