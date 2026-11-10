@@ -7,7 +7,7 @@
 [![npm version](https://img.shields.io/npm/v/dsh-hackertube.svg?style=flat-square&color=cb3837)](https://www.npmjs.com/package/dsh-hackertube)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg?style=flat-square)](https://nodejs.org)
-[![DeepSeek Harness](https://img.shields.io/badge/DSH-Plugin-blueviolet.svg?style=flat-square)](https://github.com/chow651/dsh-hackertube)
+[![DeepSeek Harness](https://img.shields.io/badge/DSH-Plugin-blueviolet.svg?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg?style=flat-square)](package.json)
 
 [English](README.en.md) | [简体中文](README.md)
@@ -41,7 +41,7 @@
 
 ## 🚀 Quick Start
 
-> **Prerequisite**: A running installation of [DeepSeek Harness](https://github.com/chow651/dsh-hackertube).
+> **Prerequisite**: A running installation of [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
 ### Option 1: Let Your Agent Install It (Recommended)
 
