@@ -1364,7 +1364,7 @@ function downloadMedia(vid, dest) {
  * 中转页：宿主页面不发 Referer，YouTube 因此报 153。
  * 这里返回一个自己声明 Referrer-Policy 的文档，让内层 embed 请求带上来源。
  */
-function serveEmbed(req, res, vid, lang) {
+function serveEmbed(req, res, vid, lang, auto) {
   /* 播放器界面语言跟随面板：英文界面下 YouTube 不该弹中文的『前往平台观看』 */
   const hl = lang === 'zh' ? 'zh-CN' : 'en'
   const host = String(req.headers?.host || '')
@@ -1384,7 +1384,7 @@ function serveEmbed(req, res, vid, lang) {
     '}catch(e){}}timer=setTimeout(tick,800)}' +
     'function ready(){player=new YT.Player("yt",{videoId:' +
     JSON.stringify(vid) +
-    ',playerVars:{rel:0,playsinline:1,hl:' + JSON.stringify(hl) + ',origin:' +
+    ',playerVars:{rel:0,playsinline:1,' + (auto ? 'autoplay:1,' : '') + 'hl:' + JSON.stringify(hl) + ',origin:' +
     JSON.stringify(relayOrigin) +
     '},events:{' +
     'onReady:function(){tell({__ht:"relay-loaded",secure:!!window.isSecureContext});tick()},' +
@@ -3329,7 +3329,13 @@ async function handler(req, res) {
       if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
         return json(res, 400, { error: 'bad vid' })
       }
-      return serveEmbed(req, res, vid, url.searchParams.get('lang') === 'zh' ? 'zh' : 'en')
+      return serveEmbed(
+        req,
+        res,
+        vid,
+        url.searchParams.get('lang') === 'zh' ? 'zh' : 'en',
+        url.searchParams.get('auto') === '1',
+      )
     }
     if (route === '/config') {
       return json(res, 200, {
@@ -3937,7 +3943,7 @@ export function apply(ctx) {
           return
         }
         const lang = u.searchParams.get('lang') === 'zh' ? 'zh' : 'en'
-        return serveEmbed(req, res, vid, lang)
+        return serveEmbed(req, res, vid, lang, u.searchParams.get('auto') === '1')
       }
       /* 直链兜底也走免认证端口：dsh-app:// 页面带不上 Host 的认证 cookie */
       if (u.pathname === '/media' || u.pathname === '/stream') {
