@@ -853,6 +853,53 @@ window.__ModuleLoader__.load({
 .ht-tab.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;border-radius:2px;
   background:var(--dsw-alias-label-primary)}
 .ht-tab-sep{width:1px;height:15px;background:var(--dsw-alias-border-l3)}
+.ht-tab-tv{gap:6px}
+.ht-tab-tv::before{content:"";width:5px;height:5px;border-radius:50%;background:#ff6600}
+/* ---- 电视：播放器满铺，信息层随鼠标浮出，静止后连光标一起退场 ---- */
+.ht-tv{position:relative;flex:1;min-height:0;overflow:hidden;background:#000;color:#fff;cursor:none}
+.ht-tv.show{cursor:default}
+.ht-tv-stage{position:absolute;inset:0;background:#000}
+.ht-tv-stage iframe{width:100%;height:100%;border:0;display:block;background:#000}
+/* 透明传感器压在播放器上：跨域 iframe 不向父页面冒泡鼠标事件，靠它接住移动 */
+.ht-tv-sense{position:absolute;inset:0;z-index:1;background:transparent}
+.ht-tv-wait{position:absolute;inset:0;display:grid;place-items:center;font-size:13px;color:rgba(255,255,255,.6)}
+.ht-tvui{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;justify-content:space-between;
+  padding:20px 30px 24px;opacity:0;pointer-events:none;transition:opacity .26s cubic-bezier(.32,.72,0,1);
+  background:
+    linear-gradient(180deg,rgba(0,0,0,.72),rgba(0,0,0,.18) 18%,rgba(0,0,0,0) 32%),
+    linear-gradient(0deg,rgba(0,0,0,.9),rgba(0,0,0,.45) 26%,rgba(0,0,0,0) 56%)}
+.ht-tv.show .ht-tvui{opacity:1}
+.ht-tv-top{width:min(100%,860px);margin:0 auto;display:flex;align-items:center;gap:10px}
+.ht-tv-onair{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:4px;
+  background:#ff6600;color:#fff;font-size:11px;font-weight:700;letter-spacing:.08em}
+.ht-tv-onair::before{content:"";width:5px;height:5px;border-radius:50%;background:#fff}
+.ht-tv-mark{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.ht-tv-bot{width:min(100%,860px);margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.ht-tv-title{margin:0;font-size:22px;line-height:28px;font-weight:600;letter-spacing:-.01em;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ht-tv-who{margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.62)}
+.ht-tv-meta{display:flex;flex-wrap:wrap;gap:14px;margin-top:2px;font-size:13px;
+  color:rgba(255,255,255,.78);font-variant-numeric:tabular-nums}
+.ht-tv-meta b{color:#ff6600;font-weight:600}
+.ht-tv-foot{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding-top:12px;
+  border-top:1px solid rgba(255,255,255,.12)}
+.ht-tv-act{display:inline-flex;align-items:center;height:34px;padding:0 15px;border-radius:999px;
+  cursor:pointer;font:inherit;font-size:13px;font-weight:500;white-space:nowrap;
+  border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;pointer-events:none;
+  transition:background .16s cubic-bezier(.32,.72,0,1)}
+.ht-tv.show .ht-tv-act{pointer-events:auto}
+.ht-tv-act:hover{background:rgba(255,255,255,.1)}
+.ht-tv-keys{margin-left:auto;font-size:11.5px;color:rgba(255,255,255,.5)}
+.ht-tv-keys kbd{font:inherit;padding:1px 5px;border:1px solid rgba(255,255,255,.28);border-radius:4px;
+  color:rgba(255,255,255,.78)}
+@container (max-width:560px){
+  .ht-tvui{padding:12px 14px 16px}
+  .ht-tv-title{font-size:17px;line-height:22px}
+  .ht-tv-mark{font-size:13px}
+  .ht-tv-meta{gap:10px;font-size:12px}
+  .ht-tv-keys{display:none}
+  .ht-tv-act{height:32px;padding:0 12px;font-size:12.5px}
+}
 .ht-areas{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(360px,100%),1fr));gap:12px;padding:16px 24px 40px}
 .ht-area{border:1px solid var(--dsw-alias-border-l1);border-radius:16px;padding:16px 20px;cursor:pointer;text-align:left;
   background:none;font:inherit;color:inherit}
@@ -2339,8 +2386,8 @@ window.__ModuleLoader__.load({
     /* ---------------- 视图组件 ---------------- */
 
     const NAV = {
-      zh: [['home', '首页'], ['cats', '分类'], ['pl', '播放列表'], null, ['liked', '喜欢'], ['later', '稍后看'], ['history', '历史']],
-      en: [['home', 'Home'], ['cats', 'Categories'], ['pl', 'Playlists'], null, ['liked', 'Liked'], ['later', 'Watch later'], ['history', 'History']],
+      zh: [['home', '首页'], ['cats', '分类'], ['pl', '播放列表'], null, ['liked', '喜欢'], ['later', '稍后看'], ['history', '历史'], null, ['tv', '电视']],
+      en: [['home', 'Home'], ['cats', 'Categories'], ['pl', 'Playlists'], null, ['liked', 'Liked'], ['later', 'Watch later'], ['history', 'History'], null, ['tv', 'TV']],
     }
 
     function ViewNav(props) {
@@ -2359,7 +2406,7 @@ window.__ModuleLoader__.load({
                     key: t[0],
                     type: 'button',
                     'data-view': t[0],
-                    className: 'ht-tab' + (props.view === t[0] ? ' on' : ''),
+                    className: 'ht-tab' + (t[0] === 'tv' ? ' ht-tab-tv' : '') + (props.view === t[0] ? ' on' : ''),
                     onClick: () => props.onPick(t[0]),
                   },
                   t[1],
@@ -2570,6 +2617,173 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* 电视：整面板只放播放器，信息层随鼠标浮出；换台按 items 的现有顺序 */
+    function TvView(props) {
+      const { item, channel, lang, onStep, onExit, onDetail } = props
+      const [origin, setOrigin] = useState(mem.mediaOrigin || null)
+      const [show, setShow] = useState(false)
+      const idleRef = useRef(null)
+      const lastChannelRef = useRef(channel)
+
+      const reveal = (ms) => {
+        if (idleRef.current) clearTimeout(idleRef.current)
+        setShow(true)
+        idleRef.current = setTimeout(() => setShow(false), ms)
+      }
+
+      useEffect(() => {
+        let alive = true
+        loadMediaOrigin().then((o) => {
+          if (alive) setOrigin(o || null)
+        })
+        return () => {
+          alive = false
+        }
+      }, [])
+
+      /* 首次进入保持纯画面；换台后短暂露出新标题 */
+      useEffect(() => {
+        const prev = lastChannelRef.current
+        lastChannelRef.current = channel
+        if (!prev || prev === channel) return undefined
+        reveal(2000)
+        return undefined
+      }, [channel])
+
+      useEffect(
+        () => () => {
+          if (idleRef.current) clearTimeout(idleRef.current)
+        },
+        [],
+      )
+
+      return h(
+        'div',
+        {
+          className: 'ht-tv' + (show ? ' show' : ''),
+          onMouseMove: () => reveal(2600),
+        },
+        h(
+          'div',
+          { className: 'ht-tv-stage' },
+          !item
+            ? h('div', { className: 'ht-tv-wait' }, tx(lang, '电视里还没有节目', 'Nothing on TV yet'))
+            : origin
+              ? h('iframe', {
+                  key: 'tv-' + item.v,
+                  className: 'ht-tv-frame',
+                  title: titleOf(item, lang),
+                  src:
+                    origin +
+                    '/embed?vid=' +
+                    encodeURIComponent(item.v) +
+                    '&lang=' +
+                    (lang === 'zh' ? 'zh' : 'en') +
+                    '&auto=1',
+                  allow:
+                    'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
+                  allowFullScreen: true,
+                })
+              : h('div', { className: 'ht-tv-wait' }, tx(lang, '正在准备播放器…', 'Preparing player…')),
+        ),
+        item ? h('div', { className: 'ht-tv-sense', 'aria-hidden': 'true' }) : null,
+        item
+          ? h(
+              'div',
+              { className: 'ht-tvui' },
+              h(
+                'div',
+                { className: 'ht-tv-top' },
+                h('span', { className: 'ht-tv-onair' }, tx(lang, 'ON AIR', 'ON AIR')),
+                h('span', { className: 'ht-tv-mark' }, tx(lang, 'HackerTube TV', 'HackerTube TV')),
+              ),
+              h(
+                'div',
+                { className: 'ht-tv-bot' },
+                h(
+                  'div',
+                  { className: 'ht-tv-info' },
+                  h('h1', { className: 'ht-tv-title' }, titleOf(item, lang)),
+                  item.c || item.y
+                    ? h(
+                        'p',
+                        { className: 'ht-tv-who' },
+                        [item.c, item.y ? String(item.y) : ''].filter(Boolean).join(' · '),
+                      )
+                    : null,
+                  h(
+                    'div',
+                    { className: 'ht-tv-meta' },
+                    item.r
+                      ? h(
+                          'span',
+                          { key: 'r' },
+                          h('b', null, String(item.r)),
+                          tx(lang, ' 人推荐', item.r === 1 ? ' recommender' : ' recommenders'),
+                        )
+                      : null,
+                    item.w
+                      ? h(
+                          'span',
+                          { key: 'w' },
+                          tx(lang, fmtCount(item.w, lang) + ' 次观看', fmtCount(item.w, lang) + ' views'),
+                        )
+                      : null,
+                    item.d ? h('span', { key: 'd' }, fmtDur(item.d)) : null,
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'ht-tv-foot' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-tv-act',
+                      'data-tv-action': 'next',
+                      onClick: () => onStep(1),
+                    },
+                    tx(lang, '换台', 'Next channel'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-tv-act',
+                      'data-tv-action': 'detail',
+                      onClick: onDetail,
+                    },
+                    tx(lang, '看详情', 'Details'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-tv-act',
+                      'data-tv-action': 'exit',
+                      onClick: onExit,
+                    },
+                    tx(lang, '退出', 'Exit'),
+                  ),
+                  h(
+                    'span',
+                    { className: 'ht-tv-keys' },
+                    h('kbd', null, '←'),
+                    ' ',
+                    h('kbd', null, '→'),
+                    ' ',
+                    tx(lang, '换台 · ', 'channels · '),
+                    h('kbd', null, 'Esc'),
+                    ' ',
+                    tx(lang, '退出', 'exit'),
+                  ),
+                ),
+              ),
+            )
+          : null,
+      )
+    }
+
     function HtRoot(props) {
       const [items, setItems] = useState(mem.list || [])
       const [tax, setTax] = useState(mem.tax || null)
@@ -2594,6 +2808,9 @@ window.__ModuleLoader__.load({
         return next
       })
       const [view, setView] = useState('home')
+      /* 电视当前频道留在 HtRoot：退出再进来还是这一台 */
+      const [tvIndex, setTvIndex] = useState(0)
+      const tvReturnRef = useRef('home')
       const [playlists, setPlaylists] = useState(null)
       const [plDetail, setPlDetail] = useState(null)
       const [plSlug, setPlSlug] = useState(null)
@@ -2995,6 +3212,22 @@ window.__ModuleLoader__.load({
         setWatching(null)
       }
 
+      const enterTv = () => {
+        if (view !== 'tv') tvReturnRef.current = view
+        if (watching) closeWatch()
+        setView('tv')
+      }
+
+      const exitTv = () => {
+        const back = tvReturnRef.current
+        setView(back && back !== 'tv' ? back : 'home')
+      }
+
+      const stepChannel = (delta) => {
+        if (!items.length) return
+        setTvIndex((i) => (i + delta + items.length) % items.length)
+      }
+
       /* 键盘快捷键：与站点一致的那一套 */
       useEffect(() => {
         if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return
@@ -3015,9 +3248,35 @@ window.__ModuleLoader__.load({
               closeWatch()
               return
             }
+            if (view === 'tv') {
+              exitTv()
+              return
+            }
             return
           }
           if (typing) return
+          if (e.key === 't' || e.key === 'T') {
+            if (view === 'tv') {
+              if (watching) closeWatch()
+              exitTv()
+            } else {
+              enterTv()
+            }
+            return
+          }
+          if (view === 'tv') {
+            if (e.key === 'ArrowRight' || e.key === 'n' || e.key === 'N') {
+              e.preventDefault()
+              stepChannel(1)
+              return
+            }
+            if (e.key === 'ArrowLeft' || e.key === 'p' || e.key === 'P') {
+              e.preventDefault()
+              stepChannel(-1)
+              return
+            }
+            return
+          }
           if (e.key === '/') {
             e.preventDefault()
             const input = rootRef.current && rootRef.current.querySelector('.ht-search input')
@@ -3063,7 +3322,7 @@ window.__ModuleLoader__.load({
         }
         document.addEventListener('keydown', onKey)
         return () => document.removeEventListener('keydown', onKey)
-      }, [watching, toggle, helpOpen])
+      }, [watching, toggle, helpOpen, view, items.length])
 
       if (watching) {
         return h(WatchView, {
@@ -3077,7 +3336,25 @@ window.__ModuleLoader__.load({
         })
       }
 
+      if (view === 'tv') {
+        const tvItem = items.length ? items[Math.min(tvIndex, items.length - 1)] : null
+        return h(TvView, {
+          item: tvItem,
+          channel: tvItem ? tvItem.v : '',
+          lang,
+          onStep: stepChannel,
+          onExit: exitTv,
+          onDetail: () => {
+            if (tvItem) openItem(tvItem)
+          },
+        })
+      }
+
       const pickView = (next) => {
+        if (next === 'tv') {
+          enterTv()
+          return
+        }
         setView(next)
         if (next !== 'playlist') setPlDetail(null)
       }

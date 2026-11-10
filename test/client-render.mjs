@@ -1543,5 +1543,83 @@ function instanceText(inst) {
   })
 }
 
+/* ---------- T08：电视模式 ---------- */
+
+console.log('\n--- T08 TV mode ---')
+{
+  resetRoute()
+  const t = await freshTree()
+  const tab = (v) =>
+    t.root.findAllByType('button').find((b) => String((b.props && b.props['data-view']) || '') === v)
+
+  const tvTab = tab('tv')
+  check(
+    'T08 TV tab is in the nav',
+    !!tvTab && /电视|TV/.test(String(tvTab.props.children)),
+    tvTab && String(tvTab.props.children),
+  )
+
+  /* 从「喜欢」进入，退出时要回到这里而不是首页 */
+  await act(async () => {
+    tab('liked').props.onClick()
+  })
+  await act(async () => {
+    tab('tv').props.onClick()
+    await wait(40)
+  })
+  const tvRoot = () =>
+    t.root.findAll((n) => n.props && /^ht-tv( show)?$/.test(String(n.props.className || '')))
+  const iframe = t.root.findAllByType('iframe')[0]
+  const tvBody = treeText(t)
+  check(
+    'T08 TV screen uses relay player and drops related content',
+    tvRoot().length === 1 &&
+      !!iframe &&
+      /\/embed\?vid=a1/.test(String(iframe.props.src)) &&
+      !/为你推荐|相关推荐|一起看|Recommended for you|Up next|Watch together/.test(tvBody),
+    (iframe && iframe.props.src) + ' / ' + tvBody.slice(0, 160),
+  )
+
+  const idle = tvRoot()[0]
+  await act(async () => {
+    idle.props.onMouseMove()
+  })
+  const layer = tvRoot()[0]
+  await act(async () => {
+    global.document.__emit('keydown', {
+      key: 'ArrowRight',
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false,
+      preventDefault() {},
+    })
+  })
+  const switched = treeText(t)
+  check(
+    'T08 mousemove reveals the layer and arrows switch channel',
+    layer &&
+      /(^| )show( |$)/.test(String(layer.props.className)) &&
+      switched.includes('A talk about type systems'),
+    String(layer && layer.props.className) + ' / ' + switched.slice(0, 160),
+  )
+
+  await act(async () => {
+    global.document.__emit('keydown', { key: 'Escape', metaKey: false, ctrlKey: false, altKey: false })
+  })
+  const backBody = treeText(t)
+  await act(async () => {
+    global.document.__emit('keydown', { key: 't', metaKey: false, ctrlKey: false, altKey: false })
+  })
+  const again = treeText(t)
+  check(
+    'T08 exit returns to previous view and keeps the channel',
+    /还没有喜欢过任何视频|No liked videos yet/.test(backBody) && again.includes('A talk about type systems'),
+    backBody.slice(0, 120) + ' / ' + again.slice(0, 160),
+  )
+  await act(async () => {
+    t.unmount()
+  })
+}
+
 console.log('\n' + (failures ? failures + ' FAILURE(S)' : 'ALL PASS'))
 process.exit(failures ? 1 : 0)
