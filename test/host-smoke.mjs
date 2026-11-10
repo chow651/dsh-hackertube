@@ -339,6 +339,39 @@ if (liveUpstream) {
   }
 }
 
+/* 11.5 播放进度：写入、读回、看完清理 */
+{
+  const post = async (body) => {
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = '/hackertube/api/progress'
+    req.headers = { host: '127.0.0.1:54321' }
+    const res = fakeRes()
+    const done = handler(req, res)
+    req.emit('data', Buffer.from(JSON.stringify(body)))
+    req.emit('end')
+    await done
+    /* 路由在 end 回调里异步写响应，等它落定 */
+    for (let i = 0; i < 40 && !res.statusCode; i += 1) await new Promise((r) => setTimeout(r, 25))
+    return res
+  }
+  const written = await post({ vid: 'fNk_zzaMoSs', t: 300, d: 592 })
+  check('progress saved', written.statusCode === 200, 'got ' + written.statusCode)
+  const one = await call('/hackertube/api/progress?vid=fNk_zzaMoSs')
+  const entry = JSON.parse(one.body).entry
+  check('progress read back', !!entry && entry.t === 300, JSON.stringify(entry))
+
+  /* 差 20 秒到结尾视为看完，进度要清掉 */
+  await post({ vid: 'fNk_zzaMoSs', t: 585, d: 592 })
+  const cleared = JSON.parse((await call('/hackertube/api/progress?vid=fNk_zzaMoSs')).body).entry
+  check('finished video clears progress', cleared === null, JSON.stringify(cleared))
+
+  /* 太靠前不记录 */
+  await post({ vid: 'FITJMJjASUs', t: 4, d: 3202 })
+  const early = JSON.parse((await call('/hackertube/api/progress?vid=FITJMJjASUs')).body).entry
+  check('early playhead ignored', early === null, JSON.stringify(early))
+}
+
 /* 12. 给 agent 用的 hackertube_search */
 {
   const tool = tools['hackertube_search']
@@ -1567,7 +1600,7 @@ async function runRecommendFixture() {
     const before = read(await call('/hackertube/api/recommend'))
     const beforeItems = Array.isArray(before.items) ? before.items : []
     fxcheck('T06 feedback starts with a like feed', before.mode === 'likes' && beforeItems.length > 1, String(before.mode))
-    fxcheck('T06 feedback first item known', beforeItems[0] && beforeItems[0].v === 'simvec01', beforeItems[0] && beforeItems[0].v)
+    fxcheck('T06 feedback starts with the related pick nearby', beforeItems.slice(0, 4).some((x) => x.v === 'simvec01'), JSON.stringify(beforeItems.slice(0, 4).map((x) => x.v)))
 
     const posted = await callPost('/hackertube/api/prefs', {
       likes: ['likevid1'],
@@ -1593,12 +1626,13 @@ async function runRecommendFixture() {
     fxcheck('T06 cold mode', data.mode === 'cold', String(data.mode))
     const items = Array.isArray(data.items) ? data.items : []
     fxcheck('T06 cold has recommendations', items.length >= 4, String(items.length))
+    const playlistPick = items.slice(0, 4).find((x) => x.reason && x.reason.kind === 'playlist')
+    fxcheck('T06 cold mixes in a playlist pick', !!playlistPick, JSON.stringify(items.slice(0, 4).map((x) => x.v + ':' + (x.reason && x.reason.kind))))
     fxcheck(
-      'T06 cold uses playlist first',
-      items[0] && items[0].v === 'playpick1' && items[0].reason && items[0].reason.kind === 'playlist',
-      JSON.stringify(items[0] && { v: items[0].v, reason: items[0].reason }),
+      'T06 cold playlist reason names playlist',
+      !!playlistPick && playlistPick.reason.title === 'Start here',
+      playlistPick && playlistPick.reason.title,
     )
-    fxcheck('T06 cold playlist reason names playlist', items[0] && items[0].reason && items[0].reason.title === 'Start here', items[0] && items[0].reason && items[0].reason.title)
     fxcheck('T06 cold fills with HN score', items.some((x) => x.reason && x.reason.kind === 'hn'))
     fxcheck('T06 cold every item has a reason', items.every((x) => x.reason && x.reason.kind))
   }
@@ -1610,11 +1644,17 @@ async function runRecommendFixture() {
     fxcheck('T06 like mode', data.mode === 'likes', String(data.mode))
     const items = Array.isArray(data.items) ? data.items : []
     fxcheck('T06 has recommendations', items.length >= 4, String(items.length))
-    fxcheck('T06 top item follows embeddings', items[0] && items[0].v === 'simvec01', items[0] && items[0].v)
+    const front = items.slice(0, 4).map((x) => x.v)
+    fxcheck('T06 related pick reaches the front', front.indexOf('simvec01') >= 0, JSON.stringify(front))
     fxcheck(
       'T06 explanation because you liked',
-      items[0] && items[0].reason && items[0].reason.kind === 'like' && items[0].reason.vid === 'likevid1',
+      items.some((x) => x.reason && x.reason.kind === 'like' && x.reason.vid === 'likevid1'),
       JSON.stringify(items[0] && items[0].reason),
+    )
+    fxcheck(
+      'T06 front mixes tiers',
+      new Set(items.slice(0, 6).map((x) => x.reason && x.reason.tier).filter(Boolean)).size >= 2,
+      JSON.stringify(items.slice(0, 6).map((x) => x.reason && x.reason.tier)),
     )
     fxcheck('T06 reason carries source title', items[0] && items[0].reason && items[0].reason.title === 'Liked video about graphs', items[0] && items[0].reason && items[0].reason.title)
     fxcheck('T06 related graph candidate included', items.some((x) => x.v === 'relpick1'))

@@ -10,6 +10,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { createServer } from 'node:http'
 import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
@@ -18,6 +19,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inflateRawSync } from 'node:zlib'
 import { normalizeIds, recommend } from './recommend.js'
+import { createResolver } from './mirror.js'
 
 /* 仓库里预生成的译文，首次安装时直接铺到缓存目录 */
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -89,6 +91,24 @@ const state = {
 function cacheRoot() {
   const base = process.env.DSH_PROFILE_DIR || join(homedir(), '.dsh')
   return join(base, '.dsh-hackertube')
+}
+
+/**
+ * 备用片源解析器。惰性创建——没用到就不握手，也不占缓存文件。
+ * 判定与缓存都在 mirror.js 里，这里只负责把列表字段喂进去。
+ */
+let mirrorResolver = null
+function getMirror() {
+  if (mirrorResolver) return mirrorResolver
+  mirrorResolver = createResolver({
+    fetchImpl: fetch,
+    hashFn: (s) => createHash('md5').update(s).digest('hex'),
+    cacheFile: join(cacheRoot(), 'mirror.json'),
+    readFile: (p, enc) => readFile(p, enc),
+    writeFile: (p, value, enc) => writeFile(p, value, enc),
+    mkdir: (p, opt) => mkdir(p, opt),
+  })
+  return mirrorResolver
 }
 
 async function readCache(name) {
@@ -1364,7 +1384,7 @@ function downloadMedia(vid, dest) {
  * 中转页：宿主页面不发 Referer，YouTube 因此报 153。
  * 这里返回一个自己声明 Referrer-Policy 的文档，让内层 embed 请求带上来源。
  */
-function serveEmbed(req, res, vid, lang, auto) {
+function serveEmbed(req, res, vid, lang, startAt, auto) {
   /* 播放器界面语言跟随面板：英文界面下 YouTube 不该弹中文的『前往平台观看』 */
   const hl = lang === 'zh' ? 'zh-CN' : 'en'
   const host = String(req.headers?.host || '')
@@ -1377,6 +1397,9 @@ function serveEmbed(req, res, vid, lang, auto) {
     '#yt iframe{width:100%;height:100%;border:0;display:block}</style>' +
     '</head><body><div id="yt"></div><script>' +
     'var player=null,lastT=-1,timer=null;var V=' + JSON.stringify(vid) + ';' +
+    'var START=' + JSON.stringify(Math.max(0, Number(startAt) || 0)) + ';' +
+    /* 续播只做一次：用户自己拖回去以后不该被拽回来 */
+    'function seekOnce(){if(START&&player&&typeof player.seekTo==="function"){try{player.seekTo(START,true)}catch(e){}START=0}}' +
     'function tell(m){m.vid=m.vid||V;try{parent.postMessage(m,"*")}catch(e){}}' +
     'function tick(){if(player&&typeof player.getCurrentTime==="function"){try{' +
     'var t=player.getCurrentTime(),d=player.getDuration();' +
@@ -1387,7 +1410,7 @@ function serveEmbed(req, res, vid, lang, auto) {
     ',playerVars:{rel:0,playsinline:1,' + (auto ? 'autoplay:1,' : '') + 'hl:' + JSON.stringify(hl) + ',origin:' +
     JSON.stringify(relayOrigin) +
     '},events:{' +
-    'onReady:function(){tell({__ht:"relay-loaded",secure:!!window.isSecureContext});tick()},' +
+    'onReady:function(){seekOnce();tell({__ht:"relay-loaded",secure:!!window.isSecureContext,start:START});tick()},' +
     'onStateChange:function(e){tell({__ht:"state",s:e.data})},' +
     'onError:function(e){tell({__ht:"yt-error",code:e.data})}}});}' +
     'window.onYouTubeIframeAPIReady=ready;' +
@@ -2918,6 +2941,56 @@ function mergePrefsWrite(body) {
   return run
 }
 
+/* ---------------- 播放进度 ---------------- */
+
+/* 按视频存「看到哪」：{ [vid]: { t, d, at } }。
+   单独落一个文件，热路径每十几秒写一次，没必要掺进 prefs。 */
+const PROGRESS_FILE = 'progress.json'
+const PROGRESS_MAX = 800
+/* 太靠前的进度没有续播价值，太靠后说明已经看完了 */
+const PROGRESS_MIN_SEC = 15
+let progressWriteChain = Promise.resolve()
+
+async function readProgress() {
+  const raw = await readCache(PROGRESS_FILE)
+  return raw && typeof raw === 'object' && raw.entries && typeof raw.entries === 'object' ? raw.entries : {}
+}
+
+function progressWorthKeeping(entry) {
+  const t = Number(entry && entry.t)
+  const d = Number(entry && entry.d)
+  if (!Number.isFinite(t) || t < PROGRESS_MIN_SEC) return false
+  if (Number.isFinite(d) && d > 0 && t > d - 20) return false
+  return true
+}
+
+/** 合并写入，按最近观看时间裁剪；同一时刻只有一个写者。 */
+function saveProgress(vid, entry) {
+  const run = progressWriteChain.then(async () => {
+    const entries = await readProgress()
+    if (progressWorthKeeping(entry)) {
+      entries[vid] = {
+        t: Math.round(Number(entry.t)),
+        d: Math.round(Number(entry.d) || 0),
+        at: Date.now(),
+      }
+    } else {
+      delete entries[vid]
+    }
+    const keys = Object.keys(entries)
+    if (keys.length > PROGRESS_MAX) {
+      keys
+        .sort((a, b) => (Number(entries[a].at) || 0) - (Number(entries[b].at) || 0))
+        .slice(0, keys.length - PROGRESS_MAX)
+        .forEach((k) => delete entries[k])
+    }
+    await writeCache(PROGRESS_FILE, { v: 1, entries })
+    return entries[vid] || null
+  })
+  progressWriteChain = run.catch(() => null)
+  return run
+}
+
 async function handler(req, res) {
   const url = new URL(req.url ?? '/', 'http://local')
   const route = url.pathname.slice(PREFIX.length)
@@ -3193,6 +3266,40 @@ async function handler(req, res) {
     return
   }
 
+    if (route === '/progress') {
+      if (req.method === 'POST') {
+        let size = 0
+        const chunks = []
+        req.on('data', (c) => {
+          size += c.length
+          if (size > 8192) {
+            req.destroy()
+            return
+          }
+          chunks.push(c)
+        })
+        req.on('end', async () => {
+          let body = {}
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+          } catch {
+            return json(res, 400, { error: 'bad json' })
+          }
+          const vid = String(body.vid || '')
+          if (!/^[A-Za-z0-9_-]{6,20}$/.test(vid)) return json(res, 400, { error: 'bad vid' })
+          const saved = await saveProgress(vid, { t: body.t, d: body.d })
+          return json(res, 200, { ok: true, entry: saved })
+        })
+        return
+      }
+      const vid = url.searchParams.get('vid')
+      const entries = await readProgress()
+      if (vid) {
+        const entry = entries[vid]
+        return json(res, 200, { vid, entry: entry && Number(entry.at) ? entry : null })
+      }
+      return json(res, 200, { entries })
+    }
   if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
 
   try {
@@ -3244,6 +3351,8 @@ async function handler(req, res) {
         vectors,
         playlists,
         limit: Number(url.searchParams.get('limit')) || 10,
+        /* 「换一批」换的是 seed：同一个 seed 顺序稳定，换一个就重新抽样 */
+        seed: Number(url.searchParams.get('seed')) || 1,
       })
       return json(res, 200, payload)
     }
@@ -3334,6 +3443,7 @@ async function handler(req, res) {
         res,
         vid,
         url.searchParams.get('lang') === 'zh' ? 'zh' : 'en',
+        Number(url.searchParams.get('start')) || 0,
         url.searchParams.get('auto') === '1',
       )
     }
@@ -3577,6 +3687,26 @@ async function handler(req, res) {
       const lang = url.searchParams.get('lang') || 'zh'
       const result = await loadSubs(vid, lang !== 'en')
       return json(res, result.status, result.body)
+    }
+    /* 备用片源：有就回一条链接，没有就回空对象。前端据此决定要不要渲染按钮。 */
+    if (route === '/mirror') {
+      const vid = url.searchParams.get('vid')
+      if (!vid || !/^[A-Za-z0-9_-]{6,20}$/.test(vid)) {
+        return json(res, 400, { error: 'bad-vid' })
+      }
+      const items = await loadList()
+      const item = items.find((x) => x.v === vid)
+      if (!item || !item.d || !item.t) return json(res, 200, {})
+      const zhTitles = await loadI18n('zh-titles').catch(() => ({}))
+      const hit = await getMirror().resolve({
+        id: item.v,
+        title: item.t,
+        titleZh: zhTitles[item.v] || '',
+        channel: item.c || '',
+        duration: item.d,
+        published: item.p || null,
+      })
+      return json(res, 200, hit || {})
     }
     return json(res, 404, { error: 'not found' })
   } catch (err) {
@@ -3943,7 +4073,14 @@ export function apply(ctx) {
           return
         }
         const lang = u.searchParams.get('lang') === 'zh' ? 'zh' : 'en'
-        return serveEmbed(req, res, vid, lang, u.searchParams.get('auto') === '1')
+        return serveEmbed(
+          req,
+          res,
+          vid,
+          lang,
+          Number(u.searchParams.get('start')) || 0,
+          u.searchParams.get('auto') === '1',
+        )
       }
       /* 直链兜底也走免认证端口：dsh-app:// 页面带不上 Host 的认证 cookie */
       if (u.pathname === '/media' || u.pathname === '/stream') {

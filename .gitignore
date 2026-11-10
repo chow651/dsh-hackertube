@@ -14,5 +14,12 @@ HANDOFF.md
 ROADMAP.md
 prototype/
 
+# 设计与工单产物：只存在本地，分支 local/design-docs 保留记录，主分支不带
+.scratch/
+GLOSSARY.md
+GLOSSARY-MAP.md
+docs/adr/
+docs/agents/
+
 # 临时补丁文件
 .patch-*

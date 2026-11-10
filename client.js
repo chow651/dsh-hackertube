@@ -2,7 +2,9 @@
  * HackerTube Client 半 —— 经典脚本，经 __ModuleLoader__ 注入。
  *
  * 落点：左栏面板图标（sidebar.panellist，id=hackertube）与主区面板
- * （main，key=hackertube）成对绑定，点图标即切到面板。
+ * （main，key=hackertube）成对绑定，点图标即切到面板；会话页原生右侧栏
+ * 另投一个 tab（sidebar.right.pane.tab，id=dsh-hackertube:right），
+ * 不依赖 dsh-better-sidebar 的服务。
  * 数据全部来自 Host 的 /hackertube/api/*，浏览器不直接碰上游。
  */
 window.__ModuleLoader__.load({
@@ -59,6 +61,9 @@ window.__ModuleLoader__.load({
       taxLang: null,
       /* 观看会话按视频 id 存：播放位置不能被下一条视频继承，暂停后也要保留 */
       sessions: new Map(),
+      /* 落盘的播放进度：vid -> { t, d, at }，用于续播与历史列表 */
+      progress: new Map(),
+      progressP: null,
       playheadSubs: new Set(),
       /* 播放错误按视频 id 存：中转页的 yt-error / api-error 会先到全局监听，再由观看页订阅 */
       playback: new Map(),
@@ -190,6 +195,15 @@ window.__ModuleLoader__.load({
     /** 界面文案：中文原句 + 英文对照，调用处不必写三元表达式 */
     const tx = (lang, zh, en) => (lang === 'zh' ? zh : en)
 
+    /** 备用片源的档位标：官方 / 中字 / 中文 / 转载 */
+    function mirrorTag(lang, label) {
+      if (lang === 'zh') return label
+      if (label === '官方') return 'Official'
+      if (label === '中字') return 'Subbed'
+      if (label === '中文') return 'Translated'
+      return 'Repost'
+    }
+
     /* ---------------- 语言偏好 ---------------- */
 
     const LANG_STORAGE_KEY = 'ht.lang'
@@ -267,6 +281,61 @@ window.__ModuleLoader__.load({
         }
         return r.json()
       })
+    }
+
+    /* ---------------- 播放进度 ---------------- */
+
+    /** 面板打开时拉一次全部进度，之后靠本地更新，避免每开一条视频打一次请求。 */
+    function ensureProgress() {
+      if (mem.progressP) return mem.progressP
+      mem.progressP = getJSON('/hackertube/api/progress')
+        .then((d) => {
+          const entries = d && d.entries && typeof d.entries === 'object' ? d.entries : {}
+          mem.progress = new Map(Object.entries(entries))
+          return mem.progress
+        })
+        .catch(() => mem.progress)
+      return mem.progressP
+    }
+
+    /** 续播点：太靠前没有意义，差 20 秒到结尾就不算。 */
+    function resumeAt(vid, duration) {
+      const entry = mem.progress.get(vid)
+      if (!entry) return 0
+      const t = Number(entry.t) || 0
+      const d = Number(duration) || Number(entry.d) || 0
+      if (t < 15) return 0
+      if (d > 0 && t > d - 20) return 0
+      return Math.floor(t)
+    }
+
+    function rememberProgress(vid, position) {
+      if (!vid || !position) return
+      const t = Number(position.t) || 0
+      const d = Number(position.d) || 0
+      if (t < 15) return
+      if (d > 0 && t > d - 20) {
+        /* 看完了就把进度清掉，历史里不再显示「继续观看」 */
+        mem.progress.delete(vid)
+        return
+      }
+      mem.progress.set(vid, { t: Math.round(t), d: Math.round(d), at: Date.now() })
+    }
+
+    function saveProgress(vid, position) {
+      rememberProgress(vid, position)
+      const entry = mem.progress.get(vid)
+      if (!entry) return
+      try {
+        void fetch('/hackertube/api/progress', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ vid, t: entry.t, d: entry.d }),
+          keepalive: true,
+        }).catch(() => {})
+      } catch {
+        /* 离线时只留内存副本 */
+      }
     }
 
     function loadList() {
@@ -488,6 +557,9 @@ window.__ModuleLoader__.load({
 .ht-lang{flex:none;height:32px;min-width:52px;padding:0 12px;border-radius:16px;cursor:pointer;  font:inherit;font-size:13px;border:1px solid var(--dsw-alias-border-l1);
   background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
 .ht-lang:hover{background:var(--dsw-alias-bg-layer-2)}
+.ht-shuffle{flex:none;width:32px;height:32px;padding:0;border-radius:16px;cursor:pointer;font:inherit;display:inline-grid;place-items:center;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);transition:color .16s cubic-bezier(.32,.72,0,1),background .16s cubic-bezier(.32,.72,0,1),transform .16s cubic-bezier(.32,.72,0,1)}
+.ht-shuffle:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.ht-shuffle:active{transform:rotate(-18deg)}
 .ht-search{flex:1;max-width:640px;display:flex;min-width:0;position:relative;
   border:1px solid var(--dsw-alias-border-l1);border-radius:18px;overflow:hidden;
   background:var(--dsw-alias-bg-layer-1);
@@ -516,17 +588,6 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;font-size:12.5px;cursor:pointer;outline:none}
 .ht-filter:focus{border-color:rgba(255,102,0,.55)}
 .ht-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 24px 40px}
-.ht-recs{padding-top:18px}
-.ht-recs-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 10px}
-.ht-recs-head h2{margin:0;font-size:15px;font-weight:600}
-.ht-recs-head span{font-size:12.5px;color:var(--dsw-alias-label-secondary)}
-.ht-recs-row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(200px,240px);gap:16px;overflow-x:auto;padding:0 0 8px}
-.ht-rec{min-width:0}
-.ht-rec-open{display:block;width:100%;padding:0;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.ht-rec .ht-title{font-size:14px;line-height:19px;height:38px;margin-top:8px}
-.ht-rec-why{margin:4px 0 0;min-height:32px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary)}
-.ht-rec-hide{margin-top:4px;padding:0;border:0;background:none;font:inherit;font-size:12px;color:var(--dsw-alias-label-tertiary);cursor:pointer}
-.ht-rec-hide:hover{color:var(--dsw-alias-label-primary);text-decoration:underline}
 .ht-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:32px 20px;padding-top:16px}
 .ht-card.kbd{outline:2px solid var(--dsw-alias-label-primary);outline-offset:3px;border-radius:12px}
 .ht-card{display:block;min-width:0;cursor:pointer;background:none;border:0;padding:0;
@@ -661,6 +722,8 @@ window.__ModuleLoader__.load({
 .ht-pill svg{flex:none}
 .ht-pill-ghost{background:transparent;border:1px solid var(--dsw-alias-border-l2)}
 .ht-pill-ghost:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.ht-pill-tag{padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.5;
+  background:rgba(0,174,236,.14);color:#0b7fa8}
 .ht-hn-mark{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:999px;
   background:rgba(255,102,0,.12);color:#b4460a;font-size:12px;font-weight:600}
 .ht-hn-mark i{width:5px;height:5px;border-radius:50%;background:#ff6600;display:inline-block}
@@ -766,6 +829,9 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);color:inherit;font-weight:500;display:inline-flex;
   align-items:center;gap:6px;margin-bottom:16px}
 .ht-back:hover{background:var(--dsw-alias-bg-layer-2)}
+.ht-resume{margin:8px 0 0;font-size:13px;color:var(--dsw-alias-label-secondary);display:flex;align-items:center;gap:8px}
+.ht-resume-reset{padding:0;border:0;background:none;font:inherit;font-size:12.5px;color:var(--dsw-alias-label-tertiary);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.ht-resume-reset:hover{color:var(--dsw-alias-label-primary)}
 .ht-h1{font-size:21px;line-height:1.32;font-weight:600;letter-spacing:-.2px;margin:16px 0 0}
 .ht-channel{margin:10px 0 0;font-size:14px;font-weight:500}
 /* 简介卡：浅灰底、默认折叠三行、底部渐隐，展开后完整显示 */
@@ -956,7 +1022,34 @@ window.__ModuleLoader__.load({
 .ht-row .ht-thumb{width:220px;flex:none;aspect-ratio:16/9}
 .ht-row .ht-title{font-size:15px;line-height:21px;height:42px}
 .ht-hgrid{display:grid;grid-template-columns:1fr 1fr;gap:0 28px;padding:0 24px}
-.ht-hgrid .ht-row .ht-thumb{width:180px}`
+.ht-hgrid .ht-row .ht-thumb{width:180px}
+/* 会话右栏：宿主给的是 320–480px 的窄容器，跟随容器宽度而不是视口 */
+.ht-rail-shell{height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;
+  container-type:inline-size;background:var(--dsw-alias-bg-base)}
+.ht-rail-shell .ht-root{height:100%;min-height:0}
+@container (max-width:560px){
+  .ht-head{padding:10px 12px;gap:8px;flex-wrap:wrap}
+  .ht-brand{font-size:15px}
+  .ht-scroll{padding:0 12px 32px}
+  .ht-chips{padding:10px 12px 0}
+  .ht-filters{padding:8px 12px 0}
+  .ht-grid,.ht-skel{grid-template-columns:1fr;gap:20px}
+  .ht-watch{padding:14px 12px 12px}
+  .ht-watch .ht-toolbar{margin-bottom:8px}
+  .ht-hgrid{padding:0 12px;grid-template-columns:1fr}
+  .ht-hgrid .ht-row .ht-thumb{width:140px}
+  .ht-sechead{padding:14px 12px 4px}
+  .ht-stagebar,.ht-stale{margin-left:12px;margin-right:12px}
+  .ht-empty,.ht-err{padding-left:12px;padding-right:12px;margin-left:0;margin-right:0}
+  .ht-keys .k{min-width:0;width:calc(100vw - 48px)}
+}
+@container (max-width:440px){
+  .ht-brand{font-size:14px}
+  .ht-lang{min-width:44px;padding:0 8px}
+  .ht-search{order:9;flex-basis:100%;max-width:none}
+  .ht-row .ht-thumb{width:120px}
+  .ht-row{gap:12px}
+}`
 
     /* ---------------- 图标 ---------------- */
 
@@ -1045,93 +1138,6 @@ window.__ModuleLoader__.load({
     }
 
     /* ---------------- 首页推荐行（T06 推荐画像） ---------------- */
-
-    function recTitleOf(lang, reason) {
-      if (!reason) return ''
-      if (reason.kind === 'like') {
-        const zh = reason.vid && mem.titles ? mem.titles[reason.vid] : ''
-        return lang === 'zh' && zh ? zh : reason.title || ''
-      }
-      return reason.title || ''
-    }
-
-    function recReasonText(lang, reason) {
-      if (!reason) return ''
-      const title = recTitleOf(lang, reason)
-      if (reason.kind === 'like') {
-        return title
-          ? tx(lang, '因为你喜欢《' + title + '》', 'Because you liked “' + title + '”')
-          : tx(lang, '因为你喜欢的视频', 'Because you liked a similar video')
-      }
-      if (reason.kind === 'playlist') {
-        return title
-          ? tx(lang, '来自播放列表「' + title + '」', 'From playlist “' + title + '”')
-          : tx(lang, '来自编辑播放列表', 'From a curated playlist')
-      }
-      if (reason.kind === 'hn') {
-        const n = Number(reason.recommenders) || 0
-        if (n > 0) {
-          return tx(
-            lang,
-            'HN 高分推荐 · ' + n + ' 人推荐',
-            'Highly recommended on HN · ' + n + (n === 1 ? ' recommender' : ' recommenders'),
-          )
-        }
-        return tx(lang, 'HN 高分推荐', 'Highly recommended on HN')
-      }
-      return ''
-    }
-
-    function RecommendRow(props) {
-      const rec = props.rec
-      const lang = props.lang
-      const items = rec && Array.isArray(rec.items) ? rec.items : []
-      if (!items.length) return null
-      const liked = rec.mode === 'likes'
-      return h(
-        'section',
-        { className: 'ht-recs', 'aria-label': tx(lang, '为你推荐', 'Recommended for you') },
-        h(
-          'div',
-          { className: 'ht-recs-head' },
-          h('h2', null, liked ? tx(lang, '为你推荐', 'Recommended for you') : tx(lang, '编辑精选', "Editor's picks")),
-          h(
-            'span',
-            null,
-            liked
-              ? tx(lang, '根据你喜欢的视频', 'Based on videos you liked')
-              : tx(lang, '来自编辑播放列表与 HN 高分', 'From curated playlists and high-signal HN picks'),
-          ),
-        ),
-        h(
-          'div',
-          { className: 'ht-recs-row' },
-          items.map((item) =>
-            h(
-              'div',
-              { key: item.v, className: 'ht-rec', 'data-vid': item.v },
-              h(
-                'button',
-                { type: 'button', className: 'ht-rec-open', onClick: () => props.onOpen(item) },
-                h(
-                  'div',
-                  { className: 'ht-thumb' },
-                  item.th ? h('img', { src: item.th, alt: '', loading: 'lazy' }) : null,
-                  item.d ? h('span', { className: 'ht-dur' }, fmtDur(item.d)) : null,
-                ),
-                h('p', { className: 'ht-title' }, titleOf(item, lang)),
-              ),
-              h('p', { className: 'ht-rec-why' }, recReasonText(lang, item.reason)),
-              h(
-                'button',
-                { type: 'button', className: 'ht-rec-hide', onClick: () => props.onDismiss(item.v) },
-                tx(lang, '不感兴趣', 'Not interested'),
-              ),
-            ),
-          ),
-        ),
-      )
-    }
 
     /* ---------------- 分享卡片 ---------------- */
 
@@ -1653,6 +1659,10 @@ window.__ModuleLoader__.load({
       const watchScrollRef = useRef(null)
       const railRef = useRef(null)
       const [playhead, setPlayhead] = useState(() => watchSession(item.v).playhead)
+      /* 上次看到的位置；0 表示从头开始 */
+      const [resumeFrom, setResumeFrom] = useState(0)
+      /* 备用片源：命中才渲染按钮，没命中就一直保持 null，界面上什么都不出现 */
+      const [mirror, setMirror] = useState(null)
 
       /* 播放位置按视频隔离：暂停后 relay 不再发事件，这里仍保留最后一次的值 */
       useEffect(() => {
@@ -1663,6 +1673,24 @@ window.__ModuleLoader__.load({
         mem.playheadSubs.add(sub)
         return () => {
           mem.playheadSubs.delete(sub)
+          /* 离开这条视频时补一次落盘：看得短、还没到 15 秒节流点也不会丢 */
+          const last = watchSession(item.v).playhead
+          if (last) saveProgress(item.v, last)
+        }
+      }, [item.v])
+
+      /* 续播：进度来自记忆里的 map，没有就先拉一次，再交给中转页 seek */
+      useEffect(() => {
+        let alive = true
+        const known = resumeAt(item.v, item.d)
+        if (known) setResumeFrom(known)
+        ensureProgress().then(() => {
+          if (!alive) return
+          const at = resumeAt(item.v, item.d)
+          if (at) setResumeFrom(at)
+        })
+        return () => {
+          alive = false
         }
       }, [item.v])
 
@@ -1716,6 +1744,23 @@ window.__ModuleLoader__.load({
           })
           .catch(() => {
             if (alive) setRelated([])
+          })
+        return () => {
+          alive = false
+        }
+      }, [item.v])
+
+      /* 备用片源异步查，不挡正文：拿到就补一个按钮，没拿到就不出现。
+         结果在 Host 侧落盘缓存，同一个视频第二次打开是 0 延迟。 */
+      useEffect(() => {
+        let alive = true
+        setMirror(null)
+        getJSON('/hackertube/api/mirror?vid=' + encodeURIComponent(item.v))
+          .then((d) => {
+            if (alive && d && d.url) setMirror(d)
+          })
+          .catch(() => {
+            /* 查不到不是错误，只是没有别的源 */
           })
         return () => {
           alive = false
@@ -2025,7 +2070,13 @@ window.__ModuleLoader__.load({
                         key: 'embed-' + playerKey,
                         className: 'ht-video',
                         title: item.t,
-                        src: origin + '/embed?vid=' + encodeURIComponent(item.v) + '&lang=' + (lang === 'zh' ? 'zh' : 'en'),
+                        src:
+                      origin +
+                      '/embed?vid=' +
+                      encodeURIComponent(item.v) +
+                      '&lang=' +
+                      (lang === 'zh' ? 'zh' : 'en') +
+                      (resumeFrom ? '&start=' + resumeFrom : ''),
                         allow:
                           'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
                         allowFullScreen: true,
@@ -2056,6 +2107,25 @@ window.__ModuleLoader__.load({
                 )
               : null,
             h('h1', { className: 'ht-h1' }, titleOf(item, lang)),
+            resumeFrom
+              ? h(
+                  'p',
+                  { className: 'ht-resume' },
+                  tx(lang, '从上次的 ', 'Resumed at ') + fmtDur(resumeFrom),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ht-resume-reset',
+                      onClick: () => {
+                        setResumeFrom(0)
+                        setPlayerKey((k) => k + 1)
+                      },
+                    },
+                    tx(lang, '从头开始', 'Start over'),
+                  ),
+                )
+              : null,
             item.c ? h('p', { className: 'ht-channel' }, item.c) : null,
             h(
               'div',
@@ -2114,6 +2184,31 @@ window.__ModuleLoader__.load({
                 h(Ico, { fill: true }, h('path', { d: 'M23 12s-4.2-6.5-11-6.5S1 12 1 12s4.2 6.5 11 6.5S23 12 23 12zm-11 4a4 4 0 1 1 0-8 4 4 0 0 1 0 8z' })),
                 tx(lang, '在 YouTube 观看', 'Watch on YouTube'),
               ),
+              /* 备用片源。只有查到了才出现，查不到就完全没有这个入口。 */
+              mirror && mirror.url
+                ? h(
+                    'a',
+                    {
+                      className: 'ht-pill ht-pill-ghost',
+                      href: mirror.url,
+                      target: '_blank',
+                      rel: 'noreferrer noopener',
+                      title:
+                        (mirror.up || '') +
+                        (mirror.play ? ' · ' + fmtCount(mirror.play, lang) + tx(lang, ' 次播放', ' views') : ''),
+                    },
+                    h(
+                      Ico,
+                      null,
+                      h('rect', { x: 3, y: 7.5, width: 18, height: 12.5, rx: 3 }),
+                      h('path', { d: 'M8.5 3.5L12 7l3.5-3.5M7.5 12.5v3M16.5 12.5v3' }),
+                    ),
+                    tx(lang, '在 B 站观看', 'Watch on Bilibili'),
+                    mirror.label
+                      ? h('span', { className: 'ht-pill-tag' }, mirrorTag(lang, mirror.label))
+                      : null,
+                  )
+                : null,
             ),
             err
               ? h('p', { className: 'ht-note' }, tx(lang, '详情加载失败：', 'Failed to load details: ') + err)
@@ -2375,12 +2470,7 @@ window.__ModuleLoader__.load({
         const next = saved.seen.filter((x) => x !== vid).concat(vid).slice(-200)
         update(Object.assign({}, saved, { seen: next }))
       }
-      /* 首页「不感兴趣」：记录到 prefs，下一轮推荐直接排除 */
-      const dismiss = (vid) => {
-        const next = saved.dismissed.filter((x) => x !== vid).concat(vid).slice(-400)
-        update(Object.assign({}, saved, { dismissed: next }))
-      }
-      return { saved, toggle, markSeen, dismiss }
+      return { saved, toggle, markSeen }
     }
 
     /* ---------------- 视图组件 ---------------- */
@@ -2785,6 +2875,8 @@ window.__ModuleLoader__.load({
     }
 
     function HtRoot(props) {
+      /* 右栏模式：不读写页面 hash，观看状态只留在栏内，避免影响主会话地址 */
+      const embedded = !!(props && props.embedded)
       const [items, setItems] = useState(mem.list || [])
       const [tax, setTax] = useState(mem.tax || null)
       const [phase, setPhase] = useState(mem.list ? 'ready' : 'loading')
@@ -2816,7 +2908,9 @@ window.__ModuleLoader__.load({
       const [plSlug, setPlSlug] = useState(null)
       const [helpOpen, setHelpOpen] = useState(false)
       const [rec, setRec] = useState(null)
-      const { saved, toggle, markSeen, dismiss } = useSaved()
+      /* 每次「换一批」换一个 seed，Host 按它重新抽前排 */
+      const [recSeed, setRecSeed] = useState(() => Math.floor(Math.random() * 1e9) + 1)
+      const { saved, toggle, markSeen } = useSaved()
       /* 计数没有读者：它一变就重渲染，让后到的中文标题显示出来 */
       const [, bumpTitles] = useState(0)
 
@@ -2841,6 +2935,7 @@ window.__ModuleLoader__.load({
         params.set('seen', saved.seen.slice(-200).join(','))
         params.set('dismissed', saved.dismissed.slice(-200).join(','))
         params.set('limit', '10')
+        params.set('seed', String(recSeed))
         getJSON('/hackertube/api/recommend?' + params.toString())
           .then((data) => {
             if (alive && data && Array.isArray(data.items)) setRec(data)
@@ -2849,7 +2944,7 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
-      }, [phase, recKey])
+      }, [phase, recKey, recSeed])
 
       /* 宿主端保存过语言偏好就跟随；本机有明确选择或用户刚手动切换时不被覆盖 */
       useEffect(() => {
@@ -2966,6 +3061,7 @@ window.__ModuleLoader__.load({
 
       /* 深链恢复：地址里带 ht-watch 的视频在列表就绪后直接打开 */
       useEffect(() => {
+        if (embedded) return undefined
         if (phase !== 'ready' || watching) return
         const vid = readWatchVid()
         if (!vid) return
@@ -2975,6 +3071,7 @@ window.__ModuleLoader__.load({
 
       /* 浏览器前进/后退与 hash 变化保持同一份观看状态 */
       useEffect(() => {
+        if (embedded) return undefined
         const w = typeof window !== 'undefined' ? window : null
         if (!w || typeof w.addEventListener !== 'function') return undefined
         const sync = () => {
@@ -3091,7 +3188,24 @@ window.__ModuleLoader__.load({
         }
       }, [searchKey])
 
-      const filtered = searchActive ? searchState.items : items
+      /* 推荐只决定先后，不新增一栏：把推荐到的视频提到列表最前，其余保持原顺序 */
+      const orderedItems = useMemo(() => {
+        const list = rec && Array.isArray(rec.items) ? rec.items : []
+        if (!list.length || !items.length) return items
+        const byId = new Map(items.map((it) => [it.v, it]))
+        const front = []
+        const moved = new Set()
+        for (const r of list) {
+          const hit = r && byId.get(r.v)
+          if (!hit || moved.has(hit.v)) continue
+          front.push(hit)
+          moved.add(hit.v)
+        }
+        if (!front.length) return items
+        return front.concat(items.filter((it) => !moved.has(it.v)))
+      }, [items, rec])
+
+      const filtered = searchActive ? searchState.items : orderedItems
       const resultTotal = searchActive ? searchState.total : items.length
       /* 输入变化到请求返回之间也算加载中：不然会先闪一下「没有匹配的视频」 */
       const searchLoading = searchActive && (searchState.loading || searchState.key !== searchKey)
@@ -3176,39 +3290,36 @@ window.__ModuleLoader__.load({
       const openItem = (it) => {
         if (!it) return
         markSeen(it.v)
-        if (!watching) {
-          const el = listScrollRef.current
-          if (el) listScrollTop.current = el.scrollTop || 0
-          watchPushedRef.current = setWatchHash(it.v, 'push')
-        } else if (watching.v !== it.v) {
-          /* 相关视频是在同一次观看里换片：替换当前历史条目，Esc 一次仍回列表 */
-          setWatchHash(it.v, 'replace')
+        if (!embedded) {
+          if (!watching) {
+            const el = listScrollRef.current
+            if (el) listScrollTop.current = el.scrollTop || 0
+            watchPushedRef.current = setWatchHash(it.v, 'push')
+          } else if (watching.v !== it.v) {
+            /* 相关视频是在同一次观看里换片：替换当前历史条目，Esc 一次仍回列表 */
+            setWatchHash(it.v, 'replace')
+          }
         }
         setWatching(it)
       }
 
-      const dismissRecommendation = (vid) => {
-        setRec((cur) =>
-          cur && Array.isArray(cur.items) ? Object.assign({}, cur, { items: cur.items.filter((it) => it.v !== vid) }) : cur,
-        )
-        dismiss(vid)
-      }
-
       const closeWatch = () => {
-        if (watchPushedRef.current) {
-          watchPushedRef.current = false
-          try {
-            const w = typeof window !== 'undefined' ? window : null
-            if (w && w.history && typeof w.history.back === 'function') {
-              w.history.back()
-              setWatching(null)
-              return
+        if (!embedded) {
+          if (watchPushedRef.current) {
+            watchPushedRef.current = false
+            try {
+              const w = typeof window !== 'undefined' ? window : null
+              if (w && w.history && typeof w.history.back === 'function') {
+                w.history.back()
+                setWatching(null)
+                return
+              }
+            } catch {
+              /* history 不可用时退回替换地址 */
             }
-          } catch {
-            /* history 不可用时退回替换地址 */
           }
+          setWatchHash(null, 'replace')
         }
-        setWatchHash(null, 'replace')
         setWatching(null)
       }
 
@@ -3442,6 +3553,28 @@ window.__ModuleLoader__.load({
             'button',
             {
               type: 'button',
+              className: 'ht-shuffle',
+              'data-testid': 'ht-shuffle',
+              onClick: () => setRecSeed(Math.floor(Math.random() * 1e9) + 1),
+              title: tx(lang, '换一批：重新排列首页前排', 'Shuffle: reorder the front of the grid'),
+              'aria-label': tx(lang, '换一批', 'Shuffle'),
+            },
+            h(
+              'svg',
+              { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+              h('path', {
+                d: 'M4 7h9l3-3M4 17h9l3 3M17 4l3 3-3 3M17 14l3 3-3 3',
+                stroke: 'currentColor',
+                strokeWidth: 1.8,
+                strokeLinecap: 'round',
+                strokeLinejoin: 'round',
+              }),
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
               className: 'ht-lang',
               onClick: () => {
                 const next = lang === 'zh' ? 'en' : 'zh'
@@ -3611,9 +3744,6 @@ window.__ModuleLoader__.load({
           },
           phase === 'ready' && staleText ? h('div', { className: 'ht-stale', role: 'status' }, staleText) : null,
           phase === 'ready' && stageText ? h('div', { className: 'ht-stagebar', role: 'status' }, stageText) : null,
-          phase === 'ready' && !q.trim() && !area && rec && Array.isArray(rec.items) && rec.items.length
-            ? h(RecommendRow, { rec, lang, onOpen: openItem, onDismiss: dismissRecommendation })
-            : null,
           phase === 'error'
             ? h(
                 'div',
@@ -3686,6 +3816,11 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* 会话右栏的页面主体：窄容器里复用同一份 HtRoot，但不碰页面 hash */
+    function HtRail() {
+      return h('div', { className: 'ht-rail-shell' }, h(HtRoot, { embedded: true }))
+    }
+
     /* ---------------- 注册 ---------------- */
 
     return {
@@ -3740,6 +3875,55 @@ window.__ModuleLoader__.load({
           }
         }, 'dsh-hackertube: native panel')
 
+        /* 会话页原生右栏：只投 tab 类型与主体。id 用插件自有命名空间，
+           kind 独占 hackertube；不接 dsh-better-sidebar 的 ctx.betterSidebar，
+           两者同时安装时各占自己的 tab，不抢座位。 */
+        if (typeof ctx.inject === 'function') {
+          try {
+            ctx.inject(['sidebarRightTabs'], (scope) => {
+              const tabs = scope && scope.sidebarRightTabs
+              if (!tabs || typeof tabs.register !== 'function') return
+              ctx.effect(
+                () =>
+                  tabs.register({
+                    id: 'dsh-hackertube:right',
+                    kind: 'hackertube',
+                    priority: 'extension',
+                    keepMounted: true,
+                    title: () => 'HackerTube',
+                    guide: [
+                      {
+                        id: 'hackertube',
+                        order: 60,
+                        title: () => 'HackerTube',
+                        description: () =>
+                          initialLang() === 'zh'
+                            ? '在会话右栏浏览与播放技术视频'
+                            : 'Browse and play technical videos in the sidebar',
+                        icon: (iconProps) => PlayGlyph((iconProps && iconProps.size) || 16),
+                      },
+                    ],
+                  }),
+                'dsh-hackertube: right pane type',
+              )
+              ctx.effect(
+                () =>
+                  ctx.slots.inject('sidebar.right.pane.tab', () =>
+                    ctx.slots.register(
+                      { name: 'sidebar.right.pane.tab', key: 'dsh-hackertube:right' },
+                      HtRail,
+                    ),
+                  ),
+                'dsh-hackertube: right pane body',
+              )
+              beacon('right-pane-registered', { id: 'dsh-hackertube:right' })
+            })
+          } catch (err) {
+            console.warn('[dsh-hackertube] 右栏注册失败：', err)
+            beacon('right-pane-error', { message: String((err && err.message) || err) })
+          }
+        }
+
         /* 刷新后可在控制台输入 __dshHackertube 直接看注册结果 */
         if (typeof window !== 'undefined') {
           window.__dshHackertube = {
@@ -3763,6 +3947,12 @@ window.__ModuleLoader__.load({
               if (!vid) return
               const position = { t: Number(data.t) || 0, d: Number(data.d) || 0, at: Date.now() }
               watchSession(vid).playhead = position
+              /* 每 15 秒落一次盘，页面关掉也不会丢 */
+              const lastWrite = watchSession(vid).savedAt || 0
+              if (Date.now() - lastWrite > 15000) {
+                watchSession(vid).savedAt = Date.now()
+                saveProgress(vid, position)
+              }
               for (const fn of mem.playheadSubs) {
                 try {
                   fn(vid, position)

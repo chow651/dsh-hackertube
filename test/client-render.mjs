@@ -516,7 +516,7 @@ await act(async () => {
 const iframe = tree.root.findAllByType('iframe')[0]
 const waiting = tree.root.findAll((n) => n.props && String(n.props.className||'').includes('ht-video-wait')).length > 0
 check('player slot rendered', !!iframe || waiting, iframe ? 'iframe' : (waiting ? 'waiting' : 'none'))
-check('iframe uses relay', !iframe || String(iframe.props.src).indexOf('/embed?vid=a1') >= 0, iframe && iframe.props.src)
+check('iframe uses relay', !iframe || /\/embed\?vid=[A-Za-z0-9_-]+/.test(String(iframe.props.src)), iframe && iframe.props.src)
 check('iframe allows autoplay', !iframe || String(iframe.props.allow).indexOf('autoplay') >= 0, '')
 
 const watchBody = text()
@@ -583,8 +583,18 @@ async function freshTree() {
   })
   return t
 }
+/* 首页前排会被推荐重排，所以按 id 开卡，而不是靠位置 */
+async function openCardByVid(t, vid) {
+  const card = t.root
+    .findAllByType('button')
+    .find((b) => String(b.props.className || '') === 'ht-card' && b.props['data-vid'] === vid)
+  await act(async () => {
+    card.props.onClick()
+  })
+}
 async function openFirstCard(t) {
-  const card = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-card')
+  const cards = t.root.findAllByType('button').filter((b) => String(b.props.className || '') === 'ht-card')
+  const card = cards.find((b) => b.props['data-vid'] === 'a1') || cards[0]
   await act(async () => {
     card.props.onClick()
   })
@@ -1260,7 +1270,8 @@ function resetLangState() {
 }
 
 async function openWatch(t) {
-  const card = t.root.findAllByType('button').find((b) => String(b.props.className || '') === 'ht-card')
+  const cards = t.root.findAllByType('button').filter((b) => String(b.props.className || '') === 'ht-card')
+  const card = cards.find((b) => b.props['data-vid'] === 'a1') || cards[0]
   await act(async () => {
     card.props.onClick()
     await new Promise((r) => setTimeout(r, 20))
@@ -1451,8 +1462,10 @@ console.log('\n--- T05 language & translation ---')
     t.unmount()
   })
 }
-
 console.log('\n--- T06 taste profile ---')
+
+/** 首页网格里卡片标题的显示顺序 */
+const gridTitles = (t) => findClass(t, 'ht-card').map((c) => instanceText(c).slice(0, 60))
 
 function instanceText(inst) {
   const out = []
@@ -1473,71 +1486,161 @@ function instanceText(inst) {
   return out.join(' | ')
 }
 
-/* 有 like：首页出现推荐行，逐个给出「因为你喜欢…」的理由 */
+/* 有 like：推荐结果只改顺序，不新增一栏，也不在卡片上加理由 */
 {
   resetRoute()
   recommendMode = 'likes'
   recommendItems = [
-    { ...LIST[1], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } },
     { ...LIST[2], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } },
+    { ...LIST[0], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } },
   ]
   const t = await freshTree()
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 80))
   })
   const body = treeText(t)
-  check('T06 home recommendation row', /为你推荐|Recommended for you/.test(body), body.slice(0, 160))
-  check(
-    'T06 like explanation visible',
-    /因为你喜欢|Because you liked/.test(body) && body.includes('Vectors, the first chapter'),
-    body.slice(0, 200),
-  )
-  const recs = findClass(t, 'ht-rec')
-  check('T06 recommendation cards rendered', recs.length === 2, String(recs.length))
-  check('T06 every recommendation has a reason', recs.every((r) => /因为你喜欢|Because you liked/.test(instanceText(r))))
-  check('T06 recommendation title visible', recs.some((r) => instanceText(r).includes('A talk about type systems')), '')
+  check('T06 no separate recommendation section', !/为你推荐|Recommended for you|编辑精选|Editor's picks/.test(body), body.slice(0, 160))
+  check('T06 no reason text on cards', !/因为你喜欢|Because you liked/.test(body), body.slice(0, 200))
 
-  /* 不感兴趣：写入 prefs，重新取推荐后该条消失，顺序变化 */
-  const hide = findClass(t, 'ht-rec-hide')[0]
-  check('T06 not interested action present', !!hide)
-  await act(async () => {
-    hide.props.onClick()
-    await new Promise((r) => setTimeout(r, 520))
-  })
-  const prefPosts = fetchPosts.filter((p) => p.url.includes('/prefs'))
+  const titles = gridTitles(t)
+  check('T06 grid keeps one row of cards', findClass(t, 'ht-card').length === 3, String(findClass(t, 'ht-card').length))
   check(
-    'T06 dismiss persists to prefs',
-    prefPosts.some((p) => String(p.body || '').includes('"dismissed"') && String(p.body || '').includes('b2')),
-    prefPosts.map((p) => p.body).join(' / ').slice(0, 180),
+    'T06 recommended videos moved to the front',
+    titles[0].includes('Intro to large language models') &&
+      titles.some((x) => x.includes('Vectors, the first chapter')),
+    titles.join(' / ').slice(0, 200),
   )
-  check('T06 dismiss refetches with feedback', fetchLog.some((u) => String(u).includes('/recommend') && String(u).includes('dismissed=b2')), '')
-  const recsAfter = findClass(t, 'ht-rec')
   check(
-    'T06 dismissed item leaves the row',
-    recsAfter.length === 1 && instanceText(recsAfter[0]).includes('Intro to large language models'),
-    recsAfter.map(instanceText).join(' / ').slice(0, 180),
+    'T06 non-recommended videos keep their order after the front',
+    titles[2].includes('A talk about type systems'),
+    titles.join(' / ').slice(0, 200),
   )
   await act(async () => {
     t.unmount()
   })
 }
 
-/* 没有 like：冷启动用播放列表与 HN 分数，理由同样可见 */
+/* 没有 like：冷启动排序同样只改顺序 */
 {
   resetRoute()
   recommendMode = 'cold'
-  recommendItems = [
-    { ...LIST[2], reason: { kind: 'playlist', title: 'Start here', slug: 'start-here' } },
-    { ...LIST[1], reason: { kind: 'hn', score: 22, recommenders: 9 } },
-  ]
+  recommendItems = [{ ...LIST[1], reason: { kind: 'hn', score: 22, recommenders: 9 } }]
   const t = await freshTree()
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 80))
   })
   const body = treeText(t)
-  check('T06 cold-start row visible', /编辑精选|Editor's picks/.test(body), body.slice(0, 160))
-  check('T06 cold playlist reason visible', /来自播放列表|From playlist/.test(body) && body.includes('Start here'), body.slice(0, 200))
-  check('T06 cold HN reason visible', /HN 高分推荐|Highly recommended on HN/.test(body), body.slice(0, 220))
+  check('T06 cold start adds no section', !/编辑精选|Editor's picks/.test(body), body.slice(0, 160))
+  const titles = gridTitles(t)
+  check(
+    'T06 cold start moves the pick to the front',
+    titles[0].includes('A talk about type systems'),
+    titles.join(' / ').slice(0, 200),
+  )
+  check('T06 cold start keeps every card', findClass(t, 'ht-card').length === 3, String(findClass(t, 'ht-card').length))
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* 搜索时顺序交回 Host 检索，不再被推荐重排 */
+{
+  resetRoute()
+  recommendMode = 'likes'
+  recommendItems = [{ ...LIST[2], reason: { kind: 'like', vid: 'a1', title: LIST[0].t } }]
+  const t = await freshTree()
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 80))
+  })
+  const input = t.root.findAllByType('input')[0]
+  searchResponder = () => ({
+    query: 'vectors',
+    total: 1,
+    items: [{ ...LIST[0], match: { fields: ['title'], snippet: 'Vectors', snippetField: 'title' } }],
+  })
+  await act(async () => {
+    input.props.onChange({ target: { value: 'vectors' } })
+    await new Promise((r) => setTimeout(r, 450))
+  })
+  const titles = gridTitles(t)
+  check('T06 search hits the host endpoint', searchCalls.length > 0, JSON.stringify(searchCalls.slice(-1)))
+  check(
+    'T06 search results ignore recommendation order',
+    titles.length === 1 && titles[0].includes('Vectors, the first chapter'),
+    titles.join(' / ').slice(0, 200),
+  )
+  searchResponder = defaultSearchResponse
+  await act(async () => {
+    t.unmount()
+  })
+}
+
+/* ---------- T07：会话右栏注册 ---------- */
+
+/* 右栏走原生 sidebarRightTabs；ctx.inject 是可选的，没有该服务的宿主不应报错 */
+{
+  resetRoute()
+  const w = makeWin('zh-CN')
+  const mod = loadClientModule(w)
+  const slots = []
+  const types = []
+  const ctx = {
+    slots: {
+      inject(name, cb) {
+        cb()
+        return () => {}
+      },
+      register(opts, comp) {
+        slots.push({ opts, comp })
+        return () => {}
+      },
+    },
+    effect(fn) {
+      return fn()
+    },
+    inject(services, cb) {
+      cb({
+        sidebarRightTabs: {
+          register(def) {
+            types.push(def)
+            return () => {}
+          },
+        },
+      })
+      return () => {}
+    },
+  }
+  mod.apply(ctx)
+  const type = types[0]
+  check(
+    'T07 right pane type registered',
+    !!type && type.id === 'dsh-hackertube:right' && type.kind === 'hackertube',
+    JSON.stringify(type && { id: type.id, kind: type.kind }),
+  )
+  check(
+    'T07 right pane guide entry',
+    !!type && Array.isArray(type.guide) && type.guide.length === 1 && type.guide[0].id === 'hackertube',
+    JSON.stringify(type && type.guide),
+  )
+  const body = slots.find((s) => s.opts.name === 'sidebar.right.pane.tab')
+  check('T07 right pane body registered', !!body && body.opts.key === 'dsh-hackertube:right', JSON.stringify(body && body.opts))
+
+  let t = null
+  await act(async () => {
+    t = create(React.createElement(body.comp, {}), { createNodeMock: makeNodeMock })
+  })
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 80))
+  })
+  check('T07 right pane renders shell', t.root.findAllByProps({ className: 'ht-rail-shell' }).length > 0)
+  const hashBefore = w.location.hash
+  const card = t.root
+    .findAllByType('button')
+    .find((b) => String(b.props.className || '') === 'ht-card' && b.props['data-vid'] === 'a1')
+  await act(async () => {
+    if (card) card.props.onClick()
+  })
+  check('T07 right pane keeps page hash', w.location.hash === hashBefore, `${hashBefore} -> ${w.location.hash}`)
   await act(async () => {
     t.unmount()
   })
