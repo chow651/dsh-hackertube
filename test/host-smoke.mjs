@@ -832,9 +832,15 @@ async function runLanguageFixture() {
     const saved = read(await call('/hackertube/api/prefs'))
     lcheck('lang prefs stores zh', saved.lang === 'zh', JSON.stringify(saved))
     lcheck('lang prefs keeps likes on partial update', Array.isArray(saved.likes) && saved.likes[0] === 'abcdef', JSON.stringify(saved.likes))
+    await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ blocked: ['zzzzzz'] }) })
     await call('/hackertube/api/prefs', { method: 'POST', body: JSON.stringify({ lang: 'fr' }) })
     const invalid = read(await call('/hackertube/api/prefs'))
     lcheck('lang prefs ignores invalid language', invalid.lang === 'zh', String(invalid.lang))
+    lcheck(
+      'prefs keeps embed-blocked ids on partial update',
+      Array.isArray(invalid.blocked) && invalid.blocked.indexOf('zzzzzz') >= 0,
+      JSON.stringify(invalid.blocked),
+    )
 
     /* 语言偏好和喜欢列表是两次独立提交，同时到达时不能互相覆盖 */
     await Promise.all([

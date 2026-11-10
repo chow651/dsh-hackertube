@@ -15,7 +15,17 @@ if (!CLIENT) {
 /* ---------- 环境 mock ---------- */
 
 const styleEls = []
+/* 按 capture 分组，__emit 先跑捕获阶段再跑冒泡阶段，stopPropagation 能截住后者，
+   这样组件里用捕获阶段抢 Esc 的写法才能被测试如实验证 */
 const docListeners = new Map()
+function docBucket(type) {
+  let bucket = docListeners.get(type)
+  if (!bucket) {
+    bucket = { capture: new Set(), bubble: new Set() }
+    docListeners.set(type, bucket)
+  }
+  return bucket
+}
 global.document = {
   head: { appendChild() {} },
   activeElement: null,
@@ -24,16 +34,39 @@ global.document = {
     styleEls.push(el)
     return el
   },
-  addEventListener(type, fn) {
-    if (!docListeners.has(type)) docListeners.set(type, new Set())
-    docListeners.get(type).add(fn)
+  addEventListener(type, fn, opts) {
+    const capture = opts === true || !!(opts && opts.capture)
+    docBucket(type)[capture ? 'capture' : 'bubble'].add(fn)
   },
-  removeEventListener(type, fn) {
-    if (docListeners.has(type)) docListeners.get(type).delete(fn)
+  removeEventListener(type, fn, opts) {
+    const capture = opts === true || !!(opts && opts.capture)
+    docBucket(type)[capture ? 'capture' : 'bubble'].delete(fn)
   },
 }
 global.document.__emit = (type, event) => {
-  for (const fn of docListeners.get(type) || []) fn(event)
+  const bucket = docListeners.get(type)
+  if (!bucket) return
+  const e = event || {}
+  let stopped = false
+  if (typeof e.stopPropagation !== 'function') {
+    e.stopPropagation = () => {
+      stopped = true
+    }
+  } else {
+    const inner = e.stopPropagation.bind(e)
+    e.stopPropagation = () => {
+      stopped = true
+      inner()
+    }
+  }
+  for (const fn of bucket.capture) {
+    fn(e)
+    if (stopped) return
+  }
+  for (const fn of bucket.bubble) {
+    fn(e)
+    if (stopped) return
+  }
 }
 global.IntersectionObserver = class {
   constructor(cb) {
@@ -66,6 +99,8 @@ global.localStorage = {
  *  re-render 会反复调用 createNodeMock，滚动容器按 className 固定同一份替身，
  *  否则 ref 指向的节点和测试持有的节点不是同一个对象。 */
 const stableNodes = new Map()
+/* 电视的 iframe 替身：ref 拿到的节点要能接 postMessage，用来断言左右键把秒数递给了播放器 */
+const framePosts = []
 function makeNodeMock(element) {
   const cls = element && element.props ? String(element.props.className || '') : ''
   const stable = cls === 'ht-scroll' || cls === 'ht-watch' || cls === 'ht-rail'
@@ -76,6 +111,14 @@ function makeNodeMock(element) {
     clientHeight: 0,
     style: {},
     scrolledIntoView: false,
+    contentWindow:
+      element && element.type === 'iframe'
+        ? {
+            postMessage(msg) {
+              framePosts.push(msg)
+            },
+          }
+        : null,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
     getBoundingClientRect: () => ({ width: 900, height: 640 }),
     querySelector: () => null,
@@ -265,6 +308,18 @@ global.fetch = async (url, options = {}) => {
   }
   if (u.includes('/list/status')) {
     return { ok: true, status: 200, json: async () => statusBody() }
+  }
+  if (u.includes('/hackertube/api/mirror')) {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        url: 'https://www.bilibili.com/video/BV1ht',
+        label: 'Bilibili',
+        up: '搬运工',
+        play: 12345,
+      }),
+    }
   }
   if (u.includes('/recommend')) {
     const query = new URL(u, 'http://fixture.local').searchParams
@@ -1651,9 +1706,29 @@ function instanceText(inst) {
 console.log('\n--- T08 TV mode ---')
 {
   resetRoute()
+  resetLangState()
+  framePosts.length = 0
   const t = await freshTree()
   const tab = (v) =>
     t.root.findAllByType('button').find((b) => String((b.props && b.props['data-view']) || '') === v)
+  const hasClass = (node, name) =>
+    String((node.props && node.props.className) || '').split(/\s+/).indexOf(name) >= 0
+  const byClass = (name) => t.root.findAll((n) => n.props && hasClass(n, name))
+  const press = (k) =>
+    act(async () => {
+      global.document.__emit('keydown', {
+        key: k,
+        metaKey: false,
+        ctrlKey: false,
+        altKey: false,
+        preventDefault() {},
+      })
+    })
+  const frameSrc = () => {
+    const frame = t.root.findAllByType('iframe')[0]
+    return frame ? String(frame.props.src) : ''
+  }
+  const vidOf = () => (frameSrc().match(/[?&]vid=([^&]+)/) || [])[1] || ''
 
   const tvTab = tab('tv')
   check(
@@ -1662,7 +1737,9 @@ console.log('\n--- T08 TV mode ---')
     tvTab && String(tvTab.props.children),
   )
 
-  /* 从「喜欢」进入，退出时要回到这里而不是首页 */
+  /* 第一次进电视抽哪台是随机的；把随机数钉死，抽屉断言才有确定的片子 */
+  const realRandom = Math.random
+  Math.random = () => 0
   await act(async () => {
     tab('liked').props.onClick()
   })
@@ -1670,54 +1747,195 @@ console.log('\n--- T08 TV mode ---')
     tab('tv').props.onClick()
     await wait(40)
   })
-  const tvRoot = () =>
-    t.root.findAll((n) => n.props && /^ht-tv( show)?$/.test(String(n.props.className || '')))
-  const iframe = t.root.findAllByType('iframe')[0]
-  const tvBody = treeText(t)
+  Math.random = realRandom
+
+  const idle = byClass('ht-tv')[0]
+  const handle = byClass('ht-tvd-handle')[0]
+  const drawer = byClass('ht-tvd')[0]
   check(
-    'T08 TV screen uses relay player and drops related content',
-    tvRoot().length === 1 &&
-      !!iframe &&
-      /\/embed\?vid=a1/.test(String(iframe.props.src)) &&
-      !/为你推荐|相关推荐|一起看|Recommended for you|Up next|Watch together/.test(tvBody),
-    (iframe && iframe.props.src) + ' / ' + tvBody.slice(0, 160),
+    'T08 TV opens straight on the picture, drawer shut and nothing on hover',
+    byClass('ht-tv').length === 1 &&
+      !!idle &&
+      idle.props.onMouseMove === undefined &&
+      /\/embed\?vid=a1/.test(frameSrc()) &&
+      /[?&]kbd=1/.test(frameSrc()) &&
+      !!handle &&
+      handle.props['data-tv-drawer'] === '1' &&
+      handle.props['aria-expanded'] === 'false' &&
+      !!drawer &&
+      !hasClass(drawer, 'open') &&
+      drawer.props['aria-hidden'] === 'true',
+    frameSrc() + ' / ' + (drawer && drawer.props.className),
+  )
+  check(
+    'T08 immersive TV drops related content and watch-together',
+    !/为你推荐|相关推荐|一起看|Recommended for you|Up next|Watch together/.test(treeText(t)),
+    treeText(t).slice(0, 160),
   )
 
-  const idle = tvRoot()[0]
+  /* 点右边的把手才拉出抽屉，简介与跳转都在里面 */
   await act(async () => {
-    idle.props.onMouseMove()
+    byClass('ht-tvd-handle')[0].props.onClick()
+    await wait(40)
   })
-  const layer = tvRoot()[0]
+  const opened = byClass('ht-tvd')[0]
+  const links = t.root.findAllByType('a').map((a) => String(a.props.href || ''))
+  const drawerBody = treeText(t)
+  check(
+    'T08 edge handle opens a drawer with summary and both outside jumps',
+    hasClass(opened, 'open') &&
+      opened.props['aria-hidden'] === undefined &&
+      drawerBody.includes('Vectors, the first chapter') &&
+      drawerBody.includes('An animated introduction to vectors.') &&
+      links.includes('https://www.youtube.com/watch?v=a1') &&
+      links.includes('https://www.bilibili.com/video/BV1ht'),
+    (opened && opened.props.className) + ' / ' + links.join(','),
+  )
+
+  /* Esc 先收抽屉，电视还在放 */
+  await press('Escape')
+  const shut = byClass('ht-tvd')[0]
+  check(
+    'T08 Esc closes the drawer without leaving TV',
+    !!shut &&
+      !hasClass(shut, 'open') &&
+      shut.props['aria-hidden'] === 'true' &&
+      /\/embed\?vid=a1/.test(frameSrc()),
+    (shut && shut.props.className) + ' / ' + frameSrc(),
+  )
+
+  /* 左右键调进度：面板把秒数递给中转页里的播放器，不换台 */
+  await press('ArrowRight')
+  check(
+    'T08 left/right keys seek instead of switching',
+    /\/embed\?vid=a1/.test(frameSrc()) && framePosts.some((m) => m && m.__ht === 'seek' && m.delta === 5),
+    frameSrc() + ' / ' + JSON.stringify(framePosts),
+  )
+
+  await press(' ')
+  check(
+    'T08 space toggles playback through the relay',
+    /\/embed\?vid=a1/.test(frameSrc()) && framePosts.some((m) => m && m.__ht === 'toggle'),
+    frameSrc() + ' / ' + JSON.stringify(framePosts),
+  )
+
+  await press('ArrowDown')
+  const downVid = vidOf()
+  check(
+    'T08 down switches to a random channel instead of the next in the list',
+    !!downVid && downVid !== 'a1' && /\/embed\?vid=/.test(frameSrc()),
+    frameSrc(),
+  )
+
+  /* 焦点在播放器里时按键进不了面板，中转页按 kbd=1 转成 __ht:nav */
   await act(async () => {
-    global.document.__emit('keydown', {
-      key: 'ArrowRight',
-      metaKey: false,
-      ctrlKey: false,
-      altKey: false,
-      preventDefault() {},
+    win.__emit('message', { data: { __ht: 'nav', dir: 1 } })
+  })
+  const relayVid = vidOf()
+  check(
+    'T08 relay-forwarded keys switch channel without opening the drawer',
+    !!relayVid &&
+      relayVid !== downVid &&
+      relayVid !== 'a1' &&
+      !hasClass(byClass('ht-tvd')[0], 'open'),
+    frameSrc(),
+  )
+
+  await press('ArrowUp')
+  check('T08 up steps back to the previous channel', vidOf() === downVid, frameSrc())
+
+  /* 一条放完：中转页发 __ht:"state" s=0，电视自动接下一台 */
+  await act(async () => {
+    win.__emit('message', { data: { __ht: 'state', s: 0, vid: downVid } })
+    await wait(20)
+  })
+  const endVid = vidOf()
+  check(
+    'T08 video ending advances to the next random channel',
+    !!endVid && endVid !== downVid,
+    frameSrc(),
+  )
+
+  /* 作者不允许内嵌（yt-error 101/150）：跳过这一台，并记进 prefs 不再抽到 */
+  const blockedVid = endVid
+  await act(async () => {
+    win.__emit('message', { data: { __ht: 'yt-error', code: 101, vid: blockedVid } })
+    await wait(30)
+  })
+  const afterBlock = vidOf()
+  check(
+    'T08 non-embeddable video is dropped and TV moves on',
+    !!afterBlock && afterBlock !== blockedVid,
+    frameSrc(),
+  )
+  await act(async () => {
+    await wait(500)
+  })
+  check(
+    'T08 non-embeddable video is persisted to prefs',
+    prefsPosts.some((p) => p && Array.isArray(p.blocked) && p.blocked.indexOf(blockedVid) >= 0),
+    JSON.stringify(prefsPosts.slice(-1)),
+  )
+  await press('ArrowUp')
+  check(
+    'T08 going back skips the non-embeddable channel',
+    vidOf() !== blockedVid && vidOf() === downVid,
+    frameSrc(),
+  )
+  await press('ArrowDown')
+  check('T08 down returns to the replacement channel', vidOf() === afterBlock, frameSrc())
+
+  /* 点了播放器右下角的「更多视频」：YouTube 在自己 iframe 里换了片，中转页转出 yt-pick，
+     面板必须跟着换，抽屉里不能还留着上一台的标题 */
+  const otherVid = ['a1', 'b2', 'c3'].find((v) => v !== afterBlock)
+  const otherTitle = {
+    a1: 'Vectors, the first chapter',
+    b2: 'A talk about type systems',
+    c3: 'Intro to large language models',
+  }[otherVid]
+  await act(async () => {
+    win.__emit('message', {
+      data: { __ht: 'yt-pick', vid: otherVid, prev: afterBlock, title: 'Picked from the player', author: 'Some Channel' },
     })
+    await wait(30)
   })
-  const switched = treeText(t)
   check(
-    'T08 mousemove reveals the layer and arrows switch channel',
-    layer &&
-      /(^| )show( |$)/.test(String(layer.props.className)) &&
-      switched.includes('A talk about type systems'),
-    String(layer && layer.props.className) + ' / ' + switched.slice(0, 160),
+    'T08 a pick inside the player moves the panel to that library video without reloading the player',
+    vidOf() === afterBlock && treeText(t).includes(otherTitle),
+    frameSrc(),
   )
 
+  /* 点开的推荐不在片库里：照样换过去，标题与频道用 YouTube 给的，详情入口不出现 */
   await act(async () => {
-    global.document.__emit('keydown', { key: 'Escape', metaKey: false, ctrlKey: false, altKey: false })
+    win.__emit('message', {
+      data: { __ht: 'yt-pick', vid: 'zz9ext', prev: otherVid, title: 'Talk outside the library', author: 'Some Channel' },
+    })
+    await wait(30)
   })
+  const extBody = treeText(t)
+  check(
+    'T08 a pick from outside the library still follows, without stale detail or a details link',
+    vidOf() === afterBlock &&
+      extBody.includes('Talk outside the library') &&
+      !extBody.includes('An animated introduction to vectors.') &&
+      !extBody.includes('bilibili') &&
+      !extBody.includes('看详情'),
+    frameSrc() + ' / ' + extBody.slice(0, 200),
+  )
+
+  /* 换台之后 iframe 重新跟着当前条目走：点开时保留下来的播放器不再沿用 */
+  await press('ArrowUp')
+  check('T08 leaving an adopted video loads that channel again', vidOf() === otherVid, frameSrc())
+  await press('ArrowDown')
+  check('T08 forward lands back on the adopted video', vidOf() === 'zz9ext', frameSrc())
+
+  await press('Escape')
   const backBody = treeText(t)
-  await act(async () => {
-    global.document.__emit('keydown', { key: 't', metaKey: false, ctrlKey: false, altKey: false })
-  })
-  const again = treeText(t)
+  await press('t')
   check(
     'T08 exit returns to previous view and keeps the channel',
-    /还没有喜欢过任何视频|No liked videos yet/.test(backBody) && again.includes('A talk about type systems'),
-    backBody.slice(0, 120) + ' / ' + again.slice(0, 160),
+    /还没有喜欢过任何视频|No liked videos yet/.test(backBody) && vidOf() === 'zz9ext',
+    backBody.slice(0, 120) + ' / ' + frameSrc(),
   )
   await act(async () => {
     t.unmount()
@@ -1769,6 +1987,24 @@ console.log('\n--- T09 TV in session pane ---')
     strip ? strip.findAllByType('img').length + ' thumbs' : 'missing',
   )
   check('T09 pane TV leaves player controls clickable', findClass(t, 'ht-tv-sense').length === 0, '')
+
+  /* 点「接下来」里的哪一台就直接换到哪一台 */
+  const vidOf = () => {
+    const frame = t.root.findAllByType('iframe')[0]
+    return ((frame && String(frame.props.src)) || '').match(/[?&]vid=([^&]+)/)?.[1] || ''
+  }
+  const beforePick = vidOf()
+  const pickBtn = findClass(t, 'ht-tv-qitem')[0]
+  const pickVid = pickBtn && pickBtn.props['data-tvpick']
+  await act(async () => {
+    if (pickBtn) pickBtn.props.onClick()
+    await wait(20)
+  })
+  check(
+    'T09 pane up-next plays the chosen video',
+    !!pickVid && vidOf() === pickVid && pickVid !== beforePick,
+    beforePick + ' -> ' + vidOf(),
+  )
 
   const exit = t.root
     .findAllByType('button')

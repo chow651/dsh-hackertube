@@ -34,8 +34,10 @@ const videos = [VID, VID_NO_SUBS, VID_COOKIES, VID_TIMEOUT].map((vid, i) => ({
   hn: { recommenders: 9 },
 }))
 writeFileSync(join(exportDir, 'videos.jsonl'), videos.map((v) => JSON.stringify(v)).join('\n') + '\n')
-writeFileSync(join(exportDir, 'mentions.jsonl'), '')
-writeFileSync(join(exportDir, 'related.jsonl'), '')
+/* 空 JSONL 用一行空白占位：Host 的 exportFilesPresent() 要求每个导出文件 size > 0，
+   0 字节会被判成没下完，进而去拉真实导出包，测试就联网了 */
+writeFileSync(join(exportDir, 'mentions.jsonl'), '\n')
+writeFileSync(join(exportDir, 'related.jsonl'), '\n')
 writeFileSync(join(exportDir, 'embeddings.npy'), 'x')
 writeFileSync(join(exportDir, 'embedding_ids.json'), '[]')
 writeFileSync(join(exportDir, 'manifest.json'), JSON.stringify({ v: 1, at: Date.now(), bytes: 1 }))

@@ -1389,22 +1389,60 @@ function serveEmbed(req, res, vid, lang, startAt, auto) {
   const hl = lang === 'zh' ? 'zh-CN' : 'en'
   const host = String(req.headers?.host || '')
   const relayOrigin = /^[\w.:-]+$/.test(host) ? 'http://' + host : 'http://127.0.0.1:18090'
+  /* 电视模式（kbd=1）由中转页接管方向键：点击播放器后焦点会落进 YouTube 的跨域 iframe，
+     父页面从此收不到按键，只能在这里把焦点收回来再把换台指令转给面板 */
+  const kbd = /[?&]kbd=1(?:&|$)/.test(String(req.url || ''))
   /* 用 YouTube IFrame API 托管播放器，才能读到播放位置；每秒把时间戳递回父页面，
      面板据此把「当前在讲什么」作为上下文交给模型 */
   const html =
     '<!doctype html><html><head><meta charset="utf-8">' +
     '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#yt{width:100%;height:100%}' +
-    '#yt iframe{width:100%;height:100%;border:0;display:block}</style>' +
-    '</head><body><div id="yt"></div><script>' +
+    '#yt iframe{width:100%;height:100%;border:0;display:block}' +
+    /* 播放器右下角有 YouTube 自己的「更多视频」卡片与标志，都在跨域 iframe 里，
+       去不掉，也不再挡：用户选择让它们照常可点。站外入口仍收在抽屉里 */
+    '</style>' +
+    '</head><body><div id="yt"></div>' +
+    '<script>' +
     'var player=null,lastT=-1,timer=null;var V=' + JSON.stringify(vid) + ';' +
     'var START=' + JSON.stringify(Math.max(0, Number(startAt) || 0)) + ';' +
+    'var KBD=' + (kbd ? 'true' : 'false') + ';' +
     /* 续播只做一次：用户自己拖回去以后不该被拽回来 */
     'function seekOnce(){if(START&&player&&typeof player.seekTo==="function"){try{player.seekTo(START,true)}catch(e){}START=0}}' +
     'function tell(m){m.vid=m.vid||V;try{parent.postMessage(m,"*")}catch(e){}}' +
+    /* 用户点了播放器里的「更多视频」卡片：YouTube 就在自己的 iframe 里换片，面板不知道
+       就会一直以为在放原来那支，抽屉标题、字幕上下文和进度全会错位。这里盯
+       getVideoData().video_id，连续两次轮询都是同一支新片才认定，避开广告插播的短暂切换 */
+    'var pickId="",pickSame=0;' +
+    'function watchPick(){if(!player||typeof player.getVideoData!=="function")return;' +
+    'var vd;try{vd=player.getVideoData()}catch(e){return}' +
+    'var id=vd&&vd.video_id;if(!id||id===V){pickId="";pickSame=0;return}' +
+    'if(id!==pickId){pickId=id;pickSame=1;return}' +
+    'pickSame+=1;if(pickSame!==2)return;' +
+    'var prev=V;V=id;pickId="";pickSame=0;' +
+    'tell({__ht:"yt-pick",vid:id,prev:prev,title:vd.title||"",author:vd.author||""})}' +
     'function tick(){if(player&&typeof player.getCurrentTime==="function"){try{' +
     'var t=player.getCurrentTime(),d=player.getDuration();' +
     'if(Math.abs(t-lastT)>=1){lastT=t;tell({__ht:"time",t:t,d:d})}' +
-    '}catch(e){}}timer=setTimeout(tick,800)}' +
+    '}catch(e){}}watchPick();timer=setTimeout(tick,800)}' +
+    'function navKey(e){if(!KBD)return;' +
+    'if(e.key==="ArrowUp"){e.preventDefault();tell({__ht:"nav",dir:-1});return}' +
+    'if(e.key==="ArrowDown"){e.preventDefault();tell({__ht:"nav",dir:1});return}' +
+    'if(e.key==="ArrowLeft"||e.key==="ArrowRight"){e.preventDefault();seekBy(e.key==="ArrowRight"?5:-5);return}' +
+    'if(e.key==="Escape"){tell({__ht:"nav",key:"Escape"})}' +
+    'if(e.key===" "||e.key==="Spacebar"){e.preventDefault();togglePlay()}}' +
+    'function seekBy(d){if(!d||!player||typeof player.getCurrentTime!=="function"||typeof player.seekTo!=="function")return;' +
+    'try{var t=player.getCurrentTime()+d,dur=player.getDuration();if(dur>0)t=Math.max(0,Math.min(dur-1,t));player.seekTo(t,true)}catch(e){}}' +
+    /* 空格暂停 / 继续：焦点在中转页时自己处理，焦点在面板上时由面板把 toggle 递进来 */
+    'function togglePlay(){if(!player||typeof player.getPlayerState!=="function")return;' +
+    'try{if(player.getPlayerState()===1)player.pauseVideo();else player.playVideo()}catch(e){}}' +
+    'window.addEventListener("message",function(e){if(e.source!==parent)return;var m=e&&e.data;if(!m||!m.__ht)return;' +
+    'if(m.__ht==="toggle"){togglePlay();return}if(m.__ht!=="seek")return;seekBy(Number(m.delta)||0)});' +
+    'if(KBD){window.addEventListener("keydown",navKey);' +
+    /* 焦点收回不能只靠 window 的 blur：点播放器时中转页可能本来就没有焦点，
+       那一下不会触发 blur，按键从此留在 YouTube 的 iframe 里。轮询把焦点抢回来，
+       无论焦点是第几次落进 iframe 都管用（例如分享面板关闭之后） */
+    'setInterval(function(){var a=document.activeElement;' +
+    'if(a&&a.tagName==="IFRAME"){try{a.blur()}catch(e){}}},300)}' +
     'function ready(){player=new YT.Player("yt",{videoId:' +
     JSON.stringify(vid) +
     ',playerVars:{rel:0,playsinline:1,' + (auto ? 'autoplay:1,' : '') + 'hl:' + JSON.stringify(hl) + ',origin:' +
@@ -2926,7 +2964,7 @@ function mergePrefsWrite(body) {
     const old = prev && typeof prev === 'object' ? prev : {}
     const clean = {}
     /* 只更新请求里真的带了的集合，语言偏好这种局部写不会清空喜欢/稍后看 */
-    for (const key of ['likes', 'later', 'seen', 'dismissed']) {
+    for (const key of ['likes', 'later', 'seen', 'dismissed', 'blocked']) {
       const list = body && Array.isArray(body[key]) ? body[key] : Array.isArray(old[key]) ? old[key] : []
       clean[key] = list.map((x) => String(x)).filter((x) => /^[A-Za-z0-9_-]{6,20}$/.test(x)).slice(-400)
     }
@@ -3186,6 +3224,7 @@ async function handler(req, res) {
               later: clean.later.length,
               seen: clean.seen.length,
               dismissed: clean.dismissed.length,
+              blocked: clean.blocked.length,
             },
           })
         })
@@ -3197,6 +3236,7 @@ async function handler(req, res) {
         later: Array.isArray(saved && saved.later) ? saved.later : [],
         seen: Array.isArray(saved && saved.seen) ? saved.seen : [],
         dismissed: Array.isArray(saved && saved.dismissed) ? saved.dismissed : [],
+        blocked: Array.isArray(saved && saved.blocked) ? saved.blocked : [],
         lang: saved && (saved.lang === 'zh' || saved.lang === 'en') ? saved.lang : null,
       })
     }

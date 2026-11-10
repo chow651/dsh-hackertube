@@ -68,6 +68,20 @@ window.__ModuleLoader__.load({
       /* 播放错误按视频 id 存：中转页的 yt-error / api-error 会先到全局监听，再由观看页订阅 */
       playback: new Map(),
       playbackSubs: new Set(),
+      /* 电视里焦点落在播放器 iframe 时，方向键由中转页转发过来，按当前挂载的电视视图消费 */
+      tvNavSubs: new Set(),
+      /* 电视里左右键调进度：面板把秒数转给中转页里的播放器 */
+      tvSeekSubs: new Set(),
+      /* 电视里空格暂停 / 继续：同样转给中转页，焦点在面板上时也能用 */
+      tvPlaySubs: new Set(),
+      /* 一条放完自动接下一台：中转页的 onStateChange 会发 __ht:"state" */
+      tvEndSubs: new Set(),
+      /* 作者不允许内嵌的视频不进电视：yt-error 101/150 触发，会话内同步去重 */
+      tvBlocked: new Set(),
+      /* 当前电视视图订阅播放错误，命中就把这条永久移出片库并换台 */
+      tvErrorSubs: new Set(),
+      /* 播放器里点了「更多视频」，YouTube 在自己的 iframe 里换了片：yt-pick 触发 */
+      tvPickSubs: new Set(),
       activeWatchVid: null,
     }
 
@@ -209,6 +223,8 @@ window.__ModuleLoader__.load({
     const LANG_STORAGE_KEY = 'ht.lang'
     /* 详情译文的等待上限：模型慢就放弃本轮，原文照旧可读 */
     const TR_BUDGET_MS = 25000
+    /* 电视里左右键的快进/快退秒数，跟 YouTube 网页端一致 */
+    const TV_SEEK_STEP = 5
 
     function normalizeLang(value) {
       return String(value || '').toLowerCase().startsWith('zh') ? 'zh' : 'en'
@@ -921,26 +937,15 @@ window.__ModuleLoader__.load({
 .ht-tab-sep{width:1px;height:15px;background:var(--dsw-alias-border-l3)}
 .ht-tab-tv{gap:6px}
 .ht-tab-tv::before{content:"";width:5px;height:5px;border-radius:50%;background:#ff6600}
-/* ---- 电视：播放器满铺，信息层随鼠标浮出，静止后连光标一起退场 ---- */
-.ht-tv{position:relative;flex:1;min-height:0;overflow:hidden;background:#000;color:#fff;cursor:none}
-.ht-tv.show{cursor:default}
+/* ---- 电视：播放器满铺，平时不出现任何浮层；简介与站外入口收在右侧毛玻璃抽屉 ---- */
+.ht-tv{position:relative;flex:1;min-height:0;overflow:hidden;background:#000;color:#fff}
 .ht-tv-stage{position:absolute;inset:0;background:#000}
 .ht-tv-stage iframe{width:100%;height:100%;border:0;display:block;background:#000}
-/* 透明传感器压在播放器上：跨域 iframe 不向父页面冒泡鼠标事件，靠它接住移动 */
-.ht-tv-sense{position:absolute;inset:0;z-index:1;background:transparent}
 .ht-tv-wait{position:absolute;inset:0;display:grid;place-items:center;font-size:13px;color:rgba(255,255,255,.6)}
-.ht-tvui{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;justify-content:space-between;
-  padding:20px 30px 24px;opacity:0;pointer-events:none;transition:opacity .26s cubic-bezier(.32,.72,0,1);
-  background:
-    linear-gradient(180deg,rgba(0,0,0,.72),rgba(0,0,0,.18) 18%,rgba(0,0,0,0) 32%),
-    linear-gradient(0deg,rgba(0,0,0,.9),rgba(0,0,0,.45) 26%,rgba(0,0,0,0) 56%)}
-.ht-tv.show .ht-tvui{opacity:1}
-.ht-tv-top{width:min(100%,860px);margin:0 auto;display:flex;align-items:center;gap:10px}
 .ht-tv-onair{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:4px;
   background:#ff6600;color:#fff;font-size:11px;font-weight:700;letter-spacing:.08em}
 .ht-tv-onair::before{content:"";width:5px;height:5px;border-radius:50%;background:#fff}
 .ht-tv-mark{font-size:15px;font-weight:600;letter-spacing:-.01em}
-.ht-tv-bot{width:min(100%,860px);margin:0 auto;display:flex;flex-direction:column;gap:14px}
 .ht-tv-title{margin:0;font-size:22px;line-height:28px;font-weight:600;letter-spacing:-.01em;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ht-tv-who{margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.62)}
@@ -951,12 +956,50 @@ window.__ModuleLoader__.load({
   border-top:1px solid rgba(255,255,255,.12)}
 .ht-tv-act{display:inline-flex;align-items:center;height:34px;padding:0 15px;border-radius:999px;
   cursor:pointer;font:inherit;font-size:13px;font-weight:500;white-space:nowrap;
-  border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;pointer-events:none;
+  border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;
   transition:background .16s cubic-bezier(.32,.72,0,1)}
-.ht-tv.show .ht-tv-act{pointer-events:auto}
 .ht-tv-act:hover{background:rgba(255,255,255,.1)}
-.ht-tv-keys{margin-left:auto;font-size:11.5px;color:rgba(255,255,255,.5)}
-.ht-tv-keys kbd{font:inherit;padding:1px 5px;border:1px solid rgba(255,255,255,.28);border-radius:4px;
+/* 抽屉把手：贴在右边缘，是电视里唯一常驻的元素 */
+.ht-tvd-handle{position:absolute;top:50%;right:0;transform:translateY(-50%);z-index:3;
+  width:26px;height:78px;display:grid;place-items:center;padding:0;cursor:pointer;
+  border:1px solid rgba(255,255,255,.18);border-right:0;border-radius:10px 0 0 10px;
+  background:rgba(16,17,20,.42);color:rgba(255,255,255,.72);
+  -webkit-backdrop-filter:blur(16px) saturate(1.2);backdrop-filter:blur(16px) saturate(1.2);
+  transition:background .2s,border-color .2s,opacity .2s}
+.ht-tvd-handle:hover{background:rgba(28,29,33,.74);border-color:rgba(255,255,255,.3)}
+.ht-tvd-handle[aria-expanded="true"]{opacity:0;pointer-events:none}
+.ht-tvd-scrim{position:absolute;inset:0;z-index:2;background:rgba(0,0,0,.16);
+  opacity:0;pointer-events:none;transition:opacity .3s cubic-bezier(.32,.72,0,1)}
+.ht-tvd-scrim.on{opacity:1;pointer-events:auto}
+.ht-tvd{position:absolute;top:0;right:0;bottom:0;z-index:4;width:min(380px,86%);
+  display:flex;flex-direction:column;gap:12px;padding:20px 20px 18px;
+  overflow-y:auto;overscroll-behavior:contain;visibility:hidden;
+  background:rgba(17,18,21,.62);color:#f7f7f7;
+  border-left:1px solid rgba(255,255,255,.14);
+  box-shadow:-30px 0 60px rgba(0,0,0,.38);
+  -webkit-backdrop-filter:blur(24px) saturate(1.35);backdrop-filter:blur(24px) saturate(1.35);
+  transform:translateX(calc(100% + 2px));
+  transition:transform .3s cubic-bezier(.32,.72,0,1),visibility 0s .3s}
+.ht-tvd.open{visibility:visible;transform:none;transition:transform .3s cubic-bezier(.32,.72,0,1)}
+.ht-tvd-head{display:flex;align-items:flex-start;gap:10px}
+.ht-tvd-title{margin:0;flex:1;min-width:0;font-size:18px;line-height:24px;font-weight:600;letter-spacing:-.01em}
+.ht-tvd-x{flex:none;width:30px;height:30px;display:grid;place-items:center;padding:0;cursor:pointer;
+  border-radius:50%;border:1px solid rgba(255,255,255,.2);background:transparent;color:rgba(255,255,255,.8)}
+.ht-tvd-x:hover{background:rgba(255,255,255,.12)}
+.ht-tvd-who{margin:0;font-size:12.5px;color:rgba(255,255,255,.6)}
+.ht-tvd-desc{margin:0;font-size:13px;line-height:1.72;color:rgba(255,255,255,.82);
+  white-space:pre-wrap;overflow-wrap:anywhere}
+.ht-tvd-note{margin:0;font-size:12.5px;color:rgba(255,255,255,.45)}
+.ht-tvd-acts{display:flex;flex-direction:column;gap:8px;margin-top:2px}
+.ht-tvd-link{display:flex;align-items:center;gap:9px;min-height:40px;padding:0 14px;border-radius:10px;
+  cursor:pointer;font:inherit;font-size:13px;font-weight:500;text-align:left;
+  border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#f7f7f7}
+.ht-tvd-link:hover{background:rgba(255,255,255,.13)}
+.ht-tvd-link svg{flex:none;opacity:.85}
+.ht-tvd-foot{display:flex;gap:8px;margin-top:auto;padding-top:12px;
+  border-top:1px solid rgba(255,255,255,.12)}
+.ht-tvd-keys{margin:0;font-size:11.5px;color:rgba(255,255,255,.5)}
+.ht-tvd-keys kbd{font:inherit;padding:1px 5px;border:1px solid rgba(255,255,255,.28);border-radius:4px;
   color:rgba(255,255,255,.78)}
 /* 会话右栏的窄版电视：信息常驻，没有悬浮层，底部动作直接可点 */
 .ht-tv-compact{flex:1;min-height:0;width:100%;display:flex;flex-direction:column;gap:12px;
@@ -990,12 +1033,11 @@ window.__ModuleLoader__.load({
 .ht-tv-compact .ht-tv-foot{flex:none;margin-top:auto;gap:8px;padding-top:10px}
 .ht-tv-compact .ht-tv-act{height:32px;padding:0 12px;font-size:12.5px;pointer-events:auto}
 @container (max-width:560px){
-  .ht-tvui{padding:12px 14px 16px}
   .ht-tv-title{font-size:17px;line-height:22px}
   .ht-tv-mark{font-size:13px}
   .ht-tv-meta{gap:10px;font-size:12px}
-  .ht-tv-keys{display:none}
   .ht-tv-act{height:32px;padding:0 12px;font-size:12.5px}
+  .ht-tvd{width:min(320px,92%);padding:16px 16px 14px}
 }
 .ht-areas{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(360px,100%),1fr));gap:12px;padding:16px 24px 40px}
 .ht-area{border:1px solid var(--dsw-alias-border-l1);border-radius:16px;padding:16px 20px;cursor:pointer;text-align:left;
@@ -2466,8 +2508,12 @@ window.__ModuleLoader__.load({
         later: readArr('ht.later'),
         seen: readArr('ht.seen'),
         dismissed: readArr('ht.dismissed'),
+        blocked: readArr('ht.blocked'),
       }))
       const saveTimer = useRef(null)
+      /* 订阅回调里拿到的 saved 可能是旧闭包，写集合前先读最新的 */
+      const savedRef = useRef(saved)
+      savedRef.current = saved
       /* dsh-app:// 下的 localStorage 不保证可用或跨会话，真正的存档放在 host 端 */
       useEffect(() => {
         let alive = true
@@ -2479,7 +2525,10 @@ window.__ModuleLoader__.load({
               later: Array.isArray(d.later) ? d.later : [],
               seen: Array.isArray(d.seen) ? d.seen : [],
               dismissed: Array.isArray(d.dismissed) ? d.dismissed : [],
+              blocked: Array.isArray(d.blocked) ? d.blocked : [],
             })
+            /* 宿主存档才是权威，把会话内的同步去重集合对齐过去 */
+            mem.tvBlocked = new Set(Array.isArray(d.blocked) ? d.blocked : [])
           })
           .catch(() => {})
         return () => {
@@ -2492,13 +2541,20 @@ window.__ModuleLoader__.load({
         writeArr('ht.later', next.later)
         writeArr('ht.seen', next.seen)
         writeArr('ht.dismissed', next.dismissed)
+        writeArr('ht.blocked', next.blocked)
         if (saveTimer.current) clearTimeout(saveTimer.current)
         saveTimer.current = setTimeout(() => {
           try {
             void fetch('/hackertube/api/prefs', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ likes: next.likes, later: next.later, seen: next.seen, dismissed: next.dismissed }),
+              body: JSON.stringify({
+                likes: next.likes,
+                later: next.later,
+                seen: next.seen,
+                dismissed: next.dismissed,
+                blocked: next.blocked,
+              }),
             }).catch(() => {})
           } catch {
             /* 离线时只留本地副本 */
@@ -2515,7 +2571,14 @@ window.__ModuleLoader__.load({
         const next = saved.seen.filter((x) => x !== vid).concat(vid).slice(-200)
         update(Object.assign({}, saved, { seen: next }))
       }
-      return { saved, toggle, markSeen }
+      /* 作者不允许内嵌：记进宿主 prefs，之后抽样与队列都避开 */
+      const blockEmbed = (vid) => {
+        if (!vid) return
+        const cur = savedRef.current
+        if (cur.blocked.indexOf(vid) >= 0) return
+        update(Object.assign({}, cur, { blocked: cur.blocked.concat(vid).slice(-300) }))
+      }
+      return { saved, toggle, markSeen, blockEmbed }
     }
 
     /* ---------------- 视图组件 ---------------- */
@@ -2752,6 +2815,98 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ---------------- 电视随机播放 ----------------
+       TristanTube 的电视算法：先按权重抽一个频道，再在频道里随机抽两条、
+       留观看数多的那条；同一次会话里不重样。它给频道的权重来自人工分的
+       S..D 档，这里换成频道内视频的平均 HN 推荐人数——同样是「频道质量」
+       的代理，也保证视频多的频道不会按条数挤占小频道。 */
+    const TV_TIER_WEIGHT = { S: 10, A: 6, B: 4, C: 2.5, D: 1 }
+
+    function tvTier(avg) {
+      if (avg >= 6) return 'S'
+      if (avg >= 4) return 'A'
+      if (avg >= 3) return 'B'
+      if (avg >= 1) return 'C'
+      return 'D'
+    }
+
+    /* 片库只按 items 的 identity 建一次；换台时只做加权抽样 */
+    function buildTvPool(list) {
+      const groups = new Map()
+      for (const it of Array.isArray(list) ? list : []) {
+        if (!it || !it.v) continue
+        /* 没有频道名的视频各自成组，不捏成一个巨大的假频道 */
+        const key = it.c || 'vid:' + it.v
+        let g = groups.get(key)
+        if (!g) {
+          g = { weight: 0, recs: 0, count: 0, videos: [] }
+          groups.set(key, g)
+        }
+        g.count += 1
+        g.recs += Number(it.r) || 0
+        g.videos.push(it)
+      }
+      let total = 0
+      const out = []
+      for (const g of groups.values()) {
+        g.weight = TV_TIER_WEIGHT[tvTier(g.recs / g.count)]
+        total += g.weight
+        out.push(g)
+      }
+      return { groups: out, total }
+    }
+
+    function tvSampleOne(pool, seen, avoid) {
+      if (!pool || !pool.total) return null
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        let roll = Math.random() * pool.total
+        let group = pool.groups[pool.groups.length - 1]
+        for (const g of pool.groups) {
+          roll -= g.weight
+          if (roll <= 0) {
+            group = g
+            break
+          }
+        }
+        let best = null
+        for (let k = 0; k < 2; k += 1) {
+          const v = group.videos[Math.floor(Math.random() * group.videos.length)]
+          if (!v || v.v === avoid || seen.has(v.v)) continue
+          if (!best || (Number(v.w) || 0) > (Number(best.w) || 0)) best = v
+        }
+        if (best) return best
+      }
+      return null
+    }
+
+    /* 60 次加权抽样落空不代表片库用完，线性找一条没看过的补上；
+       真的都看过了就返回 null，由调用方决定是否开新的一轮 */
+    function tvPickOne(pool, seen, avoid) {
+      const pick = tvSampleOne(pool, seen, avoid)
+      if (pick) {
+        seen.add(pick.v)
+        return pick
+      }
+      for (const g of pool.groups) {
+        for (const v of g.videos) {
+          if (v.v === avoid || seen.has(v.v)) continue
+          seen.add(v.v)
+          return v
+        }
+      }
+      return null
+    }
+
+    function tvFillQueue(queue, pool, seen, avoid, size = 4) {
+      const out = queue.slice()
+      while (out.length < size) {
+        const pick = tvPickOne(pool, seen, avoid)
+        if (!pick || out.some((it) => it.v === pick.v)) break
+        out.push(pick)
+      }
+      return out
+    }
+
     /* 电视节目信息：沉浸形态随信息层浮出，右栏紧凑形态常驻 */
     function TvInfo({ item, lang }) {
       if (!item) return null
@@ -2785,21 +2940,27 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /* 电视：主面板满铺沉浸，会话右栏用紧凑形态常驻信息；换台按 items 的现有顺序 */
+    /* 电视：主面板满铺沉浸，会话右栏用紧凑形态常驻信息；换台是加权随机抽台 */
     function TvView(props) {
-      const { item, channel, lang, onStep, onExit, onDetail, upNext = [], onPick } = props
+      const { item, lang, onStep, onExit, onDetail, upNext = [], onPick } = props
       /* 紧凑形态由 prop 决定，不靠容器查询兜底，主面板任何宽度都不会冒出队列 */
       const compact = !!props.compact
+      const vid = item ? item.v : ''
+      /* 从播放器里点开的外来片：片库里没有，取不到简介与备用源 */
+      const external = !!(item && item.ext)
+      /* iframe 实际加载的 vid。播放器里点开的片中转页已经在放，这时不换地址，
+         否则会黑一下并从头重播；换台、回溯一律跟着当前条目走 */
+      const [frameVid, setFrameVid] = useState(vid)
+      useEffect(() => {
+        if (!vid) return
+        setFrameVid((cur) => (props.keepFrame && cur ? cur : vid))
+      }, [vid, props.keepFrame])
       const [origin, setOrigin] = useState(mem.mediaOrigin || null)
-      const [show, setShow] = useState(false)
-      const idleRef = useRef(null)
-      const lastChannelRef = useRef(channel)
-
-      const reveal = (ms) => {
-        if (idleRef.current) clearTimeout(idleRef.current)
-        setShow(true)
-        idleRef.current = setTimeout(() => setShow(false), ms)
-      }
+      /* 沉浸形态：信息收在右侧抽屉里，默认收起，鼠标移动不改变任何东西 */
+      const [open, setOpen] = useState(false)
+      const [detail, setDetail] = useState(null)
+      const [mirror, setMirror] = useState(null)
+      const frameRef = useRef(null)
 
       useEffect(() => {
         let alive = true
@@ -2811,22 +2972,134 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      /* 首次进入保持纯画面；换台后短暂露出新标题。紧凑形态信息常驻，不折腾计时器 */
+      /* 简介与备用源只在抽屉打开时取，看电视本身不发请求。
+         换台、换语言或换成片库外的片时先清掉上一台的，别把旧简介和旧入口留在抽屉里 */
       useEffect(() => {
-        if (compact) return undefined
-        const prev = lastChannelRef.current
-        lastChannelRef.current = channel
-        if (!prev || prev === channel) return undefined
-        reveal(2000)
-        return undefined
-      }, [channel, compact])
+        setDetail(null)
+        setMirror(null)
+        if (compact || !open || !vid || external) return undefined
+        let alive = true
+        loadDetail(vid, lang)
+          .then((d) => {
+            if (alive) setDetail(d)
+          })
+          .catch(() => {})
+        getJSON('/hackertube/api/mirror?vid=' + encodeURIComponent(vid))
+          .then((d) => {
+            if (alive && d && d.url) setMirror(d)
+          })
+          .catch(() => {
+            /* 没有备用源不是错误，按钮不出现即可 */
+          })
+        return () => {
+          alive = false
+        }
+      }, [compact, open, vid, lang, external])
 
-      useEffect(
-        () => () => {
-          if (idleRef.current) clearTimeout(idleRef.current)
-        },
-        [],
-      )
+      /* 抽屉开着时 Esc 只收抽屉；捕获阶段拦下，别让 HtRoot 直接退出电视 */
+      useEffect(() => {
+        if (!open) return undefined
+        const onKey = (e) => {
+          if (e.key !== 'Escape') return
+          e.stopPropagation()
+          setOpen(false)
+        }
+        document.addEventListener('keydown', onKey, true)
+        return () => document.removeEventListener('keydown', onKey, true)
+      }, [open])
+
+      /* 焦点在播放器里时按键不会冒泡到面板，中转页把方向键与 Esc 转出来，在这里消费 */
+      useEffect(() => {
+        const onNav = (d) => {
+          if (!d) return
+          if (d.key === 'Escape') {
+            if (open) setOpen(false)
+            else onExit()
+            return
+          }
+          if (d.dir) onStep(d.dir > 0 ? 1 : -1)
+        }
+        mem.tvNavSubs.add(onNav)
+        return () => {
+          mem.tvNavSubs.delete(onNav)
+        }
+      }, [open, onStep, onExit])
+
+      /* 左右键调进度：把秒数递给中转页里的播放器；观看页没有这层，YouTube 快捷键不受影响 */
+      useEffect(() => {
+        const seek = (delta) => {
+          const frame = frameRef.current
+          const win = frame && frame.contentWindow
+          if (!win || !delta) return
+          try {
+            win.postMessage({ __ht: 'seek', delta }, '*')
+          } catch {
+            /* iframe 还在加载 */
+          }
+        }
+        mem.tvSeekSubs.add(seek)
+        return () => {
+          mem.tvSeekSubs.delete(seek)
+        }
+      }, [])
+
+      /* 空格暂停 / 继续：焦点在面板上时面板接，焦点落在播放器里时中转页自己处理 */
+      useEffect(() => {
+        const toggle = () => {
+          const frame = frameRef.current
+          const win = frame && frame.contentWindow
+          if (!win) return
+          try {
+            win.postMessage({ __ht: 'toggle' }, '*')
+          } catch {
+            /* iframe 还在加载 */
+          }
+        }
+        mem.tvPlaySubs.add(toggle)
+        return () => {
+          mem.tvPlaySubs.delete(toggle)
+        }
+      }, [])
+
+      /* 一条放完自动接下一台；播放器在 iframe 里，结束状态由中转页转出来 */
+      useEffect(() => {
+        const onEnd = () => onStep(1)
+        mem.tvEndSubs.add(onEnd)
+        return () => {
+          mem.tvEndSubs.delete(onEnd)
+        }
+      }, [onStep])
+
+      /* 作者不允许内嵌（101/150）：把这条移出电视并换台，不在这里显示错误页 */
+      const onBlockedRef = useRef(null)
+      onBlockedRef.current = props.onBlocked
+      useEffect(() => {
+        if (!vid) return undefined
+        const onErr = (id, code) => {
+          if (id !== vid) return
+          if (code !== 101 && code !== 150) return
+          if (typeof onBlockedRef.current === 'function') onBlockedRef.current(id)
+        }
+        mem.tvErrorSubs.add(onErr)
+        return () => {
+          mem.tvErrorSubs.delete(onErr)
+        }
+      }, [vid])
+
+      /* 点了播放器里的「更多视频」：中转页发现片源换了（prev 是这一台的 vid），交给面板跟着换 */
+      const onAdoptRef = useRef(null)
+      onAdoptRef.current = props.onAdopt
+      useEffect(() => {
+        if (!vid) return undefined
+        const onPick = (d) => {
+          if (!d || d.prev !== vid) return
+          if (typeof onAdoptRef.current === 'function') onAdoptRef.current(d)
+        }
+        mem.tvPickSubs.add(onPick)
+        return () => {
+          mem.tvPickSubs.delete(onPick)
+        }
+      }, [vid])
 
       const stage = h(
         'div',
@@ -2835,16 +3108,18 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'ht-tv-wait' }, tx(lang, '电视里还没有节目', 'Nothing on TV yet'))
           : origin
             ? h('iframe', {
-                key: 'tv-' + item.v,
+                key: 'tv-' + (frameVid || item.v),
+                ref: frameRef,
                 className: 'ht-tv-frame',
                 title: titleOf(item, lang),
                 src:
                   origin +
                   '/embed?vid=' +
-                  encodeURIComponent(item.v) +
+                  encodeURIComponent(frameVid || item.v) +
                   '&lang=' +
                   (lang === 'zh' ? 'zh' : 'en') +
-                  '&auto=1',
+                  '&auto=1' +
+                  (compact ? '' : '&kbd=1'),
                 allow:
                   'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen',
                 allowFullScreen: true,
@@ -2922,83 +3197,237 @@ window.__ModuleLoader__.load({
               { type: 'button', className: 'ht-tv-act', 'data-tv-action': 'next', onClick: () => onStep(1) },
               tx(lang, '换台', 'Next channel'),
             ),
-            h(
-              'button',
-              { type: 'button', className: 'ht-tv-act', 'data-tv-action': 'detail', onClick: onDetail },
-              tx(lang, '看详情', 'Details'),
-            ),
+            external
+              ? null
+              : h(
+                  'button',
+                  { type: 'button', className: 'ht-tv-act', 'data-tv-action': 'detail', onClick: onDetail },
+                  tx(lang, '看详情', 'Details'),
+                ),
           ),
         )
       }
 
+      /* 抽屉里的简介：有缓存译文就用译文，否则原文；绝不在这里触发机翻 */
+      const tr = lang === 'zh' && detail && detail.i18n ? detail.i18n : {}
+      const summaryText = tr.summary || (detail && detail.summary) || tr.why_hn || (detail && detail.why_hn) || ''
+
       return h(
         'div',
-        {
-          className: 'ht-tv' + (show ? ' show' : ''),
-          onMouseMove: () => reveal(2600),
-        },
+        { className: 'ht-tv' },
         stage,
-        item ? h('div', { className: 'ht-tv-sense', 'aria-hidden': 'true' }) : null,
+        item
+          ? h('div', {
+              className: 'ht-tvd-scrim' + (open ? ' on' : ''),
+              onClick: () => setOpen(false),
+            })
+          : null,
         item
           ? h(
-              'div',
-              { className: 'ht-tvui' },
+              'aside',
+              {
+                className: 'ht-tvd' + (open ? ' open' : ''),
+                role: 'dialog',
+                'aria-label': tx(lang, '节目信息', 'Programme info'),
+                'aria-hidden': open ? undefined : 'true',
+              },
               h(
                 'div',
-                { className: 'ht-tv-top' },
-                h('span', { className: 'ht-tv-onair' }, tx(lang, 'ON AIR', 'ON AIR')),
-                h('span', { className: 'ht-tv-mark' }, tx(lang, 'HackerTube TV', 'HackerTube TV')),
+                { className: 'ht-tvd-head' },
+                h('h2', { className: 'ht-tvd-title' }, titleOf(item, lang)),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'ht-tvd-x',
+                    'aria-label': tx(lang, '收起', 'Collapse'),
+                    onClick: () => setOpen(false),
+                  },
+                  h(
+                    'svg',
+                    { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                    h('path', {
+                      d: 'M6 6l12 12M18 6L6 18',
+                      stroke: 'currentColor',
+                      strokeWidth: 1.9,
+                      strokeLinecap: 'round',
+                    }),
+                  ),
+                ),
+              ),
+              item.c || item.y
+                ? h(
+                    'p',
+                    { className: 'ht-tvd-who' },
+                    [item.c, item.y ? String(item.y) : ''].filter(Boolean).join(' · '),
+                  )
+                : null,
+              h(
+                'div',
+                { className: 'ht-tv-meta' },
+                item.r
+                  ? h(
+                      'span',
+                      { key: 'r' },
+                      h('b', null, String(item.r)),
+                      tx(lang, ' 人推荐', item.r === 1 ? ' recommender' : ' recommenders'),
+                    )
+                  : null,
+                item.w
+                  ? h(
+                      'span',
+                      { key: 'w' },
+                      tx(lang, fmtCount(item.w, lang) + ' 次观看', fmtCount(item.w, lang) + ' views'),
+                    )
+                  : null,
+                item.d ? h('span', { key: 'd' }, fmtDur(item.d)) : null,
+              ),
+              summaryText
+                ? h('p', { className: 'ht-tvd-desc' }, summaryText)
+                : h(
+                    'p',
+                    { className: 'ht-tvd-note' },
+                    external
+                      ? tx(
+                          lang,
+                          '这支视频是从播放器里点开的，不在片库里，只有标题和频道。',
+                          'Opened from the player, so only its title and channel are known.',
+                        )
+                      : detail
+                        ? tx(lang, '这个视频没有简介。', 'No description for this video.')
+                        : tx(lang, '正在读取简介…', 'Loading description…'),
+                  ),
+              h(
+                'div',
+                { className: 'ht-tvd-acts' },
+                /* 播放器自身的站外跳转在电视里被遮住了，站外入口只留抽屉里这两个 */
+                h(
+                  'a',
+                  {
+                    className: 'ht-tvd-link',
+                    href: 'https://www.youtube.com/watch?v=' + item.v,
+                    target: '_blank',
+                    rel: 'noreferrer noopener',
+                  },
+                  h(
+                    'svg',
+                    { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                    h('rect', { x: 2.5, y: 5, width: 19, height: 14, rx: 4, stroke: 'currentColor', strokeWidth: 1.7 }),
+                    h('path', { d: 'M10.4 9.1l5 2.9-5 2.9z', fill: 'currentColor' }),
+                  ),
+                  tx(lang, '在 YouTube 观看', 'Watch on YouTube'),
+                ),
+                mirror && mirror.url
+                  ? h(
+                      'a',
+                      {
+                        className: 'ht-tvd-link',
+                        href: mirror.url,
+                        target: '_blank',
+                        rel: 'noreferrer noopener',
+                        title:
+                          (mirror.up || '') +
+                          (mirror.play ? ' · ' + fmtCount(mirror.play, lang) + tx(lang, ' 次播放', ' views') : ''),
+                      },
+                      h(
+                        'svg',
+                        { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                        h('rect', { x: 3, y: 7.5, width: 18, height: 12.5, rx: 3, stroke: 'currentColor', strokeWidth: 1.7 }),
+                        h('path', {
+                          d: 'M8.5 3.5L12 7l3.5-3.5',
+                          stroke: 'currentColor',
+                          strokeWidth: 1.7,
+                          strokeLinecap: 'round',
+                          strokeLinejoin: 'round',
+                        }),
+                      ),
+                      tx(lang, '在 B 站观看', 'Watch on Bilibili'),
+                    )
+                  : null,
+                external
+                  ? null
+                  : h(
+                      'button',
+                      { type: 'button', className: 'ht-tvd-link', onClick: onDetail },
+                      h(
+                        'svg',
+                        { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                        h('rect', {
+                          x: 4,
+                          y: 3,
+                          width: 16,
+                          height: 18,
+                          rx: 2.5,
+                          stroke: 'currentColor',
+                          strokeWidth: 1.7,
+                        }),
+                        h('path', {
+                          d: 'M8 8h8M8 12h8M8 16h5',
+                          stroke: 'currentColor',
+                          strokeWidth: 1.7,
+                          strokeLinecap: 'round',
+                        }),
+                      ),
+                      tx(lang, '看详情', 'Details'),
+                    ),
               ),
               h(
                 'div',
-                { className: 'ht-tv-bot' },
-                h(TvInfo, { item, lang }),
+                { className: 'ht-tv-foot ht-tvd-foot' },
                 h(
-                  'div',
-                  { className: 'ht-tv-foot' },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'ht-tv-act',
-                      'data-tv-action': 'next',
-                      onClick: () => onStep(1),
-                    },
-                    tx(lang, '换台', 'Next channel'),
-                  ),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'ht-tv-act',
-                      'data-tv-action': 'detail',
-                      onClick: onDetail,
-                    },
-                    tx(lang, '看详情', 'Details'),
-                  ),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'ht-tv-act',
-                      'data-tv-action': 'exit',
-                      onClick: onExit,
-                    },
-                    tx(lang, '退出', 'Exit'),
-                  ),
-                  h(
-                    'span',
-                    { className: 'ht-tv-keys' },
-                    h('kbd', null, '←'),
-                    ' ',
-                    h('kbd', null, '→'),
-                    ' ',
-                    tx(lang, '换台 · ', 'channels · '),
-                    h('kbd', null, 'Esc'),
-                    ' ',
-                    tx(lang, '退出', 'exit'),
-                  ),
+                  'button',
+                  { type: 'button', className: 'ht-tv-act', 'data-tv-action': 'next', onClick: () => onStep(1) },
+                  tx(lang, '换台', 'Next channel'),
                 ),
+                h(
+                  'button',
+                  { type: 'button', className: 'ht-tv-act', 'data-tv-action': 'exit', onClick: onExit },
+                  tx(lang, '退出', 'Exit'),
+                ),
+              ),
+              h(
+                'p',
+                { className: 'ht-tvd-keys' },
+                h('kbd', null, '↑'),
+                ' ',
+                h('kbd', null, '↓'),
+                ' ',
+                tx(lang, '换台 · ', 'channels · '),
+                h('kbd', null, '←'),
+                ' ',
+                h('kbd', null, '→'),
+                ' ',
+                tx(lang, '调进度 · ', 'seek · '),
+                h('kbd', null, tx(lang, '空格', 'Space')),
+                ' ',
+                tx(lang, '暂停 / 继续 · ', 'play / pause · '),
+                h('kbd', null, 'Esc'),
+                ' ',
+                tx(lang, '退出', 'exit'),
+              ),
+            )
+          : null,
+        item
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'ht-tvd-handle',
+                'data-tv-drawer': '1',
+                'aria-label': tx(lang, '节目信息', 'Programme info'),
+                'aria-expanded': open ? 'true' : 'false',
+                onClick: () => setOpen((v) => !v),
+              },
+              h(
+                'svg',
+                { width: 15, height: 15, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                h('path', {
+                  d: 'M15 18l-6-6 6-6',
+                  stroke: 'currentColor',
+                  strokeWidth: 1.8,
+                  strokeLinecap: 'round',
+                  strokeLinejoin: 'round',
+                }),
               ),
             )
           : null,
@@ -3031,8 +3460,31 @@ window.__ModuleLoader__.load({
         return next
       })
       const [view, setView] = useState('home')
-      /* 电视当前频道留在 HtRoot：退出再进来还是这一台 */
-      const [tvIndex, setTvIndex] = useState(0)
+      const { saved, toggle, markSeen, blockEmbed } = useSaved()
+      /* 电视播放历史留在 HtRoot：退出再进来还是这一台 */
+      const tvSeenRef = useRef(new Set())
+      const tvRef = useRef({ hist: [], pos: -1, queue: [] })
+      const [tvState, setTvState] = useState(tvRef.current)
+      /* 整份片库按频道分组一次，之后每次换台只做加权抽样。
+         作者不允许内嵌的视频（prefs.blocked）不进电视频道池 */
+      const blockedSet = useMemo(() => new Set(saved.blocked), [saved.blocked])
+      const tvPool = useMemo(
+        () => buildTvPool(items.filter((it) => !blockedSet.has(it.v))),
+        [items, blockedSet],
+      )
+      /* 播放器里点开的外来片按 vid 回查片库条目，查到就沿用原条目 */
+      const tvByVid = useMemo(() => {
+        const map = new Map()
+        for (const it of items) map.set(it.v, it)
+        return map
+      }, [items])
+      const commitTv = (next, keep) => {
+        /* keep 只由「播放器里点开」用：中转页已经在放那支片，电视的 iframe 不换地址，
+           否则会黑一下并从头重播。其余换台路径一律清空，回到跟着 vid 走 */
+        const value = { ...next, keep: keep && next.pos >= 0 && next.hist[next.pos] && next.hist[next.pos].v === keep ? keep : '' }
+        tvRef.current = value
+        setTvState(value)
+      }
       const tvReturnRef = useRef('home')
       const [playlists, setPlaylists] = useState(null)
       const [plDetail, setPlDetail] = useState(null)
@@ -3041,7 +3493,6 @@ window.__ModuleLoader__.load({
       const [rec, setRec] = useState(null)
       /* 每次「换一批」换一个 seed，Host 按它重新抽前排 */
       const [recSeed, setRecSeed] = useState(() => Math.floor(Math.random() * 1e9) + 1)
-      const { saved, toggle, markSeen } = useSaved()
       /* 计数没有读者：它一变就重渲染，让后到的中文标题显示出来 */
       const [, bumpTitles] = useState(0)
 
@@ -3078,6 +3529,7 @@ window.__ModuleLoader__.load({
       }, [phase, recKey, recSeed])
 
       /* 宿主端保存过语言偏好就跟随；本机有明确选择或用户刚手动切换时不被覆盖 */
+      const hostPrefRef = useRef(false)
       useEffect(() => {
         let alive = true
         /* localStorage 写不进去的宿主（dsh-app://）才需要宿主兜底 */
@@ -3086,7 +3538,9 @@ window.__ModuleLoader__.load({
           .then((d) => {
             if (!alive || !d || langTouchedRef.current) return
             const saved = d.lang === 'zh' || d.lang === 'en' ? d.lang : null
-            if (!saved || saved === mem.lang) return
+            if (!saved) return
+            hostPrefRef.current = true
+            if (saved === mem.lang) return
             mem.lang = saved
             setLang(saved)
           })
@@ -3094,6 +3548,25 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
+      }, [])
+
+      /* 宿主语言可能晚于模块挂载才写进 <html lang>；没有显式偏好时跟随宿主 */
+      useEffect(() => {
+        if (typeof document === 'undefined') return undefined
+        const el = document.documentElement
+        if (!el) return undefined
+        const follow = () => {
+          if (hostPrefRef.current || langTouchedRef.current || readStoredLang()) return
+          const host = el.lang ? normalizeLang(el.lang) : ''
+          if (!host || host === mem.lang) return
+          mem.lang = host
+          setLang(host)
+        }
+        follow()
+        if (typeof MutationObserver === 'undefined') return undefined
+        const mo = new MutationObserver(follow)
+        mo.observe(el, { attributes: true, attributeFilter: ['lang'] })
+        return () => mo.disconnect()
       }, [])
 
       const [reloadKey, setReloadKey] = useState(0)
@@ -3454,9 +3927,154 @@ window.__ModuleLoader__.load({
         setWatching(null)
       }
 
+      /* 进电视：正在看的这条就是第一台；否则按 TristanTube 的规则抽一台 */
+      const tvStart = (seed) => {
+        const seen = tvSeenRef.current
+        const cur = tvRef.current
+        let hist = cur.hist
+        let pos = cur.pos
+        if (seed && seed.v && !mem.tvBlocked.has(seed.v) && (!hist[pos] || hist[pos].v !== seed.v)) {
+          seen.add(seed.v)
+          hist = hist.slice(0, pos + 1).concat([seed])
+          pos = hist.length - 1
+        }
+        if (pos < 0) {
+          let first = tvPickOne(tvPool, seen)
+          if (!first) {
+            /* 整份片库都看过了：开新的一轮 */
+            seen.clear()
+            first = tvPickOne(tvPool, seen)
+          }
+          if (first) {
+            hist = [first]
+            pos = 0
+          }
+        }
+        const playing = pos >= 0 ? hist[pos].v : ''
+        commitTv({
+          hist,
+          pos,
+          queue: tvFillQueue(
+            cur.queue.filter((it) => it.v !== playing),
+            tvPool,
+            seen,
+            playing,
+          ),
+        })
+      }
+
+      /* ↓ / N：有前路就顺着历史走，没有就从「接下来」取一台，再不行才现抽 */
+      const tvNext = () => {
+        const cur = tvRef.current
+        if (!tvPool.total) return
+        /* 历史里可能有刚被发现不能内嵌的台，往前找下一台可用的 */
+        let forward = cur.pos + 1
+        while (forward < cur.hist.length && mem.tvBlocked.has(cur.hist[forward].v)) forward += 1
+        if (cur.pos >= 0 && forward < cur.hist.length) {
+          commitTv({ ...cur, pos: forward })
+          return
+        }
+        const seen = tvSeenRef.current
+        const playing = cur.pos >= 0 ? cur.hist[cur.pos].v : ''
+        const queue = cur.queue.filter((it) => !mem.tvBlocked.has(it.v))
+        let pick = queue[0]
+        if (!pick) {
+          pick = tvPickOne(tvPool, seen, playing)
+          if (!pick) {
+            /* 整份片库都看过了：开新的一轮，当前这条仍然跳过 */
+            seen.clear()
+            pick = tvPickOne(tvPool, seen, playing)
+          }
+        }
+        if (!pick) return
+        seen.add(pick.v)
+        const hist = cur.hist.slice(0, cur.pos + 1).concat([pick])
+        const rest = queue[0] === pick ? queue.slice(1) : queue
+        commitTv({ hist, pos: hist.length - 1, queue: tvFillQueue(rest, tvPool, seen, pick.v) })
+      }
+
+      /* ↑ / P：回到上一台，和遥控器一样不绕回最后；跳过不能内嵌的台 */
+      const tvPrev = () => {
+        const cur = tvRef.current
+        let back = cur.pos - 1
+        while (back >= 0 && mem.tvBlocked.has(cur.hist[back].v)) back -= 1
+        if (back >= 0) commitTv({ ...cur, pos: back })
+      }
+
+      /* 右栏「接下来」点哪台放哪台：往前翻历史就跳过去，抽好的下一台就从队列里取 */
+      const tvPlay = (it) => {
+        if (!it || !it.v || mem.tvBlocked.has(it.v)) return
+        const cur = tvRef.current
+        const forward = cur.hist.findIndex((h, i) => i > cur.pos && h.v === it.v && !mem.tvBlocked.has(h.v))
+        if (forward > cur.pos) {
+          commitTv({ ...cur, pos: forward })
+          return
+        }
+        const at = cur.queue.findIndex((q) => q.v === it.v)
+        const pick = at >= 0 ? cur.queue[at] : it
+        const rest = at >= 0 ? cur.queue.slice(at + 1) : cur.queue
+        tvSeenRef.current.add(pick.v)
+        const hist = cur.hist.slice(0, cur.pos + 1).concat([pick])
+        commitTv({ hist, pos: hist.length - 1, queue: tvFillQueue(rest, tvPool, tvSeenRef.current, pick.v) })
+      }
+
+      /* 播放器报 101/150（作者不允许内嵌）：永久移出电视，并从当前台往后换 */
+      const tvDropBlocked = (vid) => {
+        if (!vid || mem.tvBlocked.has(vid)) return
+        mem.tvBlocked.add(vid)
+        blockEmbed(vid)
+        const cur = tvRef.current
+        const curVid = cur.pos >= 0 ? cur.hist[cur.pos].v : ''
+        const queue = cur.queue.filter((it) => it.v !== vid)
+        if (curVid === vid) {
+          commitTv({ ...cur, queue })
+          tvNext()
+        } else if (queue.length !== cur.queue.length) {
+          commitTv({ ...cur, queue })
+        }
+      }
+
+      /* 播放器里点了「更多视频」：面板跟着换到那支片，否则抽屉标题、字幕上下文和进度
+         都停在上一台。片库里有这条就沿用原条目；没有就按 YouTube 给的标题与频道临时
+         入档（ext），不进频道池，抽屉里也不去取简介与备用源 */
+      const tvAdopt = (d) => {
+        const vid = d && d.vid ? String(d.vid) : ''
+        if (!vid) return
+        if (mem.tvBlocked.has(vid)) {
+          tvDropBlocked(vid)
+          return
+        }
+        const cur = tvRef.current
+        if (cur.pos >= 0 && cur.hist[cur.pos].v === vid) return
+        const entry = tvByVid.get(vid) || {
+          v: vid,
+          t: String(d.title || ''),
+          c: String(d.author || ''),
+          th: 'https://i.ytimg.com/vi/' + vid + '/hq2.jpg',
+          ext: true,
+        }
+        tvSeenRef.current.add(vid)
+        const hist = cur.hist.slice(0, cur.pos + 1).concat([entry])
+        commitTv(
+          {
+            hist,
+            pos: hist.length - 1,
+            queue: tvFillQueue(
+              cur.queue.filter((it) => it.v !== vid),
+              tvPool,
+              tvSeenRef.current,
+              vid,
+            ),
+          },
+          vid,
+        )
+      }
+
       const enterTv = () => {
         if (view !== 'tv') tvReturnRef.current = view
+        const seed = watching || null
         if (watching) closeWatch()
+        tvStart(seed)
         setView('tv')
       }
 
@@ -3466,9 +4084,15 @@ window.__ModuleLoader__.load({
       }
 
       const stepChannel = (delta) => {
-        if (!items.length) return
-        setTvIndex((i) => (i + delta + items.length) % items.length)
+        if (delta > 0) tvNext()
+        else tvPrev()
       }
+
+      /* 冷启动时电视可能比列表先打开；片库一到位就抽第一台，不用等用户按键 */
+      useEffect(() => {
+        if (view !== 'tv' || !tvPool.total || tvRef.current.pos >= 0) return
+        tvStart(null)
+      }, [view, tvPool])
 
       /* 键盘快捷键：与站点一致的那一套 */
       useEffect(() => {
@@ -3507,14 +4131,39 @@ window.__ModuleLoader__.load({
             return
           }
           if (view === 'tv') {
-            if (e.key === 'ArrowRight' || e.key === 'n' || e.key === 'N') {
+            /* 上下换台、左右调进度：与遥控器的直觉一致，也和 YouTube 的左右快进对齐 */
+            if (e.key === 'ArrowDown' || e.key === 'n' || e.key === 'N') {
               e.preventDefault()
               stepChannel(1)
               return
             }
-            if (e.key === 'ArrowLeft' || e.key === 'p' || e.key === 'P') {
+            if (e.key === 'ArrowUp' || e.key === 'p' || e.key === 'P') {
               e.preventDefault()
               stepChannel(-1)
+              return
+            }
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+              e.preventDefault()
+              const delta = e.key === 'ArrowRight' ? TV_SEEK_STEP : -TV_SEEK_STEP
+              for (const fn of mem.tvSeekSubs) {
+                try {
+                  fn(delta)
+                } catch {
+                  /* 视图卸载中 */
+                }
+              }
+              return
+            }
+            /* 空格暂停 / 继续：遥控器最顺手的那个键；阻止默认滚动 */
+            if (e.key === ' ' || e.key === 'Spacebar') {
+              e.preventDefault()
+              for (const fn of mem.tvPlaySubs) {
+                try {
+                  fn()
+                } catch {
+                  /* 视图卸载中 */
+                }
+              }
               return
             }
             return
@@ -3564,7 +4213,7 @@ window.__ModuleLoader__.load({
         }
         document.addEventListener('keydown', onKey)
         return () => document.removeEventListener('keydown', onKey)
-      }, [watching, toggle, helpOpen, view, items.length])
+      }, [watching, toggle, helpOpen, view, items, tvPool])
 
       if (watching) {
         return h(WatchView, {
@@ -3578,24 +4227,24 @@ window.__ModuleLoader__.load({
         })
       }
 
-      const pickChannel = (it) => {
-        const at = it ? items.findIndex((x) => x.v === it.v) : -1
-        if (at >= 0) setTvIndex(at)
-      }
-
       /* 沉浸形态只属于主面板；会话右栏保留头部与导航，电视只占剩余高度 */
-      const tvItem = items.length ? items[Math.min(tvIndex, items.length - 1)] : null
+      const tvItem = tvState.pos >= 0 ? tvState.hist[tvState.pos] : null
+      /* 「接下来」先列已经翻过的前路，再列随机抽好的队列，和 ↓ 的实际走向一致 */
       const tvUpNext = []
-      if (tvItem) {
-        for (let k = 1; k < items.length && tvUpNext.length < 4; k += 1) {
-          const it = items[(tvIndex + k) % items.length]
-          if (it && it.v !== tvItem.v) tvUpNext.push(it)
-        }
+      for (let k = tvState.pos + 1; k >= 0 && k < tvState.hist.length && tvUpNext.length < 4; k += 1) {
+        if (mem.tvBlocked.has(tvState.hist[k].v)) continue
+        tvUpNext.push(tvState.hist[k])
+      }
+      for (const it of tvState.queue) {
+        if (tvUpNext.length >= 4) break
+        if (mem.tvBlocked.has(it.v)) continue
+        if (!tvUpNext.some((x) => x.v === it.v)) tvUpNext.push(it)
       }
 
       if (view === 'tv' && !embedded) {
         return h(TvView, {
           item: tvItem,
+          keepFrame: !!(tvState.keep && tvItem && tvState.keep === tvItem.v),
           channel: tvItem ? tvItem.v : '',
           lang,
           onStep: stepChannel,
@@ -3603,6 +4252,8 @@ window.__ModuleLoader__.load({
           onDetail: () => {
             if (tvItem) openItem(tvItem)
           },
+          onBlocked: tvDropBlocked,
+          onAdopt: tvAdopt,
         })
       }
 
@@ -3628,6 +4279,7 @@ window.__ModuleLoader__.load({
           return h(TvView, {
             compact: true,
             item: tvItem,
+            keepFrame: !!(tvState.keep && tvItem && tvState.keep === tvItem.v),
             channel: tvItem ? tvItem.v : '',
             lang,
             onStep: stepChannel,
@@ -3635,8 +4287,10 @@ window.__ModuleLoader__.load({
             onDetail: () => {
               if (tvItem) openItem(tvItem)
             },
+            onBlocked: tvDropBlocked,
+            onAdopt: tvAdopt,
             upNext: tvUpNext,
-            onPick: pickChannel,
+            onPick: tvPlay,
           })
         }
         if (view === 'cats') {
@@ -4124,16 +4778,60 @@ window.__ModuleLoader__.load({
               return
             }
             if (data.__ht === 'yt-error' || data.__ht === 'api-error') {
-              setPlaybackError(String(data.vid || mem.activeWatchVid || ''), {
-                kind: data.__ht,
-                code: data.code == null ? null : Number(data.code),
-              })
+              const errVid = String(data.vid || mem.activeWatchVid || '')
+              const errCode = data.code == null ? null : Number(data.code)
+              setPlaybackError(errVid, { kind: data.__ht, code: errCode })
               beacon('playback-error', data)
+              /* 电视里作者不允许内嵌（101/150）：交给当前电视视图移出片库并换台 */
+              if (data.__ht === 'yt-error') {
+                for (const fn of mem.tvErrorSubs) {
+                  try {
+                    fn(errVid, errCode)
+                  } catch {
+                    /* 视图卸载中 */
+                  }
+                }
+              }
+              return
+            }
+            /* 播放器里点了「更多视频」，YouTube 在自己 iframe 里换了片：交给电视跟着换台 */
+            if (data.__ht === 'yt-pick') {
+              for (const fn of mem.tvPickSubs) {
+                try {
+                  fn(data)
+                } catch {
+                  /* 视图卸载中 */
+                }
+              }
               return
             }
             if (data.__ht === 'relay-loaded') {
               /* 重试后播放器真正就绪，清掉旧的错误覆盖层 */
               setPlaybackError(String(data.vid || mem.activeWatchVid || ''), null)
+            }
+            /* 电视里一条放完：交给当前电视视图接下一台 */
+            if (data.__ht === 'state') {
+              if (Number(data.s) === 0) {
+                for (const fn of mem.tvEndSubs) {
+                  try {
+                    fn()
+                  } catch {
+                    /* 视图卸载中 */
+                  }
+                }
+              }
+              return
+            }
+            /* 电视的中转页把播放器里的方向键 / Esc 转出来，交给当前电视视图换台或退出 */
+            if (data.__ht === 'nav') {
+              for (const fn of mem.tvNavSubs) {
+                try {
+                  fn(data)
+                } catch {
+                  /* 视图卸载中 */
+                }
+              }
+              return
             }
             beacon('relay-msg', data)
           }
