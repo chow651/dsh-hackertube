@@ -377,6 +377,24 @@ if (liveUpstream) {
   const tool = tools['hackertube_search']
   check('tool registered', !!tool)
 
+  /* 模型侧拿到的是 input_schema：必须是对象根 JSON Schema，
+     否则 DeepSeek / OpenCode Go 会把整条请求判成 invalid schema */
+  if (tool) {
+    const params = tool.parameters || {}
+    check(
+      'tool parameters is object schema',
+      params.type === 'object' &&
+        !!params.properties &&
+        params.properties.query?.type === 'string',
+      JSON.stringify(params).slice(0, 120),
+    )
+    check(
+      'tool marks query required',
+      Array.isArray(params.required) && params.required.indexOf('query') >= 0,
+      JSON.stringify(params.required),
+    )
+  }
+
   if (!tool || !liveUpstream || !listOk) {
     console.log('skip tool search assertions — live list unavailable')
   } else {

@@ -3901,40 +3901,46 @@ export function apply(ctx) {
           '当用户讨论某个技术概念、想找深入讲解，或问有没有相关的演讲、课程、访谈时使用。' +
           '与面板搜索共用同一套排序：词边界、中英文扩展、标题/频道/标签/分类/摘要/HN 推荐理由加权。' +
           '返回标题、频道、时长、观看量、HN 推荐人数、匹配字段、摘要片段与链接。',
+        /* register() 直接把 parameters 当作 input_schema 发给模型，必须是完整 JSON Schema；
+           这里不能写 defineTool 那种作者规格（{ query: { required: true } }），
+           DeepSeek / OpenCode Go 这类严格校验的上游会整条请求 400。 */
         parameters: {
-          query: {
-            type: 'string',
-            required: true,
-            description: '检索词，可以是技术概念、语言、框架名或自然语言描述，中英文均可',
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: '检索词，可以是技术概念、语言、框架名或自然语言描述，中英文均可',
+            },
+            limit: {
+              type: 'number',
+              description: '返回条数，默认 5，最多 15',
+            },
+            lang: {
+              type: 'string',
+              description: '返回文案的语言，zh 或 en，默认 zh',
+            },
+            area: {
+              type: 'string',
+              description: '按领域筛选，例如 software、ai-data、systems-security',
+            },
+            year: {
+              type: 'number',
+              description: '按发布年份筛选',
+            },
+            type: {
+              type: 'string',
+              description: '按内容类型筛选，例如 talk、course、lecture',
+            },
+            level: {
+              type: 'string',
+              description: '按难度筛选，例如 intro、intermediate、advanced、general',
+            },
+            sort: {
+              type: 'string',
+              description: '排序：relevance（默认）、score、year、views',
+            },
           },
-          limit: {
-            type: 'number',
-            description: '返回条数，默认 5，最多 15',
-          },
-          lang: {
-            type: 'string',
-            description: '返回文案的语言，zh 或 en，默认 zh',
-          },
-          area: {
-            type: 'string',
-            description: '按领域筛选，例如 software、ai-data、systems-security',
-          },
-          year: {
-            type: 'number',
-            description: '按发布年份筛选',
-          },
-          type: {
-            type: 'string',
-            description: '按内容类型筛选，例如 talk、course、lecture',
-          },
-          level: {
-            type: 'string',
-            description: '按难度筛选，例如 intro、intermediate、advanced、general',
-          },
-          sort: {
-            type: 'string',
-            description: '排序：relevance（默认）、score、year、views',
-          },
+          required: ['query'],
         },
         output: {
           schema: { type: 'string' },
